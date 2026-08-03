@@ -1,0 +1,4 @@
+edition = "2024"
+# Decouples formatting churn from language-edition upgrades.
+style_edition = "2024"
+max_width = 100

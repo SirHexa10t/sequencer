@@ -1,0 +1,33 @@
+[package]
+name = "sequencer-input"
+description = "Platform input backends for sequencer: global capture and event synthesis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The Linux backend: reads /dev/input for capture, writes /dev/uinput for injection.
+# One code path that works identically on X11, Wayland and the console, which is also
+# why there is no X11-protocol backend -- this one covers those sessions too.
+# Inert off-Linux: the dependencies below are target-gated.
+evdev = ["dep:evdev"]
+# Reserved so the feature names are stable:
+#   x11     -- only if a zero-setup X11-only mode is ever wanted
+#   windows -- WH_KEYBOARD_LL hooks + SendInput
+#   macos   -- CGEventTap + CGEventPost
+
+[dependencies]
+sequencer-core = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+tracing = { workspace = true, features = ["std"] }
+# Sleeps natively up to the platform's accuracy, then spins out the remainder.
+spin_sleep = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { workspace = true, optional = true }
+
+[lints]
+workspace = true

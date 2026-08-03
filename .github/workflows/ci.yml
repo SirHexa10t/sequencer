@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Format, lints, docs and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test --workspace --all-features
+      # The clap surface and the Linux backend are both feature-gated, and "does not
+      # compile without it" is the failure only a powerset check catches.
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --workspace --feature-powerset --no-dev-deps
+
+  portability:
+    # sequencer-core has no operating-system dependency at all, and cross-compiling the
+    # workspace for two other platforms is the proof. The Linux backend is target-gated,
+    # so `--all-features` still compiles there -- it just compiles none of it.
+    name: Cross-compile (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-apple-darwin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo check --workspace --all-features --target ${{ matrix.target }}
+
+  devices:
+    # The tests that need a real virtual device skip themselves when /dev/uinput is
+    # absent, so the job above proves nothing about them. GitHub's Linux runners are VMs
+    # rather than containers and should allow loading the module, which makes an actual
+    # round trip possible here and nowhere else in CI.
+    #
+    # continue-on-error until it has been seen to pass: a job that has never run is not
+    # yet something to gate merges on.
+    name: Real uinput round trip
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Load uinput and grant access
+        run: |
+          sudo modprobe uinput
+          sudo chmod 0666 /dev/uinput
+          ls -l /dev/uinput
+      - run: cargo test --workspace --all-features -- --nocapture uinput
+
+  deny:
+    # sequencer is GPL-3.0-or-later, so a dependency's licence is a correctness matter and
+    # not paperwork. deny.toml holds the GPLv3-compatible allowlist.
+    name: Licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

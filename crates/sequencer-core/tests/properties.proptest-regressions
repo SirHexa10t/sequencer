@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 21fbcd14769121537134d3e93fd5b1adb9be081aaac5414b31afe252e8f7e8dc # shrinks to scenario = Scenario { steps: [LoopStart { count: Times(0), end: 3 }, Emit(KeyDown(A)), LoopEnd { start: 0 }], mode: Once { on: Press }, cancel: CancelPolicy { on_trigger_release: false, on_other_key: Ignore, on_timeout: None, epilogue: RunTail { from: 1 } }, events: [], jumps: [], seed: 0 }
+cc a379c3593a7bca1774d05de35ab786136297f9537eaab6a2da15322a29ddc018 # shrinks to scenario = Scenario { steps: [LoopStart { count: Times(0), end: 3 }, Emit(KeyDown(A)), LoopEnd { start: 0 }], mode: Once { on: Press }, cancel: CancelPolicy { on_trigger_release: false, on_other_key: Ignore, on_timeout: None, epilogue: RunTail { from: 1 } }, events: [(0, true, true)], jumps: [], seed: 0 }

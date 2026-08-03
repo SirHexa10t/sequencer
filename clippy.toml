@@ -1,0 +1,4 @@
+msrv = "1.88"
+# sequencer-core and sequencer-cli are consumed as libraries by another project, so a
+# lint that would change their public API needs to be a deliberate decision, not a drive-by.
+avoid-breaking-exported-api = true

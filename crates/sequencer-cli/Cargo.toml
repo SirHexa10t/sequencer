@@ -1,0 +1,49 @@
+[package]
+name = "sequencer-cli"
+description = "Autoclicker and hotkey-binding-profile interpreter: library and `sequencer` binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cli", "logging", "evdev"]
+# The clap surface: Cli, Command, the *Args types, and run/try_run. Turn it off to embed
+# just the engine wiring with no clap in your dependency graph.
+cli = ["dep:clap"]
+# init_logging(). Off for embedders that own the global tracing subscriber themselves.
+logging = ["dep:tracing-subscriber"]
+# The Linux input backend. On by default so `cargo build` produces a working clicker;
+# inert on other platforms.
+evdev = ["sequencer-input/evdev"]
+
+[dependencies]
+sequencer-core = { workspace = true }
+sequencer-input = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+tracing = { workspace = true, features = ["std", "attributes"] }
+clap = { workspace = true, optional = true, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "color",
+    "wrap_help",
+] }
+tracing-subscriber = { workspace = true, optional = true, features = ["fmt", "ansi"] }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+trycmd = { workspace = true }
+
+[[bin]]
+name = "sequencer"
+path = "src/bin/sequencer.rs"
+required-features = ["cli"]
+
+[lints]
+workspace = true
