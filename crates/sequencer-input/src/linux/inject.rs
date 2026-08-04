@@ -12,7 +12,7 @@
 use std::io;
 
 use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
-use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
+use evdev::{AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use sequencer_core::emit::{Emit, EmitAction, Holdable, InputSink, SinkError};
 
 use crate::linux::keymap;
@@ -47,8 +47,31 @@ impl UinputSink {
             keys.insert(code);
         }
 
+        // Declared but never sent: this device only ever clicks, and moving the cursor is
+        // explicitly not its job.
+        //
+        // They are here because libinput — which every Wayland compositor and modern X
+        // server sits on — decides what a device *is* from the axes it advertises, not from
+        // its buttons. Advertising BTN_LEFT with no axes produces a device that libinput does
+        // not classify as a pointer, so it routes the button events nowhere: the kernel
+        // accepts every write, a read-back (`bench`) counts every one of them, and not a
+        // single click reaches an application. Two unused axes are the whole difference
+        // between that and a working clicker.
+        let mut axes = AttributeSet::<RelativeAxisCode>::new();
+        axes.insert(RelativeAxisCode::REL_X);
+        axes.insert(RelativeAxisCode::REL_Y);
+        // A wheel, for the same reason and never scrolled either. Without one libinput has
+        // no wheel to offer, so it selects BUTTON scrolling as the device's scroll method
+        // (`Scroll methods: *button` in `libinput list-devices`, where real mice say
+        // `*wheel`). Button scrolling makes libinput hold each press back to see whether it
+        // begins a scroll gesture rather than a click — which turns rapid clicking into one
+        // long held button.
+        axes.insert(RelativeAxisCode::REL_WHEEL);
+        axes.insert(RelativeAxisCode::REL_HWHEEL);
+
         let device = VirtualDevice::builder()
             .and_then(|builder| builder.name(DEVICE_NAME).with_keys(&keys))
+            .and_then(|builder| builder.with_relative_axes(&axes))
             .and_then(VirtualDeviceBuilder::build)
             .map_err(uinput_error)?;
 
@@ -192,6 +215,51 @@ mod tests {
             .write(true)
             .open("/dev/uinput")
             .is_ok()
+    }
+
+    /// The virtual device must advertise relative axes, or libinput does not classify it as
+    /// a pointer and routes every button event into nothing.
+    ///
+    /// Worth a hardware test rather than a unit one because the failure is *silent at every
+    /// layer we can see*: the builder succeeds, `emit` succeeds, the kernel accepts the
+    /// writes, and `bench` — which reads the raw device back — counts every single one. Only
+    /// an application receiving nothing reveals it, and no assertion below the compositor
+    /// notices. So this inspects what the kernel actually published for the device.
+    ///
+    /// Named `uinput` so CI's device-enabled job selects it.
+    #[test]
+    fn the_uinput_device_advertises_pointer_axes() {
+        if !uinput_available() {
+            eprintln!("SKIPPED: /dev/uinput is not writable here");
+            return;
+        }
+        let mut sink = UinputSink::open().expect("virtual device");
+        let node = sink
+            .dev_nodes()
+            .expect("dev nodes")
+            .into_iter()
+            .next()
+            .expect("the device has an event node");
+        let device = evdev::Device::open(&node).expect("open the device we just made");
+
+        let axes = device
+            .supported_relative_axes()
+            .expect("a pointer must advertise relative axes at all");
+        assert!(
+            axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y),
+            "libinput classifies by axes, not buttons: without REL_X/REL_Y the clicks go nowhere"
+        );
+        assert!(
+            axes.contains(RelativeAxisCode::REL_WHEEL),
+            "without a wheel libinput falls back to BUTTON scrolling, and then holds every \
+             press back to see whether it starts a scroll instead of a click"
+        );
+        assert!(
+            device
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT)),
+            "and the buttons must still be there"
+        );
     }
 
     #[test]

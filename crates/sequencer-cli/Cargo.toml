@@ -8,15 +8,19 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["cli", "logging", "evdev"]
+default = ["cli", "logging", "evdev", "xtest"]
 # The clap surface: Cli, Command, the *Args types, and run/try_run. Turn it off to embed
 # just the engine wiring with no clap in your dependency graph.
 cli = ["dep:clap"]
 # init_logging(). Off for embedders that own the global tracing subscriber themselves.
 logging = ["dep:tracing-subscriber"]
 # The Linux input backend. On by default so `cargo build` produces a working clicker;
-# inert on other platforms.
-evdev = ["sequencer-input/evdev"]
+# inert on other platforms. `nix` rides along for session mode's privilege drop.
+evdev = ["sequencer-input/evdev", "dep:nix"]
+# The XTEST backend, for X11 sessions where libinput throttles the device path. Chosen at
+# runtime over `evdev` when $DISPLAY is set; needs `evdev` present for the shared keymap and
+# the hotkey capture, so it is not a standalone backend.
+xtest = ["sequencer-input/xtest"]
 
 [dependencies]
 sequencer-core = { workspace = true }
@@ -34,6 +38,9 @@ clap = { workspace = true, optional = true, features = [
     "wrap_help",
 ] }
 tracing-subscriber = { workspace = true, optional = true, features = ["fmt", "ansi"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, optional = true, features = ["user"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

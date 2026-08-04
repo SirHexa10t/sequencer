@@ -10,6 +10,8 @@
 
 use std::process::ExitCode;
 
+use sequencer_cli::clap;
+
 fn main() -> ExitCode {
     // Global setup belongs here, never in the library: a second subscriber in one process
     // fails, and an embedder must be free to install their own. The flags are sniffed
@@ -31,5 +33,15 @@ fn main() -> ExitCode {
         }
     }
 
-    ExitCode::from(sequencer_cli::run(std::env::args_os()))
+    // Parse here rather than in `run`: session mode may re-exec this command line under
+    // sudo, and the decision belongs to the process that owns argv. A parse failure (or
+    // `--help`) exits the way clap says, before sudo could ever be mentioned.
+    let cli = match <sequencer_cli::Cli as clap::Parser>::try_parse_from(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2));
+        }
+    };
+    ExitCode::from(sequencer_cli::run_with_sudo_prompt(&cli, "sequencer doctor"))
 }

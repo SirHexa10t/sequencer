@@ -95,6 +95,19 @@ Verify:
 sequencer doctor    # exit code 0 once everything passes
 ```
 
+### Or: no setup at all (session mode)
+
+Skip everything above and just run `sequencer clicker`. When the devices aren't accessible
+and you're at a terminal, it explains itself and asks for your password via sudo — **for
+that run only**. Root lasts exactly as long as opening the devices takes; the process then
+drops back to your user (plus the `input` group) and runs the whole session unprivileged.
+Nothing persists after it exits, and no other program gains any access at any point.
+
+That is the inverse of the standing setup's trade: a password per session, in exchange for
+never widening what the rest of your programs can do. A sudo ticket the run created is
+revoked afterwards; one you already had is left untouched. Pipelines are never prompted —
+without a terminal the run fails with the setup instructions instead.
+
 ### Optional developer tools
 
 Only for contributing, and only these two; CI installs its own copies.
@@ -308,6 +321,38 @@ CI runs the suite plus fmt, clippy and docs on Linux; cross-compiles for Windows
 macOS, which is the proof `sequencer-core` is OS-free; checks every feature combination
 with `cargo hack`; and runs `cargo deny`, since the project is GPL-3.0-or-later and a
 dependency's licence is a correctness matter.
+
+## Rate ceiling: what the machine can do vs what an application receives
+
+`bench` measures how fast this tool can write to the kernel, and that number is real — the
+device accepts thousands of events a second. It is **not** the same as how many clicks an
+application will register.
+
+Everything written to `/dev/uinput` passes through libinput before any application sees it.
+On at least one X11 machine, clicks above roughly 20-30/s arrive at the kernel perfectly —
+correct alternation, one `SYN_REPORT` per event, exact cadence, all verified by reading the
+device node back — and are then collapsed by libinput into a single held button. Nothing
+about the device shape changes it: a stripped-down 100-line reference clicker
+(`contrib/minimal_uinput_click.py`), declaring nothing but `BTN_LEFT` and the pointer axes,
+hits the same wall at the same rate. Two independent implementations, one ceiling.
+
+**On an X11 session this is handled automatically.** There is a second injection backend,
+XTEST, which puts events into the X server's own queue — above libinput, the same layer
+`xdotool` and pynput-based autoclickers use — so the ceiling does not apply. When `$DISPLAY`
+names an X11 session, the clicker uses it without being asked; `sequencer doctor` reports
+which backend is active (`inject:` line). The hotkey is still read through evdev either way.
+
+It is a second sink, not a replacement: XTEST is X11-only, and reaching Wayland and the
+console is why this tool writes input devices directly in the first place. On those sessions
+the uinput backend and its ceiling still apply. The `xtest` feature is on by default; build
+`--no-default-features` without it for a uinput-only binary.
+
+To see your own machine's uinput ceiling independently of this project,
+`contrib/minimal_uinput_click.py` measures it in about a minute:
+
+```sh
+sudo python3 contrib/minimal_uinput_click.py --cps 20    # then 30, then 40
+```
 
 ## Limitations
 

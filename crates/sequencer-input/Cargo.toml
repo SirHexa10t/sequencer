@@ -14,6 +14,9 @@ default = []
 # why there is no X11-protocol backend -- this one covers those sessions too.
 # Inert off-Linux: the dependencies below are target-gated.
 evdev = ["dep:evdev"]
+# XTEST injection for X11 sessions: the same events, delivered above libinput instead of
+# below it. See the README's rate-ceiling section for why that layer matters.
+xtest = ["dep:x11rb", "dep:evdev"]
 # Reserved so the feature names are stable:
 #   x11     -- only if a zero-setup X11-only mode is ever wanted
 #   windows -- WH_KEYBOARD_LL hooks + SendInput
@@ -28,6 +31,7 @@ spin_sleep = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { workspace = true, optional = true }
+x11rb = { workspace = true, optional = true }
 
 [lints]
 workspace = true

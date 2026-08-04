@@ -426,7 +426,18 @@ impl core::fmt::Display for Millis {
         let ms = nanos / 1_000_000;
         match nanos % 1_000_000 {
             0 => write!(f, "{ms}"),
-            frac => write!(f, "{ms}.{frac:06}"),
+            // Six digits is the full sub-millisecond precision, but padding is not the same
+            // as significance: half a millisecond is `.5`, not `.500000`. Trailing zeros are
+            // divided off rather than trimmed from a string, since this crate has no
+            // allocator to spare for a formatter.
+            frac => {
+                let (mut value, mut width) = (frac, 6_usize);
+                while value % 10 == 0 {
+                    value /= 10;
+                    width -= 1;
+                }
+                write!(f, "{ms}.{value:0width$}")
+            }
         }
     }
 }
@@ -445,5 +456,29 @@ impl core::fmt::Display for Short {
             EmitAction::CursorTo { x, y } => write!(f, "CT:{x},{y}"),
             EmitAction::CursorBy { dx, dy } => write!(f, "CB:{dx},{dy}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod millis_tests {
+    use alloc::string::String;
+
+    use super::{Millis, Timestamp};
+
+    #[test]
+    fn sub_millisecond_digits_appear_only_when_they_mean_something() {
+        // No `ToString` without an allocator in scope here; the formatter is what is under
+        // test anyway, so it is exercised through `write!` directly.
+        let at = |nanos| {
+            let mut rendered = String::new();
+            core::fmt::write(&mut rendered, format_args!("{}", Millis(Timestamp::from_nanos(nanos))))
+                .expect("writing to a String cannot fail");
+            rendered
+        };
+        assert_eq!(at(0), "0");
+        assert_eq!(at(50_000_000), "50", "a whole millisecond carries no fraction");
+        assert_eq!(at(2_500_000), "2.5", "not 2.500000");
+        assert_eq!(at(1_250_000), "1.25");
+        assert_eq!(at(1_000_001), "1.000001", "real precision is still shown in full");
     }
 }

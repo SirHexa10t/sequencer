@@ -74,7 +74,7 @@ fn a_key_binding_reaches_the_sink_as_a_key_press() {
     deps.pump = Some(&mut pump);
 
     let args = ClickerArgs {
-        key: Some(Key::F),
+        kb_key: Some(Key::F),
         ..ClickerArgs::new()
     };
     dispatch(&Command::Clicker(args), &mut deps).expect("should run");
@@ -164,39 +164,28 @@ fn an_unknown_key_names_itself_in_the_error() {
 }
 
 #[test]
-fn a_dry_run_explains_the_settings_and_touches_nothing() {
-    bin()
-        .args(["clicker", "--cps", "20", "--dry-run"])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("left click at 20/s")
-                .and(predicate::str::contains("while f9 is held"))
-                .and(predicate::str::contains("f8 quits"))
-                .and(predicate::str::contains("dry run")),
-        );
-}
-
-#[test]
 fn the_prototypes_flags_still_work() {
     // `--toggle --cps 30 --key_press f` is a command line someone may have in their shell
     // history from the Python version.
     bin()
         .args([
-            "clicker",
+            "simulate",
+            "tests/fixtures/hold.txt",
             "--toggle",
             "--cps",
             "30",
             "--key_press",
             "f",
-            "--dry-run",
+            // Past the fixture's 520ms release: toggle latches ON there, so the window has
+            // to outlast it for anything to be emitted at all.
+            "--until-ms",
+            "1000",
         ])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("f key press at 30/s")
-                .and(predicate::str::contains("after tapping f9")),
-        );
+        // The timeline proves the flags took EFFECT, not merely that they parsed: `--key_press f`
+        // makes the emitted actions key presses (`KD:f`) rather than the default button clicks.
+        .stdout(predicate::str::contains("KD:f").and(predicate::str::contains("BD:left").not()));
 }
 
 #[test]
@@ -206,9 +195,11 @@ fn simulate_replays_a_script_and_prints_the_timeline() {
         .assert()
         .success()
         .stdout(
-            // Eleven clicks, one every 50ms, from a 520ms hold at 20/s.
-            predicate::str::contains("0 BD:left BU:left | 50 BD:left BU:left")
-                .and(predicate::str::contains("| 500 BD:left BU:left"))
+            // Eleven clicks, one every 50ms, from a 520ms hold at 20/s — and each one is a
+            // press held 8ms before its release, never a press and release at the same
+            // instant, which applications discard as a zero-duration click.
+            predicate::str::contains("0 BD:left | 8 BU:left | 50 BD:left | 58 BU:left")
+                .and(predicate::str::contains("| 500 BD:left | 508 BU:left"))
                 .and(predicate::str::contains("11 repetitions"))
                 .and(predicate::str::contains("nothing left held")),
         );

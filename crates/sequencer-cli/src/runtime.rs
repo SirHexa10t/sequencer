@@ -206,6 +206,18 @@ pub fn fuse_limit(cps: f64) -> u32 {
     scaled.max(DEFAULT_MAX_EMITS_PER_SEC)
 }
 
+/// The longest gap between two repetitions that still counts as one continuous burst.
+///
+/// Four times the requested period, and at least a quarter-second. Generous on purpose: a
+/// machine that stutters must not be mistaken for the user letting go. Still far shorter than
+/// any real pause between two deliberate presses, which is the thing being excluded.
+///
+/// Derived from the *requested* cadence rather than from [`fuse_limit`], which floors at
+/// [`DEFAULT_MAX_EMITS_PER_SEC`] and so tells you nothing about a rate below 5000/s.
+fn burst_gap(cadence: Duration) -> Duration {
+    (cadence * 4).max(Duration::from_millis(250))
+}
+
 /// Releases everything the sink holds when the loop leaves, however it leaves.
 ///
 /// Owns the borrow rather than taking one alongside, because a guard that merely borrowed
@@ -238,9 +250,17 @@ pub struct RunSummary {
     pub quit: bool,
     /// How long the repeater was actually firing, summed across activations.
     ///
-    /// Only the time between the first and last repetition, not the whole run, so idle
-    /// time waiting for the trigger does not drag the measured rate down.
+    /// Genuinely summed: the gap between two repetitions counts only when they belong to
+    /// the same burst. Measuring first-to-last instead would fold every pause BETWEEN
+    /// activations into the total — tap the trigger a few times over a minute and a perfect
+    /// 20/s reads as 3/s, which looks like a broken tool rather than a user thinking.
     pub active: Duration,
+    /// Gaps counted into [`Self::active`] — the denominator's matching numerator.
+    ///
+    /// Not `iterations - 1`: that counts the spans BETWEEN bursts too, which `active`
+    /// deliberately excludes, and dividing one by the other would understate the rate by
+    /// exactly the share of repetitions that started a burst.
+    pub paced_spans: u64,
 }
 
 impl RunSummary {
@@ -249,21 +269,24 @@ impl RunSummary {
         self.slots_skipped += u64::from(stats.slots_skipped);
     }
 
-    /// Repetitions per second actually achieved, if enough of them happened to say.
+    /// Repetitions per second this process actually *sent*, if enough happened to say.
     ///
     /// The number that matters when the requested rate is near what the machine can do:
-    /// "you asked for 5000 and got 3200" is the answer, and a rate the tool silently
+    /// "you asked for 5000 and sent 3200" is the answer, and a rate the tool silently
     /// failed to hit would otherwise look like success.
+    ///
+    /// Deliberately not called "achieved": it counts events handed to the backend, and the
+    /// input stack above can still coalesce or drop them. `bench` is the one that measures
+    /// what came back out of the kernel.
     #[must_use]
-    pub fn achieved_cps(&self) -> Option<f64> {
+    pub fn sent_cps(&self) -> Option<f64> {
         let seconds = self.active.as_secs_f64();
-        (self.iterations > 1 && seconds > 0.0).then(|| {
-            // `iterations - 1` because N repetitions span N-1 gaps.
+        (self.paced_spans > 0 && seconds > 0.0).then(|| {
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "a count this large would need centuries of clicking"
             )]
-            let spans = (self.iterations - 1) as f64;
+            let spans = self.paced_spans as f64;
             spans / seconds
         })
     }
@@ -281,6 +304,7 @@ pub fn run_engine(
     clock: &dyn Clock,
     pump: &mut dyn EventPump,
     max_emits_per_sec: u32,
+    cadence: Duration,
 ) -> Result<RunSummary, Error> {
     let guard = ReleaseGuard { sink };
     let mut buf = EmitBuf::new();
@@ -290,16 +314,24 @@ pub fn run_engine(
     // Bracketing the repetitions rather than the whole run: time spent idle waiting for
     // the trigger is not time the machine failed to click in, and counting it would make
     // the achieved rate meaningless.
-    let mut first_iteration: Option<Timestamp> = None;
-    let mut last_iteration = Timestamp::ZERO;
+    // Burst accounting: the previous repetition's instant, and how far apart two of them
+    // may be while still counting as the same burst.
+    let mut previous_iteration: Option<Timestamp> = None;
+    let same_burst = burst_gap(cadence);
 
     'run: loop {
         let now = clock.now();
         let outcome = engine.tick(now, &mut buf);
         summary.absorb(outcome.stats);
         if outcome.stats.iterations_started > 0 {
-            first_iteration.get_or_insert(now);
-            last_iteration = now;
+            if let Some(previous) = previous_iteration {
+                let gap = now.saturating_sub(previous);
+                if gap <= same_burst {
+                    summary.active += gap;
+                    summary.paced_spans += 1;
+                }
+            }
+            previous_iteration = Some(now);
         }
 
         if !buf.is_empty() {
@@ -342,9 +374,6 @@ pub fn run_engine(
     }
     let _ = guard.sink.flush();
 
-    summary.active =
-        first_iteration.map_or(Duration::ZERO, |start| last_iteration.saturating_sub(start));
-
     match failure {
         Some(err) => Err(err),
         None => Ok(summary),
@@ -352,10 +381,68 @@ pub fn run_engine(
 }
 
 #[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    /// The bug this replaced: two short bursts a long way apart used to be measured
+    /// first-repetition-to-last, folding the idle minute between them into "active" and
+    /// reporting a fraction of the real rate.
+    #[test]
+    fn idle_time_between_activations_is_not_counted_as_clicking() {
+        let mut summary = RunSummary::default();
+        // Two bursts of 20/s (50ms apart), separated by a 30-second pause.
+        for _ in 0..10 {
+            summary.active += Duration::from_millis(50);
+            summary.paced_spans += 1;
+        }
+        summary.iterations = 22; // 11 repetitions per burst; the pause spans none
+        assert_eq!(
+            summary.sent_cps().map(f64::round),
+            Some(20.0),
+            "the pause between bursts must not drag the rate down"
+        );
+    }
+
+    /// `iterations - 1` would count the between-burst span as a gap that `active` never
+    /// included — the exact mismatch that made the old figure look like a slow machine.
+    #[test]
+    fn the_numerator_counts_only_the_gaps_the_denominator_measured() {
+        let summary = RunSummary {
+            iterations: 100,
+            paced_spans: 10,
+            active: Duration::from_secs(1),
+            ..RunSummary::default()
+        };
+        assert_eq!(summary.sent_cps(), Some(10.0), "spans, not iterations");
+    }
+
+    /// A single repetition spans no gap, so there is nothing to divide — better no figure
+    /// than a fabricated one.
+    #[test]
+    fn one_lonely_repetition_reports_no_rate() {
+        let summary = RunSummary {
+            iterations: 1,
+            ..RunSummary::default()
+        };
+        assert_eq!(summary.sent_cps(), None);
+    }
+
+    /// The window has to be forgiving of a machine stuttering, but nowhere near long enough
+    /// to swallow a human pause between two deliberate presses.
+    #[test]
+    fn the_burst_window_tolerates_stutter_but_not_thinking() {
+        // 20/s requested -> fuse of 80/s -> 12.5ms quarter-period -> 200ms window.
+        let window = burst_gap(Duration::from_millis(50));
+        assert!(window >= Duration::from_millis(150), "{window:?} is too strict for a stutter");
+        assert!(window <= Duration::from_millis(400), "{window:?} would swallow a real pause");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sequencer_core::CompiledProfile;
-    use sequencer_core::click::ClickConfig;
+    use sequencer_core::clicker::ClickConfig;
     use sequencer_core::input::{EventKind, Key};
     use sequencer_core::testutil::VirtualClock;
     use sequencer_input::MockInjector;
@@ -385,6 +472,7 @@ mod tests {
             &clock,
             &mut pump,
             DEFAULT_MAX_EMITS_PER_SEC,
+            Duration::from_millis(50),
         )
         .expect("should run");
 
@@ -405,6 +493,7 @@ mod tests {
             &clock,
             &mut pump,
             DEFAULT_MAX_EMITS_PER_SEC,
+            Duration::from_millis(50),
         )
         .expect("should run");
         assert!(!summary.quit);
@@ -429,6 +518,7 @@ mod tests {
             &clock,
             &mut pump,
             DEFAULT_MAX_EMITS_PER_SEC,
+            Duration::from_millis(50),
         )
         .expect("should run");
 
@@ -439,20 +529,23 @@ mod tests {
 
     #[test]
     fn the_achieved_rate_measures_only_the_time_spent_repeating() {
+        // 100 gaps measured across one second of firing is 100/s. The iteration count is no
+        // longer the numerator — see `summary_tests` for why counting it overstated the
+        // denominator whenever a run had more than one burst.
         let mut summary = RunSummary {
             iterations: 101,
+            paced_spans: 100,
             active: Duration::from_secs(1),
             ..RunSummary::default()
         };
-        // 101 repetitions span 100 gaps, so one second of them is 100/s, not 101/s.
-        assert!((summary.achieved_cps().unwrap() - 100.0).abs() < 0.001);
+        assert!((summary.sent_cps().unwrap() - 100.0).abs() < 0.001);
 
         // Too little to say anything: better to report nothing than a made-up number.
-        summary.iterations = 1;
-        assert_eq!(summary.achieved_cps(), None);
-        summary.iterations = 50;
+        summary.paced_spans = 0;
+        assert_eq!(summary.sent_cps(), None);
+        summary.paced_spans = 50;
         summary.active = Duration::ZERO;
-        assert_eq!(summary.achieved_cps(), None);
+        assert_eq!(summary.sent_cps(), None);
     }
 
     #[test]

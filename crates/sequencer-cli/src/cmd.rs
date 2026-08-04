@@ -1,15 +1,16 @@
 //! What each subcommand actually does.
 
-use sequencer_core::click::{ActivationMode, ClickAction, ClickConfig};
 use sequencer_core::input::{EventKind, InputEvent, Key};
 use sequencer_core::testutil::Harness;
 use sequencer_core::time::Timestamp;
 use sequencer_core::{CompiledProfile, Engine};
+use std::io::IsTerminal as _;
+
 use sequencer_input::probe::{CheckResult, Step as FixStep};
 use sequencer_input::{Requirement, SessionInfo};
 
-use crate::args::{BenchArgs, ClickerArgs, DoctorArgs, SimulateArgs};
-use crate::runtime::{RunSummary, fuse_limit, run_engine};
+use crate::args::{BenchArgs, DoctorArgs, SimulateArgs};
+use crate::runtime::{RunSummary, run_engine};
 use crate::{Deps, Error, Result, exit};
 
 /// Every requirement the Linux backend needs, in report order.
@@ -19,103 +20,20 @@ const REQUIREMENTS: &[Requirement] = &[
     Requirement::EvdevReadable,
 ];
 
-/// `sequencer clicker`.
-///
-/// # Errors
-///
-/// If the settings do not describe a runnable profile, or the input devices cannot be
-/// opened.
-pub fn clicker(args: &ClickerArgs, deps: &mut Deps<'_>) -> Result<u8> {
-    let config = args.config();
-    let profile = CompiledProfile::validate(config.to_profile()?)?;
-
-    if args.dry_run {
-        describe(&config, deps)?;
-        writeln!(deps.out, "\ndry run: nothing was sent to any application.")?;
-        return Ok(exit::OK);
-    }
-
-    if !args.global.quiet {
-        describe(&config, deps)?;
-        writeln!(deps.out)?;
-        deps.out.flush()?;
-    }
-
-    let summary = run_profile(profile, fuse_limit(config.cps), deps)?;
-    report(&summary, args, deps)?;
-    Ok(exit::OK)
-}
-
 /// Runs a validated profile, using the injected sink and pump if there are any.
-fn run_profile(
+pub(crate) fn run_profile(
     profile: CompiledProfile,
     max_emits_per_sec: u32,
+    cadence: sequencer_core::time::Duration,
+    hotkeys: &[Key],
     deps: &mut Deps<'_>,
 ) -> Result<RunSummary> {
     let mut engine = Engine::new(profile, 0);
 
     if let (Some(sink), Some(pump)) = (deps.sink.as_deref_mut(), deps.pump.as_deref_mut()) {
-        return run_engine(&mut engine, sink, deps.clock, pump, max_emits_per_sec);
+        return run_engine(&mut engine, sink, deps.clock, pump, max_emits_per_sec, cadence);
     }
-    platform::run(&mut engine, max_emits_per_sec)
-}
-
-/// Prints the settings in the words a user would use, so a surprising result can be
-/// traced to a flag rather than guessed at.
-fn describe(config: &ClickConfig, deps: &mut Deps<'_>) -> Result<()> {
-    let what = match config.action {
-        ClickAction::Button(button) => format!("{button} click"),
-        ClickAction::Key(key) => format!("{key} key press"),
-    };
-    let how = match config.mode {
-        ActivationMode::Hold => format!("while {} is held", config.activate),
-        ActivationMode::Toggle => format!("after tapping {}, until tapped again", config.activate),
-    };
-    let limit = match config.limit {
-        0 => String::from("no limit"),
-        n => format!("stopping after {n}"),
-    };
-    writeln!(
-        deps.out,
-        "{what} at {cps}/s, {how} ({limit}). {quit} quits.",
-        cps = config.cps,
-        quit = config.quit,
-    )?;
-    Ok(())
-}
-
-fn report(summary: &RunSummary, args: &ClickerArgs, deps: &mut Deps<'_>) -> Result<()> {
-    if args.global.quiet {
-        return Ok(());
-    }
-    match summary.achieved_cps() {
-        Some(rate) => writeln!(
-            deps.out,
-            "{} actions over {} repetitions, {rate:.0}/s achieved (asked for {}/s).",
-            summary.emitted, summary.iterations, args.cps
-        )?,
-        None => writeln!(
-            deps.out,
-            "{} actions sent over {} repetitions.",
-            summary.emitted, summary.iterations
-        )?,
-    }
-    if summary.slots_skipped > 0 {
-        writeln!(
-            deps.out,
-            "{} repetitions were skipped: this machine could not keep up with {}/s. \
-             The achieved rate above is what it can actually do.",
-            summary.slots_skipped, args.cps
-        )?;
-    }
-    if summary.throttled > 0 {
-        writeln!(
-            deps.out,
-            "{} actions were dropped by the output rate limit.",
-            summary.throttled
-        )?;
-    }
-    Ok(())
+    platform::run(&mut engine, max_emits_per_sec, cadence, hotkeys)
 }
 
 /// `sequencer bench`.
@@ -135,7 +53,14 @@ pub fn bench(args: &BenchArgs, deps: &mut Deps<'_>) -> Result<u8> {
     }
     deps.out.flush()?;
 
-    let result = sequencer_input::linux::bench::run(args.cps, args.seconds)?;
+    let mut observer = BenchProgress {
+        live: std::io::stderr().is_terminal(),
+    };
+    let result = sequencer_input::linux::bench::run(args.cps, args.seconds, &mut observer)?;
+    if observer.live {
+        // Wipe the progress line so the summary starts on clean ground.
+        eprint!("\r\u{1b}[K");
+    }
 
     writeln!(deps.out)?;
     if let Some(requested) = args.cps {
@@ -169,6 +94,39 @@ pub fn bench(args: &BenchArgs, deps: &mut Deps<'_>) -> Result<u8> {
     Ok(exit::OK)
 }
 
+/// Renders the benchmark's live progress, and sheds root once the devices are open.
+///
+/// Progress goes to **stderr**, not `deps.out`: it is a carriage-return-overwritten line
+/// meant for a watching human, and mixing it into the stream a caller may be capturing
+/// would leave a pile of `\r`-joined junk in their file. It is suppressed entirely when
+/// stderr is not a terminal, so a redirected run just prints its summary.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+struct BenchProgress {
+    live: bool,
+}
+
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+impl sequencer_input::linux::BenchObserver for BenchProgress {
+    fn devices_open(&mut self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    {
+        crate::elevate::drop_root_after_open().map_err(Into::into)
+    }
+
+    fn sample(&mut self, sample: sequencer_input::linux::BenchSample) {
+        if !self.live {
+            return;
+        }
+        // `\r` + erase-to-end-of-line: one line, rewritten, no scrollback spam.
+        eprint!(
+            "\r\u{1b}[K  {:>5.1}s   emitting {:>8.0}/s   delivered {:>8.0}/s",
+            sample.elapsed.as_secs_f64(),
+            sample.emitted_rate(),
+            sample.delivered_rate(),
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
 /// `sequencer bench`, on a platform with no backend.
 ///
 /// # Errors
@@ -195,6 +153,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         std::env::consts::ARCH
     )?;
     writeln!(deps.out, "session: {}", info.session)?;
+    writeln!(deps.out, "backend: {}", injection_backend())?;
     if args.global.verbose > 0 {
         for (label, value) in [
             ("DISPLAY", info.display.as_deref()),
@@ -241,8 +200,8 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     } else {
         writeln!(
             deps.out,
-            "\nUntil that is fixed, `sequencer simulate` and `clicker --dry-run` still \
-             work: neither touches an input device."
+            "\nUntil that is fixed, `sequencer simulate` still works: it runs the engine \
+             without touching an input device."
         )?;
         Ok(exit::FAILURE)
     }
@@ -354,33 +313,56 @@ fn parse_script(source: &str) -> Result<Vec<(Timestamp, EventKind)>> {
     Ok(events)
 }
 
+/// Which injection backend a run would choose right now, for `doctor` to report. Mirrors
+/// `platform::open_sink`'s decision without connecting to anything: XTEST when this is an
+/// X11 session and the feature is built, the uinput device otherwise. On XTEST the uinput
+/// requirements below are informational — injection skips the device, though the hotkey is
+/// still read through evdev.
+fn injection_backend() -> &'static str {
+    if cfg!(feature = "xtest") && std::env::var_os("DISPLAY").is_some() {
+        "X11 — XTEST for clicks, key grabs for hotkeys (no device access, no sudo)"
+    } else {
+        "uinput device for clicks, evdev for hotkeys"
+    }
+}
+
 /// The parts that need a real operating system, and the stubs that stand in when there is
 /// no backend for this one.
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 mod platform {
     use super::{Result, RunSummary, run_engine};
     use sequencer_core::Engine;
-    use sequencer_input::{EvdevCapture, SystemClock, UinputSink};
+    use sequencer_core::emit::InputSink;
+    use sequencer_input::{Epoch, EvdevCapture, SystemClock};
 
     pub(super) const AVAILABLE: bool = true;
 
     /// Opens the devices and drives the engine until it quits.
-    pub(super) fn run(engine: &mut Engine, max_emits_per_sec: u32) -> Result<RunSummary> {
+    pub(super) fn run(
+        engine: &mut Engine,
+        max_emits_per_sec: u32,
+        cadence: sequencer_core::time::Duration,
+        hotkeys: &[sequencer_core::input::Key],
+    ) -> Result<RunSummary> {
         // One epoch shared by the clock and the capture threads, so an event's timestamp
         // and the engine's deadlines sit on the same timeline and the cadence
         // phase-locks to the physical press.
-        let epoch = sequencer_input::Epoch::start();
+        let epoch = Epoch::start();
         let clock = SystemClock::from_epoch(epoch.instant());
 
+        // Session mode's window: as root (if sudo brought us here), make sure the module
+        // is loaded, open everything, then shed the privilege before the engine runs.
         // The sink opens first: capture excludes our virtual device by name, so it has to
         // exist before the reader threads enumerate.
-        let mut sink = UinputSink::open()?;
-        let mut capture = EvdevCapture::new(epoch);
-        let stream = capture.start()?;
-        tracing::info!(devices = capture.watching(), "watching input devices");
+        crate::elevate::load_uinput_if_root();
+        let mut sink = open_sink()?;
+        let mut capture = open_capture(&epoch, hotkeys)?;
+        let stream = capture.stream();
+        crate::elevate::drop_root_after_open()?;
 
         let mut pump = crate::runtime::CapturePump::new(stream, &clock);
-        let summary = run_engine(engine, &mut sink, &clock, &mut pump, max_emits_per_sec);
+        let summary =
+            run_engine(engine, sink.as_mut(), &clock, &mut pump, max_emits_per_sec, cadence);
         let dropped = pump.dropped();
         capture.stop();
 
@@ -388,6 +370,83 @@ mod platform {
             tracing::warn!(dropped, "input events were lost while the loop was busy");
         }
         summary
+    }
+
+    /// The hotkey source, chosen the same way the sink is.
+    ///
+    /// On X11 a passive grab on just the bound keys needs no privilege at all — which is what
+    /// makes a whole X11 run password-free, since injection went to XTEST too. Everywhere
+    /// else, and if the grab is refused for a reason sudo cannot fix, evdev.
+    fn open_capture(epoch: &Epoch, hotkeys: &[sequencer_core::input::Key]) -> Result<Capture> {
+        #[cfg(feature = "xtest")]
+        if std::env::var_os("DISPLAY").is_some() {
+            match sequencer_input::GrabCapture::start(epoch.clone(), hotkeys) {
+                Ok((capture, stream)) => {
+                    tracing::info!(keys = hotkeys.len(), "hotkeys grabbed through X11");
+                    return Ok(Capture::Grab(capture, Some(stream)));
+                }
+                Err(err) => {
+                    // A key another program owns is worth saying out loud: evdev would work,
+                    // but only after a password prompt, and the user can just pick a free key.
+                    tracing::warn!(%err, "X11 grab unavailable; falling back to reading devices");
+                }
+            }
+        }
+        let mut capture = EvdevCapture::new(epoch.clone());
+        let stream = capture.start()?;
+        tracing::info!(devices = capture.watching(), "watching input devices");
+        Ok(Capture::Evdev(capture, Some(stream)))
+    }
+
+    /// Whichever capture backend the run picked, with one shape for the caller.
+    enum Capture {
+        Evdev(EvdevCapture, Option<sequencer_input::CaptureStream>),
+        #[cfg(feature = "xtest")]
+        Grab(sequencer_input::GrabCapture, Option<sequencer_input::CaptureStream>),
+    }
+
+    impl Capture {
+        /// Takes the event stream. Called once; the backend keeps filling it until `stop`.
+        fn stream(&mut self) -> sequencer_input::CaptureStream {
+            match self {
+                Self::Evdev(_, stream) => stream.take(),
+                #[cfg(feature = "xtest")]
+                Self::Grab(_, stream) => stream.take(),
+            }
+            .expect("the stream is taken exactly once, right after opening")
+        }
+
+        fn stop(&mut self) {
+            match self {
+                Self::Evdev(capture, _) => capture.stop(),
+                #[cfg(feature = "xtest")]
+                Self::Grab(capture, _) => capture.stop(),
+            }
+        }
+    }
+
+    /// The injection backend, chosen at runtime.
+    ///
+    /// XTEST when `$DISPLAY` names an X11 session and it opens — it injects above libinput,
+    /// which is what lets it exceed the device path's click-rate ceiling (see
+    /// [`sequencer_input::xtest`]). Otherwise, and on Wayland or the console, the uinput
+    /// device. An XTEST *build* that finds no usable X server falls back rather than failing:
+    /// the uinput backend works everywhere, just slower past the ceiling.
+    fn open_sink() -> Result<Box<dyn InputSink>> {
+        #[cfg(feature = "xtest")]
+        if std::env::var_os("DISPLAY").is_some() {
+            match sequencer_input::XTestSink::open() {
+                Ok(sink) => {
+                    tracing::info!("injecting through XTEST (X11, above libinput)");
+                    return Ok(Box::new(sink));
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "XTEST unavailable; falling back to the uinput device");
+                }
+            }
+        }
+        tracing::info!("injecting through the uinput device");
+        Ok(Box::new(sequencer_input::UinputSink::open()?))
     }
 }
 
@@ -406,7 +465,12 @@ mod platform {
         )))
     }
 
-    pub(super) fn run(_engine: &mut Engine, _max_emits_per_sec: u32) -> Result<RunSummary> {
+    pub(super) fn run(
+        _engine: &mut Engine,
+        _max_emits_per_sec: u32,
+        _cadence: sequencer_core::time::Duration,
+        _hotkeys: &[sequencer_core::input::Key],
+    ) -> Result<RunSummary> {
         unsupported()
     }
 }

@@ -89,7 +89,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub mod click;
+pub mod clicker;
 pub mod emit;
 pub mod engine;
 pub mod input;
@@ -101,7 +101,7 @@ pub mod validate;
 
 pub mod testutil;
 
-pub use crate::click::{ActivationMode, ClickAction, ClickConfig};
+pub use crate::clicker::{ActivationMode, ClickAction, ClickConfig};
 pub use crate::emit::{Emit, EmitAction, EmitBuf, Holdable, InputSink, SinkError};
 pub use crate::engine::{Engine, TickOutcome, TickStats};
 pub use crate::input::{Button, EventKind, EventOrigin, InputEvent, Key};

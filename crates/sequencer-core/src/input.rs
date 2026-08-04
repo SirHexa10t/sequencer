@@ -260,8 +260,14 @@ impl FromStr for Key {
 }
 
 impl fmt::Display for Key {
+    /// The name a user would write, cased the way the key is *labelled*: `F9`, not `f9`. The
+    /// parse table is lowercase because input is matched case-insensitively; output is read by
+    /// someone looking at a keyboard.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match KEY_NAMES.iter().find(|(_, key)| key == self) {
+            Some((name, _)) if is_function_key(name) => {
+                write!(f, "F{}", &name[1..])
+            }
             Some((name, _)) => f.write_str(name),
             // Only reachable for `Hid`, which by construction has no table entry.
             None => match self {
@@ -270,6 +276,12 @@ impl fmt::Display for Key {
             },
         }
     }
+}
+
+/// Whether a table name is a function key (`f` followed by digits) — `f9` yes, `find` no.
+fn is_function_key(name: &str) -> bool {
+    name.strip_prefix('f')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `str::strip_prefix`, but comparing ASCII case-insensitively.

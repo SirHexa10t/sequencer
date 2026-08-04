@@ -24,6 +24,65 @@ use sequencer_core::time::Timestamp;
 
 use crate::linux::UinputSink;
 
+/// A snapshot taken while the loop is still running, so a caller can show progress rather
+/// than a frozen terminal. Same two counters as [`BenchResult`], mid-flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchSample {
+    /// Press/release pairs written so far.
+    pub emitted: u64,
+    /// Pairs read back off the device so far. Lags `emitted` slightly — the reader is
+    /// asynchronous — which is why the final figure gets a settling pause and this one is
+    /// explicitly a *live* reading, not a verdict.
+    pub delivered: u64,
+    /// Time since the first write.
+    pub elapsed: Duration,
+}
+
+impl BenchSample {
+    /// Pairs per second written, so far.
+    #[must_use]
+    pub fn emitted_rate(&self) -> f64 {
+        rate(self.emitted, self.elapsed)
+    }
+
+    /// Pairs per second read back, so far.
+    #[must_use]
+    pub fn delivered_rate(&self) -> f64 {
+        rate(self.delivered, self.elapsed)
+    }
+}
+
+/// How often [`BenchObserver::sample`] fires. Fast enough to look live, slow enough that
+/// the rendering cannot itself become the bottleneck being measured.
+const SAMPLE_EVERY: Duration = Duration::from_millis(250);
+
+/// Hooks into a running benchmark. Both methods have defaults, so a caller that wants
+/// neither passes a unit struct and reads only the final [`BenchResult`].
+pub trait BenchObserver {
+    /// Called once, after the virtual device is created and opened for read-back, before
+    /// any measuring begins.
+    ///
+    /// This is the window a caller that elevated *only to open the devices* uses to shed
+    /// that privilege — the descriptors are already open, so the measurement runs
+    /// unprivileged. Returning an error aborts the benchmark before it writes anything.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the caller could not do; the benchmark reports it and stops.
+    fn devices_open(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    /// Called roughly every [`SAMPLE_EVERY`] while the loop runs.
+    fn sample(&mut self, _sample: BenchSample) {}
+}
+
+/// An observer that does nothing — the plain "just measure it" case.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Unobserved;
+
+impl BenchObserver for Unobserved {}
+
 /// What a benchmark measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BenchResult {
@@ -67,7 +126,11 @@ fn rate(count: u64, elapsed: Duration) -> f64 {
 /// # Errors
 ///
 /// If the virtual device cannot be created or its own event node cannot be found.
-pub fn run(cps: Option<f64>, seconds: f64) -> Result<BenchResult, BenchError> {
+pub fn run(
+    cps: Option<f64>,
+    seconds: f64,
+    observer: &mut dyn BenchObserver,
+) -> Result<BenchResult, BenchError> {
     let mut sink = UinputSink::open().map_err(|source| BenchError::Device(Box::new(source)))?;
 
     // Read our own device back. Everything else in this crate deliberately excludes it;
@@ -81,6 +144,12 @@ pub fn run(cps: Option<f64>, seconds: f64) -> Result<BenchResult, BenchError> {
     let device = Device::open(&node).map_err(BenchError::DevNodes)?;
 
     let delivered = Arc::new(AtomicU64::new(0));
+    // Everything that needs privilege has happened: the device exists and is open for
+    // read-back. A caller elevated purely for that drops it here, before a single write.
+    observer
+        .devices_open()
+        .map_err(|source| BenchError::Aborted { source })?;
+
     let reading = Arc::new(AtomicBool::new(true));
     spawn_counter(device, Arc::clone(&delivered), Arc::clone(&reading));
 
@@ -88,7 +157,13 @@ pub fn run(cps: Option<f64>, seconds: f64) -> Result<BenchResult, BenchError> {
     // count is not short by whatever it missed while spawning.
     thread::sleep(Duration::from_millis(50));
 
-    let emitted = drive(&mut sink, cps, Duration::from_secs_f64(seconds))?;
+    let emitted = drive(
+        &mut sink,
+        cps,
+        Duration::from_secs_f64(seconds),
+        &delivered,
+        observer,
+    )?;
     let elapsed_at_stop = Instant::now();
 
     // Reading is asynchronous, so give the kernel a moment to hand over what is already
@@ -114,6 +189,8 @@ fn drive(
     sink: &mut UinputSink,
     cps: Option<f64>,
     duration: Duration,
+    delivered: &AtomicU64,
+    observer: &mut dyn BenchObserver,
 ) -> Result<Emitted, BenchError> {
     let down = Emit {
         at: Timestamp::ZERO,
@@ -134,6 +211,7 @@ fn drive(
     let started = Instant::now();
     let deadline = started + duration;
     let mut count = 0_u64;
+    let mut next_sample = started + SAMPLE_EVERY;
 
     while Instant::now() < deadline {
         sink.emit(&down)
@@ -141,6 +219,19 @@ fn drive(
         sink.emit(&up).map_err(|e| BenchError::Emit(Box::new(e)))?;
         sink.flush().map_err(|e| BenchError::Emit(Box::new(e)))?;
         count += 1;
+
+        // Checked against a wall-clock deadline rather than every Nth write: at an
+        // unbounded ceiling run the write count per second is exactly what is unknown,
+        // so a count-based interval would sample wildly too often or too rarely.
+        let now = Instant::now();
+        if now >= next_sample {
+            observer.sample(BenchSample {
+                emitted: count,
+                delivered: delivered.load(Ordering::Relaxed),
+                elapsed: now.duration_since(started),
+            });
+            next_sample = now + SAMPLE_EVERY;
+        }
 
         if let Some(period) = period {
             // Absolute deadlines, so a slow iteration does not push every later one back
@@ -194,11 +285,65 @@ pub enum BenchError {
     /// A write failed part-way through.
     #[error("{0}")]
     Emit(#[source] Box<sequencer_core::SinkError>),
+    /// The observer refused to continue once the devices were open.
+    #[error("benchmark stopped before measuring: {source}")]
+    Aborted {
+        /// Why the caller stopped it.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live sample must divide by *its own* elapsed span, not the whole run — a
+    /// mid-flight reading that used the total duration would report a rate climbing from
+    /// near-zero rather than the steady one actually being achieved.
+    #[test]
+    fn a_live_sample_reports_the_rate_so_far_not_a_fraction_of_the_target() {
+        let half_way = BenchSample {
+            emitted: 500,
+            delivered: 480,
+            elapsed: Duration::from_millis(500),
+        };
+        assert!((half_way.emitted_rate() - 1000.0).abs() < f64::EPSILON);
+        assert!((half_way.delivered_rate() - 960.0).abs() < f64::EPSILON);
+    }
+
+    /// An observer that wants nothing must not have to say so twice: both hooks default,
+    /// so `Unobserved` is a complete implementation.
+    #[test]
+    fn the_unobserved_case_needs_no_methods() {
+        let mut observer = Unobserved;
+        assert!(observer.devices_open().is_ok());
+        observer.sample(BenchSample {
+            emitted: 1,
+            delivered: 1,
+            elapsed: Duration::from_secs(1),
+        });
+    }
+
+    /// A refusal at the devices-open hook stops the run before anything is written — the
+    /// promise session mode relies on when the drop fails.
+    #[test]
+    fn a_refusal_once_devices_are_open_aborts_and_keeps_the_reason() {
+        struct Refuses;
+        impl BenchObserver for Refuses {
+            fn devices_open(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err("could not drop root".into())
+            }
+        }
+        let err = BenchError::Aborted {
+            source: Box::new(io::Error::other("could not drop root")),
+        };
+        assert!(err.to_string().contains("stopped before measuring"), "{err}");
+        assert!(std::error::Error::source(&err).is_some(), "the cause must survive");
+        // The trait object is usable as written (compile-time half of the guarantee).
+        let mut refuses = Refuses;
+        assert!((&mut refuses as &mut dyn BenchObserver).devices_open().is_err());
+    }
 
     #[test]
     fn rates_divide_by_the_measured_span() {
@@ -223,6 +368,18 @@ mod tests {
 
     #[test]
     fn a_short_benchmark_reports_something_plausible() {
+        /// Counts the progress callbacks: a live rate nobody ever receives is the same as
+        /// no live rate at all.
+        struct Counting {
+            samples: u32,
+        }
+        impl BenchObserver for Counting {
+            fn sample(&mut self, sample: BenchSample) {
+                assert!(sample.elapsed > Duration::ZERO, "a sample must span some time");
+                self.samples += 1;
+            }
+        }
+
         if std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/uinput")
@@ -231,7 +388,10 @@ mod tests {
             eprintln!("skipping: /dev/uinput is not writable here");
             return;
         }
-        let result = run(Some(200.0), 0.3).expect("bench should run");
+        // At 250ms apart over 0.3s, at least one sample is due.
+        let mut observer = Counting { samples: 0 };
+        let result = run(Some(200.0), 0.3, &mut observer).expect("bench should run");
+        assert!(observer.samples > 0, "the run reported no live progress at all");
         assert!(result.emitted > 0, "nothing was emitted");
         assert!(
             result.delivered <= result.emitted,

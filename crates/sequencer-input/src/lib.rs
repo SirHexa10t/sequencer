@@ -17,14 +17,18 @@
 
 pub mod capture;
 pub mod clock;
-#[cfg(all(feature = "evdev", target_os = "linux"))]
+#[cfg(all(any(feature = "evdev", feature = "xtest"), target_os = "linux"))]
 pub mod linux;
 pub mod mock;
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+pub mod x11;
 pub mod probe;
 
 pub use crate::capture::{CaptureStream, Epoch, EventQueue};
 pub use crate::clock::SystemClock;
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 pub use crate::linux::{EvdevCapture, UinputSink};
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+pub use crate::x11::{GrabCapture, XTestSink};
 pub use crate::mock::MockInjector;
 pub use crate::probe::{CheckResult, Remediation, Requirement, Session, SessionInfo};

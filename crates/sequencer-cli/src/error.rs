@@ -49,6 +49,13 @@ pub enum Error {
     #[error("could not write output")]
     Io(#[from] std::io::Error),
 
+    /// Session mode could not shed root after opening the devices.
+    ///
+    /// The password prompt promised the drop; running on as root would break that
+    /// promise silently, so the run is refused instead.
+    #[error("could not drop root after opening the devices: {0}")]
+    Privilege(String),
+
     /// Something real but not built yet.
     ///
     /// Kept as an explicit variant rather than faked: a subcommand that pretends to work
@@ -67,9 +74,11 @@ impl Error {
             Self::Config(_) | Self::Script { .. } => exit::USAGE,
             #[cfg(all(feature = "evdev", target_os = "linux"))]
             Self::Capture(_) | Self::Bench(_) => exit::FAILURE,
-            Self::Sink(_) | Self::Io(_) | Self::ScriptRead { .. } | Self::NotImplemented(_) => {
-                exit::FAILURE
-            }
+            Self::Sink(_)
+            | Self::Io(_)
+            | Self::ScriptRead { .. }
+            | Self::Privilege(_)
+            | Self::NotImplemented(_) => exit::FAILURE,
         }
     }
 }

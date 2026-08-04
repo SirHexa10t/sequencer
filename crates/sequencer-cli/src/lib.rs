@@ -66,8 +66,16 @@
 // `run_clicker` -- which is exactly what an embedder who wants the engine and not the
 // command line asks for.
 #[cfg(feature = "cli")]
+pub mod clicker;
 pub mod cmd;
 pub mod runtime;
+pub mod write_script;
+
+#[cfg(feature = "cli")]
+mod elevate;
+mod style;
+#[cfg(feature = "cli")]
+pub use elevate::run_with_sudo_prompt;
 
 #[cfg(feature = "cli")]
 mod args;
@@ -86,11 +94,13 @@ pub use sequencer_input as input;
 
 #[cfg(feature = "cli")]
 pub use crate::args::{
-    BenchArgs, Cli, ClickerArgs, Command, DoctorArgs, GlobalArgs, MouseButton, SimulateArgs,
+    BenchArgs, Cli, Command, DoctorArgs, GlobalArgs, SimulateArgs,
 };
+pub use crate::clicker::{ClickerArgs, MouseButton};
+pub use crate::write_script::WriteScriptArgs;
 pub use crate::error::Error;
 
-use sequencer_core::click::ClickConfig;
+use sequencer_core::clicker::ClickConfig;
 use sequencer_core::emit::InputSink;
 use sequencer_core::time::Clock;
 use sequencer_core::{CompiledProfile, Engine};
@@ -272,7 +282,8 @@ pub fn try_run_command(command: &Command) -> Result<u8> {
 #[cfg(feature = "cli")]
 pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
     match command {
-        Command::Clicker(args) => cmd::clicker(args, deps),
+        Command::Clicker(args) => clicker::clicker(args, deps),
+        Command::WriteScript(args) => write_script::write_script(args, deps),
         Command::Bench(args) => cmd::bench(args, deps),
         Command::Doctor(args) => cmd::doctor(args, deps),
         Command::Simulate(args) => cmd::simulate(args, deps),
@@ -295,7 +306,7 @@ pub fn run_clicker(
 ) -> Result<RunSummary> {
     let profile = CompiledProfile::validate(config.to_profile()?)?;
     let mut engine = Engine::new(profile, 0);
-    run_engine(&mut engine, sink, clock, pump, fuse_limit(config.cps))
+    run_engine(&mut engine, sink, clock, pump, fuse_limit(config.cps), clicker::cadence_of(config.cps))
 }
 
 /// Installs a `tracing` subscriber.
