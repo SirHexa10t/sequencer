@@ -4,6 +4,8 @@ use sequencer_core::input::{EventKind, InputEvent, Key};
 use sequencer_core::testutil::Harness;
 use sequencer_core::time::Timestamp;
 use sequencer_core::{CompiledProfile, Engine};
+// Only the benchmark's live progress asks whether stderr is a terminal.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
 use std::io::IsTerminal as _;
 
 use sequencer_input::probe::{CheckResult, Step as FixStep};
@@ -31,7 +33,14 @@ pub(crate) fn run_profile(
     let mut engine = Engine::new(profile, 0);
 
     if let (Some(sink), Some(pump)) = (deps.sink.as_deref_mut(), deps.pump.as_deref_mut()) {
-        return run_engine(&mut engine, sink, deps.clock, pump, max_emits_per_sec, cadence);
+        return run_engine(
+            &mut engine,
+            sink,
+            deps.clock,
+            pump,
+            max_emits_per_sec,
+            cadence,
+        );
     }
     platform::run(&mut engine, max_emits_per_sec, cadence, hotkeys)
 }
@@ -107,8 +116,9 @@ struct BenchProgress {
 
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 impl sequencer_input::linux::BenchObserver for BenchProgress {
-    fn devices_open(&mut self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
-    {
+    fn devices_open(
+        &mut self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::elevate::drop_root_after_open().map_err(Into::into)
     }
 
@@ -196,14 +206,36 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
 
     if unmet.is_empty() {
         writeln!(deps.out, "\nReady.")?;
-        Ok(exit::OK)
-    } else {
+        return Ok(exit::OK);
+    }
+    if x11_handles_the_run() {
+        writeln!(
+            deps.out,
+            "\nNone of that is needed here: this is an X11 session, so clicks go through \
+             XTEST and hotkeys through key grabs. The checks above matter only if you \
+             later run without X."
+        )?;
+        return Ok(exit::OK);
+    }
+    {
         writeln!(
             deps.out,
             "\nUntil that is fixed, `sequencer simulate` still works: it runs the engine \
              without touching an input device."
         )?;
         Ok(exit::FAILURE)
+    }
+}
+
+/// Whether the X11 pair will handle the whole run, making the device checks informational.
+fn x11_handles_the_run() -> bool {
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    {
+        sequencer_input::x11::is_usable()
+    }
+    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
+    {
+        false
     }
 }
 
@@ -313,17 +345,20 @@ fn parse_script(source: &str) -> Result<Vec<(Timestamp, EventKind)>> {
     Ok(events)
 }
 
-/// Which injection backend a run would choose right now, for `doctor` to report. Mirrors
-/// `platform::open_sink`'s decision without connecting to anything: XTEST when this is an
-/// X11 session and the feature is built, the uinput device otherwise. On XTEST the uinput
-/// requirements below are informational — injection skips the device, though the hotkey is
-/// still read through evdev.
+/// Which backend pair a run would choose right now, for `doctor` to report.
+///
+/// Asks the same question `platform::open_pair` will — [`sequencer_input::x11::is_usable`],
+/// which connects rather than reading `$DISPLAY` — so the report cannot promise one backend
+/// and the run pick the other.
+///
+/// On the X11 pair the uinput requirements listed below are informational: neither half
+/// touches a device, and a refused grab is a hard error rather than a fall back to them.
 fn injection_backend() -> &'static str {
-    if cfg!(feature = "xtest") && std::env::var_os("DISPLAY").is_some() {
-        "X11 — XTEST for clicks, key grabs for hotkeys (no device access, no sudo)"
-    } else {
-        "uinput device for clicks, evdev for hotkeys"
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    if sequencer_input::x11::is_usable() {
+        return "X11 — XTEST for clicks, key grabs for hotkeys (no device access, no sudo)";
     }
+    "uinput device for clicks, evdev for hotkeys"
 }
 
 /// The parts that need a real operating system, and the stubs that stand in when there is
@@ -355,14 +390,19 @@ mod platform {
         // The sink opens first: capture excludes our virtual device by name, so it has to
         // exist before the reader threads enumerate.
         crate::elevate::load_uinput_if_root();
-        let mut sink = open_sink()?;
-        let mut capture = open_capture(&epoch, hotkeys)?;
+        let (mut sink, mut capture) = open_pair(&epoch, hotkeys)?;
         let stream = capture.stream();
         crate::elevate::drop_root_after_open()?;
 
         let mut pump = crate::runtime::CapturePump::new(stream, &clock);
-        let summary =
-            run_engine(engine, sink.as_mut(), &clock, &mut pump, max_emits_per_sec, cadence);
+        let summary = run_engine(
+            engine,
+            sink.as_mut(),
+            &clock,
+            &mut pump,
+            max_emits_per_sec,
+            cadence,
+        );
         let dropped = pump.dropped();
         capture.stop();
 
@@ -372,37 +412,59 @@ mod platform {
         summary
     }
 
-    /// The hotkey source, chosen the same way the sink is.
+    /// Opens the injection sink and the hotkey source as a **pair**.
     ///
-    /// On X11 a passive grab on just the bound keys needs no privilege at all — which is what
-    /// makes a whole X11 run password-free, since injection went to XTEST too. Everywhere
-    /// else, and if the grab is refused for a reason sudo cannot fix, evdev.
-    fn open_capture(epoch: &Epoch, hotkeys: &[sequencer_core::input::Key]) -> Result<Capture> {
+    /// The two halves are chosen together, never independently. On a usable X11 session
+    /// both go through the X server; everywhere else both go through the input devices.
+    /// A mixed pair would be the worst of each: XTEST's rate with evdev's permission
+    /// requirement, and a run that decided it needed no password discovering otherwise
+    /// halfway through opening.
+    ///
+    /// Which session it is was already settled by [`sequencer_input::x11::is_usable`],
+    /// which actually connects rather than trusting `$DISPLAY`. That is the same answer
+    /// [`crate::elevate`] used to decide whether to ask for a password, so the two cannot
+    /// disagree.
+    ///
+    /// A grab the X server refuses — another program already owns the key — is a hard
+    /// error rather than a fallback. Dropping to the device path there would demand
+    /// device access, and possibly a password, for a problem no privilege can fix: the
+    /// answer is a different `--activate` key, and the error says so.
+    fn open_pair(
+        epoch: &Epoch,
+        hotkeys: &[sequencer_core::input::Key],
+    ) -> Result<(Box<dyn InputSink>, Capture)> {
         #[cfg(feature = "xtest")]
-        if std::env::var_os("DISPLAY").is_some() {
-            match sequencer_input::GrabCapture::start(epoch.clone(), hotkeys) {
-                Ok((capture, stream)) => {
-                    tracing::info!(keys = hotkeys.len(), "hotkeys grabbed through X11");
-                    return Ok(Capture::Grab(capture, Some(stream)));
-                }
-                Err(err) => {
-                    // A key another program owns is worth saying out loud: evdev would work,
-                    // but only after a password prompt, and the user can just pick a free key.
-                    tracing::warn!(%err, "X11 grab unavailable; falling back to reading devices");
-                }
-            }
+        if sequencer_input::x11::is_usable() {
+            let sink = sequencer_input::XTestSink::open()?;
+            let (capture, stream) = sequencer_input::GrabCapture::start(epoch, hotkeys)?;
+            tracing::info!(
+                keys = hotkeys.len(),
+                "X11: injecting through XTEST, hotkeys through key grabs"
+            );
+            return Ok((Box::new(sink), Capture::Grab(capture, Some(stream))));
         }
+
+        // Only the X11 grab has to name individual keys; the device backend watches every
+        // device and lets the engine decide what it cares about.
+        let _ = hotkeys;
+        let sink = sequencer_input::UinputSink::open()?;
         let mut capture = EvdevCapture::new(epoch.clone());
         let stream = capture.start()?;
-        tracing::info!(devices = capture.watching(), "watching input devices");
-        Ok(Capture::Evdev(capture, Some(stream)))
+        tracing::info!(
+            devices = capture.watching(),
+            "devices: injecting through uinput, hotkeys from /dev/input"
+        );
+        Ok((Box::new(sink), Capture::Evdev(capture, Some(stream))))
     }
 
     /// Whichever capture backend the run picked, with one shape for the caller.
     enum Capture {
         Evdev(EvdevCapture, Option<sequencer_input::CaptureStream>),
         #[cfg(feature = "xtest")]
-        Grab(sequencer_input::GrabCapture, Option<sequencer_input::CaptureStream>),
+        Grab(
+            sequencer_input::GrabCapture,
+            Option<sequencer_input::CaptureStream>,
+        ),
     }
 
     impl Capture {
@@ -424,30 +486,6 @@ mod platform {
             }
         }
     }
-
-    /// The injection backend, chosen at runtime.
-    ///
-    /// XTEST when `$DISPLAY` names an X11 session and it opens — it injects above libinput,
-    /// which is what lets it exceed the device path's click-rate ceiling (see
-    /// [`sequencer_input::xtest`]). Otherwise, and on Wayland or the console, the uinput
-    /// device. An XTEST *build* that finds no usable X server falls back rather than failing:
-    /// the uinput backend works everywhere, just slower past the ceiling.
-    fn open_sink() -> Result<Box<dyn InputSink>> {
-        #[cfg(feature = "xtest")]
-        if std::env::var_os("DISPLAY").is_some() {
-            match sequencer_input::XTestSink::open() {
-                Ok(sink) => {
-                    tracing::info!("injecting through XTEST (X11, above libinput)");
-                    return Ok(Box::new(sink));
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "XTEST unavailable; falling back to the uinput device");
-                }
-            }
-        }
-        tracing::info!("injecting through the uinput device");
-        Ok(Box::new(sequencer_input::UinputSink::open()?))
-    }
 }
 
 #[cfg(not(all(feature = "evdev", target_os = "linux")))]
@@ -459,8 +497,8 @@ mod platform {
 
     pub(super) fn unsupported<T>() -> Result<T> {
         Err(Error::NotImplemented(format!(
-            "no input backend for {}; only Linux is supported. `sequencer simulate` and \
-             `clicker --dry-run` work anywhere.",
+            "no input backend for {}; only Linux is supported. `sequencer simulate` \
+             works anywhere.",
             std::env::consts::OS
         )))
     }

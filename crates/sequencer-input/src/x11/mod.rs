@@ -17,3 +17,19 @@ pub mod inject;
 
 pub use capture::{GrabCapture, GrabError};
 pub use inject::XTestSink;
+
+/// Whether this really is an X11 session that both halves can use.
+///
+/// Connects and checks for XTEST, rather than trusting `$DISPLAY` to be set — a stale
+/// variable, or a server without the extension, would otherwise route a run down the X11
+/// path and strand it there. Callers use this to pick the backend *pair* up front, so the
+/// privilege the run will need is known before it asks for any.
+///
+/// The connection is opened and dropped; a run that proceeds opens its own.
+#[must_use]
+pub fn is_usable() -> bool {
+    if std::env::var_os("DISPLAY").is_none() {
+        return false;
+    }
+    XTestSink::open().is_ok()
+}

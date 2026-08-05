@@ -206,6 +206,19 @@ pub fn fuse_limit(cps: f64) -> u32 {
     scaled.max(DEFAULT_MAX_EMITS_PER_SEC)
 }
 
+/// The period a rate implies, for the burst-accounting window below.
+///
+/// Falls back to a tenth of a second for a rate with no sensible period (zero or
+/// non-finite). Such a rate never reaches a run — the profile rejects it first — and the
+/// window only ever tells one burst from another, so a placeholder is harmless where a
+/// panic would not be.
+#[must_use]
+pub fn cadence_of(cps: f64) -> Duration {
+    sequencer_core::time::Period::from_cps(cps).map_or(Duration::from_millis(100), |period| {
+        Duration::from_nanos(period.nanos())
+    })
+}
+
 /// The longest gap between two repetitions that still counts as one continuous burst.
 ///
 /// Four times the requested period, and at least a quarter-second. Generous on purpose: a
@@ -433,8 +446,14 @@ mod summary_tests {
     fn the_burst_window_tolerates_stutter_but_not_thinking() {
         // 20/s requested -> fuse of 80/s -> 12.5ms quarter-period -> 200ms window.
         let window = burst_gap(Duration::from_millis(50));
-        assert!(window >= Duration::from_millis(150), "{window:?} is too strict for a stutter");
-        assert!(window <= Duration::from_millis(400), "{window:?} would swallow a real pause");
+        assert!(
+            window >= Duration::from_millis(150),
+            "{window:?} is too strict for a stutter"
+        );
+        assert!(
+            window <= Duration::from_millis(400),
+            "{window:?} would swallow a real pause"
+        );
     }
 }
 

@@ -43,5 +43,8 @@ fn main() -> ExitCode {
             return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2));
         }
     };
-    ExitCode::from(sequencer_cli::run_with_sudo_prompt(&cli, "sequencer doctor"))
+    ExitCode::from(sequencer_cli::run_with_sudo_prompt(
+        &cli,
+        "sequencer doctor",
+    ))
 }

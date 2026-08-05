@@ -19,9 +19,8 @@ const RESET: &str = "\u{1b}[0m";
 /// re-checking per word would mean an `isatty` syscall per banner field.
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal())
 }
 
 /// `text` in bold blue, or unchanged when colour is off.
@@ -48,7 +47,10 @@ mod tests {
     fn the_highlight_wraps_and_always_closes() {
         // Whatever `enabled()` decided, a highlight must never leave the terminal coloured.
         let styled = format!("{HIGHLIGHT}F9{RESET}");
-        assert!(styled.ends_with(RESET), "an unterminated colour leaks into the next line");
+        assert!(
+            styled.ends_with(RESET),
+            "an unterminated colour leaks into the next line"
+        );
         assert!(styled.contains("F9"));
     }
 }

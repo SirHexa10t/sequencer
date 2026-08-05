@@ -1,8 +1,9 @@
 //! Events flowing *in*: what the user physically did.
 //!
 //! Keys are identified by **physical position**, following the USB HID keyboard usage
-//! table, not by the character they happen to produce. Backends own the mapping to X11
-//! keysyms, evdev codes and Win32 virtual-key codes.
+//! table, not by the character they happen to produce. Backends own the mapping to
+//! whatever their platform names keys by — evdev codes on Linux, and X keycodes (which are
+//! evdev codes plus a fixed offset) for the X11 backend.
 //!
 //! This matters more than it looks. A keysym-based identity cannot survive a layout
 //! change and does not correspond to any position on evdev's keyboard, so building on one

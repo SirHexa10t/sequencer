@@ -53,6 +53,9 @@ mod tests {
         assert_eq!(code, exit::OK);
         let said = String::from_utf8(out).expect("text");
         assert!(said.contains("not implemented"), "{said}");
-        assert!(said.contains("write-script"), "it should name itself: {said}");
+        assert!(
+            said.contains("write-script"),
+            "it should name itself: {said}"
+        );
     }
 }

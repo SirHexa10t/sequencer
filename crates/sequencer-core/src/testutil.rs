@@ -471,14 +471,25 @@ mod millis_tests {
         // test anyway, so it is exercised through `write!` directly.
         let at = |nanos| {
             let mut rendered = String::new();
-            core::fmt::write(&mut rendered, format_args!("{}", Millis(Timestamp::from_nanos(nanos))))
-                .expect("writing to a String cannot fail");
+            core::fmt::write(
+                &mut rendered,
+                format_args!("{}", Millis(Timestamp::from_nanos(nanos))),
+            )
+            .expect("writing to a String cannot fail");
             rendered
         };
         assert_eq!(at(0), "0");
-        assert_eq!(at(50_000_000), "50", "a whole millisecond carries no fraction");
+        assert_eq!(
+            at(50_000_000),
+            "50",
+            "a whole millisecond carries no fraction"
+        );
         assert_eq!(at(2_500_000), "2.5", "not 2.500000");
         assert_eq!(at(1_250_000), "1.25");
-        assert_eq!(at(1_000_001), "1.000001", "real precision is still shown in full");
+        assert_eq!(
+            at(1_000_001),
+            "1.000001",
+            "real precision is still shown in full"
+        );
     }
 }

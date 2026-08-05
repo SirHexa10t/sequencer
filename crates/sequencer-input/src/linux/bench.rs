@@ -54,7 +54,7 @@ impl BenchSample {
 
 /// How often [`BenchObserver::sample`] fires. Fast enough to look live, slow enough that
 /// the rendering cannot itself become the bottleneck being measured.
-const SAMPLE_EVERY: Duration = Duration::from_millis(250);
+pub const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
 /// Hooks into a running benchmark. Both methods have defaults, so a caller that wants
 /// neither passes a unit struct and reads only the final [`BenchResult`].
@@ -338,11 +338,21 @@ mod tests {
         let err = BenchError::Aborted {
             source: Box::new(io::Error::other("could not drop root")),
         };
-        assert!(err.to_string().contains("stopped before measuring"), "{err}");
-        assert!(std::error::Error::source(&err).is_some(), "the cause must survive");
+        assert!(
+            err.to_string().contains("stopped before measuring"),
+            "{err}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "the cause must survive"
+        );
         // The trait object is usable as written (compile-time half of the guarantee).
         let mut refuses = Refuses;
-        assert!((&mut refuses as &mut dyn BenchObserver).devices_open().is_err());
+        assert!(
+            (&mut refuses as &mut dyn BenchObserver)
+                .devices_open()
+                .is_err()
+        );
     }
 
     #[test]
@@ -375,7 +385,10 @@ mod tests {
         }
         impl BenchObserver for Counting {
             fn sample(&mut self, sample: BenchSample) {
-                assert!(sample.elapsed > Duration::ZERO, "a sample must span some time");
+                assert!(
+                    sample.elapsed > Duration::ZERO,
+                    "a sample must span some time"
+                );
                 self.samples += 1;
             }
         }
@@ -391,7 +404,10 @@ mod tests {
         // At 250ms apart over 0.3s, at least one sample is due.
         let mut observer = Counting { samples: 0 };
         let result = run(Some(200.0), 0.3, &mut observer).expect("bench should run");
-        assert!(observer.samples > 0, "the run reported no live progress at all");
+        assert!(
+            observer.samples > 0,
+            "the run reported no live progress at all"
+        );
         assert!(result.emitted > 0, "nothing was emitted");
         assert!(
             result.delivered <= result.emitted,

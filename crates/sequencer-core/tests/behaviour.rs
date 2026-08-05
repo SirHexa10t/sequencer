@@ -1,8 +1,9 @@
 //! Behavioural tests for the engine, against a virtual clock and a recording sink.
 //!
-//! The parity group is the contract with `contrib/clicker.py`: the Rust version has to do
-//! what the prototype did, including the parts that were accidents of its implementation
-//! (toggling on release, for one).
+//! The parity group pins the behaviour inherited from the original Python prototype,
+//! including the parts that were accidents of its implementation — toggling on key
+//! *release* rather than press, for one. The prototype itself is gone; these tests are now
+//! the only record of what it did, which is the reason they spell it out.
 
 // Test code: unwrapping is how a test reports a failure.
 #![allow(clippy::unwrap_used)]
@@ -32,7 +33,7 @@ fn click_program() -> Program {
     }
 }
 
-/// Press, hold briefly, release: what `--key_press f` produces.
+/// Press, hold briefly, release: what `--kb-key f` produces.
 fn key_program(key: Key, hold: Duration) -> Program {
     Program {
         name: "key".into(),
@@ -102,7 +103,7 @@ fn times_of(harness: &Harness, action: EmitAction) -> Vec<u64> {
         .collect()
 }
 
-// ---------------------------------------------------------------- parity with clicker.py
+// -------------------------------------------------------- parity with the Python original
 
 #[test]
 fn hold_emits_exactly_cps_per_second() {

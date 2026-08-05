@@ -247,7 +247,6 @@ mod tests {
         assert!(Cli::try_parse_from(["sequencer", "--cps", "30"]).is_err());
     }
 
-
     #[test]
     fn bench_defaults_to_flat_out_for_three_seconds() {
         let Command::Bench(args) = parse(&["sequencer", "bench"]) else {
@@ -274,15 +273,10 @@ mod tests {
         }
     }
 
-
-
-
-
     #[test]
     fn verbose_and_quiet_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["sequencer", "clicker", "-v", "-q"]).is_err());
     }
-
 
     #[test]
     fn every_subcommand_exposes_the_shared_options() {

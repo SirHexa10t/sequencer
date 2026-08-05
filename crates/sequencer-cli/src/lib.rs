@@ -67,12 +67,16 @@
 // command line asks for.
 #[cfg(feature = "cli")]
 pub mod clicker;
+#[cfg(feature = "cli")]
 pub mod cmd;
 pub mod runtime;
+#[cfg(feature = "cli")]
 pub mod write_script;
 
 #[cfg(feature = "cli")]
 mod elevate;
+// Colour for the clicker's banner; there is no banner without the command line.
+#[cfg(feature = "cli")]
 mod style;
 #[cfg(feature = "cli")]
 pub use elevate::run_with_sudo_prompt;
@@ -93,19 +97,19 @@ pub use sequencer_core as core;
 pub use sequencer_input as input;
 
 #[cfg(feature = "cli")]
-pub use crate::args::{
-    BenchArgs, Cli, Command, DoctorArgs, GlobalArgs, SimulateArgs,
-};
+pub use crate::args::{BenchArgs, Cli, Command, DoctorArgs, GlobalArgs, SimulateArgs};
+#[cfg(feature = "cli")]
 pub use crate::clicker::{ClickerArgs, MouseButton};
-pub use crate::write_script::WriteScriptArgs;
 pub use crate::error::Error;
+#[cfg(feature = "cli")]
+pub use crate::write_script::WriteScriptArgs;
 
 use sequencer_core::clicker::ClickConfig;
 use sequencer_core::emit::InputSink;
 use sequencer_core::time::Clock;
 use sequencer_core::{CompiledProfile, Engine};
 
-use crate::runtime::{EventPump, RunSummary, fuse_limit, run_engine};
+use crate::runtime::{EventPump, RunSummary, cadence_of, fuse_limit, run_engine};
 
 /// This crate's result type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -181,9 +185,13 @@ where
 
 /// Prints an error and everything underneath it.
 ///
+/// Only the argv entry points report for themselves; an embedder calling [`run_clicker`]
+/// renders its own.
+///
 /// Walking the chain matters here: the sentence a user can act on -- which permission is
 /// missing, which command fixes it -- is often two levels down, and printing only the
 /// outermost `Display` would hide exactly the part worth reading.
+#[cfg(feature = "cli")]
 fn report_error(err: &Error) {
     let mut shown = err.to_string();
     eprintln!("error: {shown}");
@@ -306,7 +314,14 @@ pub fn run_clicker(
 ) -> Result<RunSummary> {
     let profile = CompiledProfile::validate(config.to_profile()?)?;
     let mut engine = Engine::new(profile, 0);
-    run_engine(&mut engine, sink, clock, pump, fuse_limit(config.cps), clicker::cadence_of(config.cps))
+    run_engine(
+        &mut engine,
+        sink,
+        clock,
+        pump,
+        fuse_limit(config.cps),
+        cadence_of(config.cps),
+    )
 }
 
 /// Installs a `tracing` subscriber.

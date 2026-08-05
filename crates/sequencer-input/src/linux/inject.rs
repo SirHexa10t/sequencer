@@ -2,12 +2,19 @@
 //!
 //! A uinput device is a real input device as far as the rest of the system is concerned —
 //! the kernel delivers its events the same way it delivers a physical mouse's. That is
-//! what makes this one backend work on X11, on Wayland, and on a bare console, and it is
-//! also the fastest path available: emitting a click is a couple of `write(2)` calls, with
-//! no display-server round trip in the way.
+//! what makes this backend work on X11, on Wayland, and on a bare console alike, and it is
+//! the only one that reaches Wayland and the console at all.
 //!
-//! Clicks land wherever the pointer already is. The device declares buttons but no
-//! pointer axes, so it can press and release without ever moving the cursor.
+//! It is the *shortest* path to the kernel — emitting a click is a couple of `write(2)`
+//! calls with no display-server round trip — but not necessarily the fastest to an
+//! application: everything written here passes through libinput on the way up. See
+//! [`crate::x11::inject`] for the X11 backend that goes over the top of it, and
+//! [`UinputSink::open`] for the device shape that keeps libinput routing these events at
+//! all.
+//!
+//! Clicks land wherever the pointer already is. The device advertises pointer axes (see
+//! [`UinputSink::open`]) but never sends a motion event, so it can press and release
+//! without moving the cursor.
 
 use std::io;
 

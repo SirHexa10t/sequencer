@@ -19,7 +19,9 @@
 //! round trip and a reverse lookup to learn something already known.
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Window};
+use x11rb::protocol::xproto::{
+    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Window,
+};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
@@ -63,7 +65,11 @@ impl XTestSink {
             .reply()
             .map_err(|err| SinkError::Backend(Box::new(err)))?;
         let root = conn.setup().roots[screen].root;
-        Ok(Self { conn, root, held: Vec::new() })
+        Ok(Self {
+            conn,
+            root,
+            held: Vec::new(),
+        })
     }
 
     /// Sends one `XTestFakeInput`. `detail` is an X keycode for a key, or a button number
@@ -77,16 +83,27 @@ impl XTestSink {
     }
 
     fn press(&mut self, is_key: bool, detail: u8) -> Result<(), SinkError> {
-        let event_type = if is_key { KEY_PRESS_EVENT } else { BUTTON_PRESS_EVENT };
+        let event_type = if is_key {
+            KEY_PRESS_EVENT
+        } else {
+            BUTTON_PRESS_EVENT
+        };
         self.fake(event_type, detail)?;
         self.held.push(Pressed { is_key, detail });
         Ok(())
     }
 
     fn release(&mut self, is_key: bool, detail: u8) -> Result<(), SinkError> {
-        let event_type = if is_key { KEY_RELEASE_EVENT } else { BUTTON_RELEASE_EVENT };
+        let event_type = if is_key {
+            KEY_RELEASE_EVENT
+        } else {
+            BUTTON_RELEASE_EVENT
+        };
         self.fake(event_type, detail)?;
-        if let Some(index) = self.held.iter().rposition(|p| p.is_key == is_key && p.detail == detail)
+        if let Some(index) = self
+            .held
+            .iter()
+            .rposition(|p| p.is_key == is_key && p.detail == detail)
         {
             self.held.remove(index);
         }
@@ -135,22 +152,29 @@ impl InputSink for XTestSink {
             EmitAction::CursorTo { .. } | EmitAction::CursorBy { .. } => {
                 Err(SinkError::Unsupported("moving the cursor"))
             }
-            _ => Err(SinkError::Unsupported("an action this backend does not handle")),
+            _ => Err(SinkError::Unsupported(
+                "an action this backend does not handle",
+            )),
         }
     }
 
     /// XTEST batches on the connection's write buffer; this is the round trip that actually
     /// puts the queued events on the wire, which is why the trait has a `flush` at all.
     fn flush(&mut self) -> Result<(), SinkError> {
-        self.conn.flush().map_err(|err| SinkError::Backend(Box::new(err)))
+        self.conn
+            .flush()
+            .map_err(|err| SinkError::Backend(Box::new(err)))
     }
 
     fn release_all(&mut self) {
         // Best effort, in reverse, swallowing errors: this runs from the drop guard, and a
         // stuck key is worse than a lost error message. Drain so a second call is a no-op.
         for pressed in std::mem::take(&mut self.held).into_iter().rev() {
-            let event_type =
-                if pressed.is_key { KEY_RELEASE_EVENT } else { BUTTON_RELEASE_EVENT };
+            let event_type = if pressed.is_key {
+                KEY_RELEASE_EVENT
+            } else {
+                BUTTON_RELEASE_EVENT
+            };
             let _ = self.fake(event_type, pressed.detail);
         }
         let _ = self.conn.flush();

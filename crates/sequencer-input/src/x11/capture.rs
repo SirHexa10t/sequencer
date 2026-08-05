@@ -17,8 +17,9 @@
 //!
 //! Grabs use [`ModMask::ANY`], so the hotkey works with NumLock on, CapsLock on, or Shift
 //! held. If *another* client already holds a grab on the key ([`GrabError::AlreadyGrabbed`]),
-//! the run refuses with the offender named as far as X reports it — falling back to evdev
-//! would mean a surprise password prompt for a problem sudo cannot fix.
+//! the run refuses and names the key. Falling back to reading devices would demand access,
+//! and possibly a password, for a problem no privilege can fix — the answer is a different
+//! `--activate` key, so that is what the error says.
 //!
 //! Events are stamped on arrival with the shared [`Epoch`] and pushed into the same
 //! [`EventQueue`] the evdev backend fills, so the pump above is one code path.
@@ -65,7 +66,6 @@ pub enum GrabError {
 /// Grabs the named keys and feeds their presses into a [`CaptureStream`].
 #[derive(Debug)]
 pub struct GrabCapture {
-    epoch: Epoch,
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -78,7 +78,7 @@ impl GrabCapture {
     /// [`GrabError`] — no server, an unmappable key, or a key someone else holds. Nothing is
     /// left half-done on failure: the connection drops, and dropping it releases any grabs
     /// this client took.
-    pub fn start(epoch: Epoch, keys: &[Key]) -> Result<(Self, CaptureStream), GrabError> {
+    pub fn start(epoch: &Epoch, keys: &[Key]) -> Result<(Self, CaptureStream), GrabError> {
         let (conn, screen) =
             RustConnection::connect(None).map_err(|err| GrabError::Connect(Box::new(err)))?;
         let root = conn.setup().roots[screen].root;
@@ -88,12 +88,20 @@ impl GrabCapture {
             // ANY modifier state: F9 is F9 with NumLock on too. Checked immediately — an
             // `Access` error here means another client got there first, and starting a run
             // whose hotkey silently never fires would be far worse than refusing.
-            conn.grab_key(false, root, ModMask::ANY, keycode, GrabMode::ASYNC, GrabMode::ASYNC)
-                .map_err(|err| GrabError::Connect(Box::new(err)))?
-                .check()
-                .map_err(|_| GrabError::AlreadyGrabbed(key))?;
+            conn.grab_key(
+                false,
+                root,
+                ModMask::ANY,
+                keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )
+            .map_err(|err| GrabError::Connect(Box::new(err)))?
+            .check()
+            .map_err(|_| GrabError::AlreadyGrabbed(key))?;
         }
-        conn.flush().map_err(|err| GrabError::Connect(Box::new(err)))?;
+        conn.flush()
+            .map_err(|err| GrabError::Connect(Box::new(err)))?;
 
         let (queue, stream) = CaptureStream::channel(256);
         let running = Arc::new(AtomicBool::new(true));
@@ -107,7 +115,6 @@ impl GrabCapture {
         };
         Ok((
             Self {
-                epoch,
                 running,
                 thread: Some(thread),
             },
@@ -121,8 +128,6 @@ impl GrabCapture {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        // `epoch` is kept only so start/stop symmetry matches EvdevCapture's shape.
-        let _ = &self.epoch;
     }
 }
 
@@ -133,16 +138,13 @@ impl Drop for GrabCapture {
 }
 
 /// Reads grabbed-key events until told to stop, translating each to the engine's shape.
-fn pump_events(
-    conn: &RustConnection,
-    queue: &EventQueue,
-    epoch: &Epoch,
-    running: &AtomicBool,
-) {
+fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running: &AtomicBool) {
     while running.load(Ordering::Relaxed) {
         match conn.poll_for_event() {
             Ok(Some(event)) => {
-                let Some(kind) = translate(&event) else { continue };
+                let Some(kind) = translate(&event) else {
+                    continue;
+                };
                 // Stamped on arrival, on the runner's timeline — same rule as the evdev
                 // reader, so cadence phase-locks to the press either way.
                 if !queue.offer(InputEvent::physical(epoch.now(), kind)) {
@@ -201,5 +203,21 @@ mod tests {
     fn impossible_keycodes_translate_to_nothing() {
         assert_eq!(key_from_x(0), None);
         assert_eq!(key_from_x(7), None);
+    }
+
+    /// A key another program owns names itself and points at the fix. The caller turns
+    /// this into a usage error rather than falling back to reading devices, so the message
+    /// is the only thing the user gets — it has to be the actionable one.
+    #[test]
+    fn an_already_grabbed_key_names_itself_and_the_flags_that_change_it() {
+        let message = GrabError::AlreadyGrabbed(Key::F9).to_string();
+        assert!(
+            message.contains("f9") || message.contains("F9"),
+            "{message}"
+        );
+        assert!(
+            message.contains("--activate") && message.contains("--quit"),
+            "the fix is a different key, and the message must say which flags: {message}"
+        );
     }
 }

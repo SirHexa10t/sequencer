@@ -7,7 +7,7 @@
 //! What lives here is only what a clicker means: the settings a user gives ([`ClickConfig`]),
 //! what to repeat ([`ClickAction`]), and how the trigger behaves ([`ActivationMode`]) — plus
 //! [`ClickConfig::to_profile`], which lowers all of that into the general
-//! [`Profile`](crate::ir::Profile) the engine runs.
+//! [`crate::ir::Profile`] the engine runs.
 //!
 //! What deliberately stays out: the engine, the step IR, emit/input types, timing. Those are
 //! not "clicker parts" — they are the substrate a sequence runner will build on identically,
@@ -195,7 +195,9 @@ mod tests {
     /// one click arrived anywhere.
     #[test]
     fn a_button_click_holds_before_releasing() {
-        let profile = ClickConfig::new().to_profile().expect("the defaults are runnable");
+        let profile = ClickConfig::new()
+            .to_profile()
+            .expect("the defaults are runnable");
         let steps = &profile.programs.first().expect("one program").steps;
         let waits = steps
             .iter()
@@ -228,7 +230,10 @@ mod tests {
         let period = u128::from(Period::from_cps(500.0).expect("valid").nanos());
         let hold = spec.base.as_nanos();
         assert!(hold > 0, "the hold must not vanish entirely");
-        assert!(hold <= period / 2, "a {hold}ns hold does not fit a {period}ns period");
+        assert!(
+            hold <= period / 2,
+            "a {hold}ns hold does not fit a {period}ns period"
+        );
     }
     use crate::validate::CompiledProfile;
 

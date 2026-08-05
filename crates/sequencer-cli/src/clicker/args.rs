@@ -1,10 +1,9 @@
 //! The clicker's own command-line surface.
 //!
-//! Split from [`crate::args`] because these are the clicker *product's* options, not the
-//! program's: a scripted-sequence command will bring its own `*Args` beside this one, while
-//! the shared pieces ([`GlobalArgs`](crate::args::GlobalArgs), the key parser) stay where
-//! both can reach them.
-
+//! Split from the program's own argument module because these are the clicker
+//! *product's* options: a scripted-sequence command will bring its own `*Args` beside this
+//! one, while the shared pieces ([`GlobalArgs`] and the key parser) stay where both can
+//! reach them.
 
 use clap::{Args, ValueEnum};
 use sequencer_core::clicker::{ActivationMode, ClickAction, ClickConfig};
@@ -96,7 +95,6 @@ pub struct ClickerArgs {
     /// requested rate leaves no room for it
     #[arg(long, default_value_t = 8, value_name = "MS")]
     pub button_hold_ms: u64,
-
 }
 
 impl ClickerArgs {
@@ -158,7 +156,6 @@ impl From<&ClickerArgs> for ClickConfig {
         args.config()
     }
 }
-
 
 pub(crate) fn parse_cps(raw: &str) -> Result<f64, String> {
     let value: f64 = raw

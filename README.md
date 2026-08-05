@@ -1,37 +1,65 @@
 # sequencer
 
-An autoclicker for Linux. Hold or toggle a key to click at a rate you choose, wherever the
-mouse already is.
+Synthetic input for Linux. Today that means one product — `clicker`: hold or toggle a key
+to click at a rate you choose, wherever the mouse already is.
 
-It works the same on X11, on Wayland, and on a bare console, because it reads and writes
-input devices directly rather than asking a display server for permission. That is also
-the fastest path available — a click is a couple of kernel writes with no display-server
-round trip in the way — so the rate ceiling is whatever your machine can do rather than a
-number picked in advance.
+It works on X11, on Wayland and on a bare console. There is no rate ceiling picked in
+advance: ask for what you want, and the tool reports what it actually managed to send.
 
 ## Features
 
 - **Hold or toggle** a chosen key to click, or to repeat a keyboard key instead.
 - **Clicks at the cursor**, without moving it. Any mouse button.
-- **No rate ceiling.** Ask for whatever you want; the tool reports the rate it actually
-  achieved, and `sequencer bench` measures your machine's real limit end to end.
+- **No rate ceiling of ours.** The limit is your machine and your input stack, and
+  `sequencer bench` measures both.
 - **The rate you asked for.** Repetitions are scheduled against absolute deadlines in
   integer nanoseconds, so 20/s stays 20/s over hours instead of drifting. When the machine
   cannot keep up it drops the missed slots and says how many, rather than firing a
   catch-up burst.
 - **Nothing gets left held down**, including after a panic — checked by a property test
   across hundreds of random cancellation scenarios.
-- **Works on Wayland**, which the tools built on X11 automation APIs do not.
-- **`doctor`** tells you exactly what setup is missing and prints the commands to fix it.
+- **Works on Wayland**, which tools built on X11 automation APIs cannot.
+- **No setup required.** On X11 it needs no permissions at all; elsewhere it can borrow
+  sudo for one run rather than making you widen anything permanently.
+- **`doctor`** reports which backends a run would use and what setup, if any, is missing.
+- **`bench`** measures what the machine really delivers, by reading its own virtual device
+  back rather than trusting its own send count.
 - **`simulate`** replays a scripted list of events through the real engine and prints a
   timeline, so behaviour can be checked — or a bug reported — without any hardware.
-- **`bench`** measures what the machine can really deliver, by reading its own virtual
-  device back rather than trusting its own send count.
 
-## Tech Stack Setup
+## The two backends
 
-Two things: a Rust toolchain to build it, and permission to reach the input devices to run
-it. No system libraries, no `-dev` packages, no BIOS settings.
+Which pair a run uses is decided at startup and reported by `doctor`. This is worth
+knowing up front, because it decides whether you need any setup at all.
+
+| Session | Inject | Hotkey | Needs |
+|---|---|---|---|
+| X11 (a reachable X server) | XTEST | X11 key grab | nothing |
+| Wayland, console | `/dev/uinput` | `/dev/input` | device access — see below |
+
+**X11** goes through the X server: XTEST for the clicks, a passive grab for the two keys
+the run binds. Neither touches an input device, so an X11 session needs no group
+membership, no udev rule and no password. It is also *above* libinput, which matters for
+the achievable rate — see [Rate ceiling](#rate-ceiling).
+
+**Everywhere else** the tool writes `/dev/uinput` and reads `/dev/input` directly, below
+the display server. That is the only way to reach a Wayland compositor or the console, and
+it is what needs permission.
+
+The two halves are always chosen **together**, and the choice is made by actually
+connecting to the X server rather than by checking whether `$DISPLAY` is set — a variable
+left over from a dead session would otherwise send a run down the X11 path and strand it.
+A mixed pair would be the worst of both: XTEST's rate with evdev's permissions.
+
+If a hotkey is refused because another program already owns it, the run stops and says so.
+It does not quietly drop to the device path, which would demand access — possibly a
+password — for something no privilege can fix. Pick a different `--activate` or `--quit`
+key.
+
+## Setup
+
+A Rust toolchain to build, and — outside X11 — some way to reach the input devices. No
+system libraries, no `-dev` packages, no BIOS settings.
 
 ### 1. Rust
 
@@ -42,12 +70,6 @@ The toolchain version is pinned in `rust-toolchain.toml` (currently **1.97**, ed
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Open a new shell and confirm:
-
-```sh
-cargo --version    # 1.97.x or newer
-```
-
 ### 2. Build
 
 ```sh
@@ -56,13 +78,23 @@ cd sequencer
 cargo build --release
 ```
 
-The binary lands at `target/release/sequencer`.
+The binary lands at `target/release/sequencer`. Run `sequencer doctor` — on an X11 session
+it will already say `Ready.`, and you can stop here.
 
-### 3. Input device access
+### 3. Input device access — only if you are not on X11
 
-`sequencer doctor` checks all of this and prints the exact commands for whatever is
-missing on your machine, so the fastest path is to run it and follow what it says. For
-reference, the full setup is:
+Two ways, and they trade off against each other.
+
+**Per run (no setup).** Just run `sequencer clicker`. When the devices are not reachable
+and you are at a terminal, it explains itself and asks for your password via sudo — for
+that run only. Root lasts exactly as long as opening the devices takes; the process then
+drops back to your user and runs the whole session unprivileged. Nothing persists after it
+exits, and no other program gains anything at any point. A sudo ticket the run created is
+revoked afterwards; one you already had is left alone. Pipelines are never prompted —
+without a terminal the run fails with these instructions instead.
+
+**Standing (no password, ever).** `sequencer doctor` prints the exact commands for whatever
+your machine is missing. In full:
 
 ```sh
 # The uinput module, for creating the virtual device that does the clicking.
@@ -83,41 +115,25 @@ sudo usermod -aG input "$USER"
 Then **log out and back in** — group membership is only applied at login. To test in the
 current shell without logging out, `newgrp input`.
 
-> **What you are agreeing to.** Membership of the `input` group lets *any* program you run
-> read *every* input device on the machine. That is full keylogging capability, including
-> passwords typed into any application. sequencer needs it because reading and writing the
-> device nodes is exactly what makes it work under Wayland and on the console. It is a
-> real trade and worth making deliberately.
-
-Verify:
-
-```sh
-sequencer doctor    # exit code 0 once everything passes
-```
-
-### Or: no setup at all (session mode)
-
-Skip everything above and just run `sequencer clicker`. When the devices aren't accessible
-and you're at a terminal, it explains itself and asks for your password via sudo — **for
-that run only**. Root lasts exactly as long as opening the devices takes; the process then
-drops back to your user (plus the `input` group) and runs the whole session unprivileged.
-Nothing persists after it exits, and no other program gains any access at any point.
-
-That is the inverse of the standing setup's trade: a password per session, in exchange for
-never widening what the rest of your programs can do. A sudo ticket the run created is
-revoked afterwards; one you already had is left untouched. Pipelines are never prompted —
-without a terminal the run fails with the setup instructions instead.
+> **What the standing setup costs.** Membership of the `input` group lets *any* program you
+> run read *every* input device on the machine. That is full keylogging capability,
+> including passwords typed into any application. The per-run option exists precisely so
+> this is a choice rather than a prerequisite.
 
 ### Optional developer tools
 
-Only for contributing, and only these two; CI installs its own copies.
+Only for contributing; CI installs its own copies.
 
 ```sh
 cargo install cargo-hack   # checks every feature combination compiles
 cargo install cargo-deny   # licence and advisory checks
 ```
 
-## How to Run
+## How to run
+
+`sequencer --help` lists the subcommands; each has its own `--help`. There is no default
+subcommand — more modes are planned, and one of them silently winning would get harder to
+read as they arrive.
 
 ### Clicking
 
@@ -125,65 +141,73 @@ cargo install cargo-deny   # licence and advisory checks
 sequencer clicker --cps 20                  # hold F9 to click at 20/s; F8 quits
 sequencer clicker --toggle --cps 30         # tap F9 to start, tap again to stop
 sequencer clicker --cps 500                 # as fast as the machine manages
-sequencer clicker --key f --cps 10          # repeat the `f` key instead of clicking
+sequencer clicker --kb-key f --cps 10       # repeat the `f` key instead of clicking
+sequencer clicker --m-key right             # a different mouse button
 sequencer clicker --activate f7 --quit esc  # different trigger and quit keys
+sequencer clicker --limit 100               # stop after 100 repetitions
 ```
 
-Clicks land wherever the pointer is; the tool never moves it. The subcommand is required
-rather than implied — more modes are coming, and a tool where one of them silently wins
-gets harder to read as they arrive. `sequencer --help` lists them; `sequencer clicker
---help` lists every flag.
+Clicks land wherever the pointer is; the tool never moves it. `--kb-key` also answers to
+`--key` and `--key_press`, and `--m-key` to `--button`.
 
-On start it echoes the settings in words, so a surprising result can be traced to a flag
-rather than guessed at:
+It opens with a one-line banner — the four things worth re-reading before pressing
+anything:
 
 ```
-left click at 500/s, while f9 is held (no limit). f8 quits.
+f key 25/s | HOLD: F9 | Quit: F8 | Limit: 5
 ```
 
-On exit it reports the total actions, the number of repetitions, and — once there have
-been enough to measure — the rate it actually achieved next to the one you asked for. If
-the machine could not keep up it also says how many repetitions were skipped. The achieved
-figure is the honest answer for that machine, and the way to find your ceiling is to ask
-for more than you expect and read it back.
+On exit it reports the actions and repetitions it **sent**, the rate that works out to, and
+the rate you asked for — with the word "sent" repeated, deliberately never "achieved".
+Everything in that line is counted as this process hands events to the backend. What an
+application ends up acting on can be lower, and this tool cannot see that from the inside.
+`bench` is the one that measures what came back out. If the machine could not keep up it
+also says how many repetitions were skipped.
 
-Note the trigger key is **not** hidden from whatever has focus: pressing F9 both starts the
-clicker and sends F9 to the focused application, the same as the Python prototype did.
-Pick a trigger the target application ignores.
+Two hold durations matter and are separately tunable: `--button-hold-ms` (default 8) and
+`--key-hold-ms` (default 1). A click of zero duration is not a click as far as most
+applications are concerned.
 
-### Find the real ceiling
+**The trigger key is not hidden from the focused application** when the run is using
+devices: pressing F9 both starts the clicker and sends F9 to whatever has focus. On X11 the
+key grab *is* exclusive, so there the trigger does not reach other programs while the run
+is active. Either way, pick a trigger the target application ignores.
 
-Reporting how fast the loop *wrote* would be easy and misleading: the kernel or whatever
-is reading can coalesce or drop events under load. So `bench` reads its own virtual device
+### Measuring the real ceiling
+
+Reporting how fast the loop *wrote* would be easy and misleading: the kernel, or whatever
+is reading, can coalesce or drop events under load. So `bench` reads its own virtual device
 back and counts what a real consumer would have seen.
 
 ```sh
-sequencer bench                        # flat out for three seconds
-sequencer bench --cps 2000 --seconds 5 # can this machine hold 2000/s?
+sequencer bench                         # flat out for three seconds
+sequencer bench --cps 2000 --seconds 5  # can this machine hold 2000/s?
 ```
 
-It prints the requested, emitted and delivered rates side by side. A gap between emitted
-and delivered is the interesting part: it means the bottleneck is below this process, not
-in its loop.
+It prints requested, emitted and delivered rates side by side, with a live progress line
+while it runs. A gap between emitted and delivered means the bottleneck is below this
+process, not in its loop.
 
 It presses F24 rather than clicking — a key that exists on no physical keyboard and that
 essentially nothing binds to — so benchmarking does not click on whatever is under the
 pointer. It is still a real key press, so it is not something to run with unsaved work
-focused.
+focused. Note it measures the **uinput device path** specifically, which is the path with a
+ceiling worth measuring.
 
-### Check the machine
+### Checking the machine
 
 ```sh
 sequencer doctor
 ```
 
-Checks each requirement and, for anything failing, prints why and the commands that fix
-it. Exit code `0` when everything passes, `1` otherwise. Sample from a container with no
-input devices at all:
+Reports the session, which backends a run would pick, and each requirement — with the exact
+fix for anything failing. Exit code `0` when a run would work, `1` otherwise. From a
+container with no input devices at all:
 
 ```
 sequencer 0.1.0  (linux x86_64)
 session: Linux virtual terminal
+backend: uinput device for clicks, evdev for hotkeys
 
 [fail] uinput kernel module: /dev/uinput does not exist
 [fail] /dev/uinput writable: /dev/uinput: No such file or directory (os error 2)
@@ -196,10 +220,12 @@ The uinput kernel module is not loaded
           uinput
 ```
 
-### Try it without touching anything
+`-v` adds the `DISPLAY` / `WAYLAND_DISPLAY` / `XDG_SESSION_TYPE` values it read.
+
+### Trying it without touching anything
 
 `simulate` runs a scripted list of events through the real engine on a virtual clock. No
-devices, no permissions, works anywhere — useful for checking what a set of flags does, and
+devices, no permissions, works anywhere — useful for seeing what a set of flags does, and
 for reporting a bug reproducibly.
 
 ```sh
@@ -207,14 +233,17 @@ sequencer simulate crates/sequencer-cli/tests/fixtures/hold.txt --until-ms 300
 ```
 
 ```
-0 BD:left BU:left | 50 BD:left BU:left | 100 BD:left BU:left | 150 BD:left BU:left | 200 BD:left BU:left | 250 BD:left BU:left | 300 BD:left BU:left
+0 BD:left | 8 BU:left | 50 BD:left | 58 BU:left | 100 BD:left | 108 BU:left | 150 BD:left | 158 BU:left | 200 BD:left | 208 BU:left | 250 BD:left | 258 BU:left | 300 BD:left
 
-14 actions, 7 repetitions, 0 skipped.
-nothing left held.
+13 actions, 7 repetitions, 0 skipped.
+STILL HELD: [(Button(Left), 1)]
 ```
 
-Groups read `<milliseconds> <actions>`; `BD:left` is a press and `BU:left` a release. A
-script is one event per line, `<milliseconds> <down|up> <key>`, `#` for comments:
+Groups read `<milliseconds> <actions>`; `BD:left` is a press and `BU:left` a release, 8 ms
+apart at the default hold. `STILL HELD` here is the simulation being cut off mid-click at
+300 ms, not a leak — a real run releases on shutdown.
+
+A script is one event per line, `<milliseconds> <down|up> <key>`, `#` for comments:
 
 ```
 # Hold F9 for just over half a second, then let go.
@@ -222,44 +251,36 @@ script is one event per line, `<milliseconds> <down|up> <key>`, `#` for comments
 520  up   f9
 ```
 
-`--dry-run` is the other no-op mode — it resolves the flags and explains them without
-opening a device:
+### write-script
 
-```sh
-$ sequencer clicker --cps 25 --key f --dry-run
-f key press at 25/s, while f9 is held (no limit). f8 quits.
+A placeholder. It prints what it will be and exits zero; the format and its parser are not
+written yet.
 
-dry run: nothing was sent to any application.
-```
+## Rate ceiling
 
-### Differences from the Python prototype
+`bench` measures how fast this tool can write to the kernel, and that number is real. It is
+**not** the same as how many clicks an application will register.
 
-`contrib/clicker.py` is the original, kept as the behavioural reference. Behaviour matches
-it — including toggle mode flipping on key *release* — with three intentional exceptions:
+Everything written to `/dev/uinput` passes through libinput before any application sees it,
+and libinput decides what a device *is* from the axes it advertises rather than from its
+buttons. Two consequences, both discovered the hard way and both now handled:
 
-- `--verbose` prints structured progress rather than a per-click line and a `|`-per-wait bar.
-- `--cps 0` is a usage error (exit 2) instead of a division by zero.
-- `--key_press` still works, but is spelled `--key` in help.
+- A device advertising `BTN_LEFT` and no axes is not classified as a pointer at all, so
+  libinput routes its buttons nowhere. Every write succeeds, a read-back counts every
+  event, and not a single click arrives.
+- A device with no wheel gets *button* scrolling as its scroll method, which makes libinput
+  hold each press back to see whether it begins a scroll gesture — turning rapid clicking
+  into one long held button, around 20-30/s.
 
-The prototype also could not have worked on Wayland: `pynput`'s global listener is X11-only.
+The virtual device therefore advertises `REL_X`, `REL_Y`, `REL_WHEEL` and `REL_HWHEEL`, and
+never sends any of them. Four unused axes are the difference between a clicker that works
+and one whose events vanish.
 
-## Platform support
-
-Linux only, today. The engine is platform-independent and the backend interface is in
-place, but only the Linux backend is written.
-
-| Platform | Capture | Inject | Status |
-|---|---|---|---|
-| Linux — X11, Wayland, console | `/dev/input` | `/dev/uinput` | works |
-| Windows | `WH_KEYBOARD_LL` | `SendInput` | not written |
-| macOS | `CGEventTap` | `CGEventPost` | not written |
-
-The workspace still cross-compiles for Windows and macOS — the backend is target-gated, so
-those builds simply contain none of it and every command that needs a device says so.
-
-There is no X11-specific backend and none is planned: XTEST and XInput2 would cover only
-X11 sessions, which the current backend already handles, at the cost of a second keymap
-and a second self-echo problem.
+**On X11 none of this applies**, because XTEST injects into the X server's own queue, above
+libinput — the layer `xdotool` and pynput-based clickers use. That backend is chosen
+automatically when `$DISPLAY` is set. It is a second sink, not a replacement: reaching
+Wayland and the console is why the device path exists at all. Build
+`--no-default-features --features cli,logging,evdev` for a uinput-only binary.
 
 ## Using it from another project
 
@@ -280,9 +301,14 @@ let args = ClickerArgs { cps: 12.5, toggle: true, ..ClickerArgs::new() };
 let exit_code: u8 = Command::Clicker(args).run();
 ```
 
-`Command` also derives clap's `Subcommand`, so it can be nested in another parser — use
-the re-exported `sequencer_cli::clap` rather than depending on clap directly, so the two
-cannot end up on different major versions.
+`Command` also derives clap's `Subcommand`, so it can be nested in another parser — use the
+re-exported `sequencer_cli::clap` rather than depending on clap directly, so the two cannot
+end up on different major versions.
+
+To offer the same per-run sudo flow the binary has, call
+`sequencer_cli::run_with_sudo_prompt(&cli, "yourtool doctor")` instead of `run_cli`; the
+second argument is how *your* command line spells the doctor command, so the advice printed
+is runnable.
 
 The library never calls `process::exit`, never installs a tracing subscriber or signal
 handler, and never reads `std::env::args` for you. For the engine with no clap at all,
@@ -301,73 +327,53 @@ clock — the runner passes time in. That is what makes "iteration 10,000 starts
 500 seconds" an exact assertion that runs in microseconds. Timing is the whole ballgame for
 an autoclicker, and a test suite that has to sleep in real time is one nobody runs.
 
-The engine is also more general than the clicker built on it: it runs sequences of steps
-with loops, waits and per-binding repeat and cancellation policies. That is what the
-clicker is expressed in, not a promise about what comes next — richer tools may end up as
-a separate system rather than grown from here.
+Within each crate, one product's worth of behaviour lives in its own directory
+(`clicker/`, and `write_script/` next to it), while the engine, the step IR, the run loop
+and both input backends stay general. The engine already runs sequences of steps with
+loops, waits and per-binding repeat and cancellation policies; the clicker is one profile
+expressed in that.
 
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 156 tests, all headless
+cargo test --workspace --all-features    # 180 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --no-deps --all-features
 ```
 
 Tests that need a real `/dev/uinput` skip themselves with a note when it is absent, so the
-suite is green on a container and exercises the device on a real machine.
+suite is green in a container and exercises the device on a real machine.
 
-CI runs the suite plus fmt, clippy and docs on Linux; cross-compiles for Windows and
-macOS, which is the proof `sequencer-core` is OS-free; checks every feature combination
-with `cargo hack`; and runs `cargo deny`, since the project is GPL-3.0-or-later and a
+CI runs the suite plus fmt, clippy and docs on Linux; cross-compiles for Windows and macOS,
+which is the proof `sequencer-core` is OS-free; checks every feature combination with
+`cargo hack`; and runs `cargo deny`, since the project is GPL-3.0-or-later and a
 dependency's licence is a correctness matter.
 
-## Rate ceiling: what the machine can do vs what an application receives
+## Platform support
 
-`bench` measures how fast this tool can write to the kernel, and that number is real — the
-device accepts thousands of events a second. It is **not** the same as how many clicks an
-application will register.
+Linux only. The engine is platform-independent and the workspace cross-compiles for Windows
+and macOS — the backends are target-gated, so those builds contain none of them and every
+command that needs a device says so — but no backend for either is written.
 
-Everything written to `/dev/uinput` passes through libinput before any application sees it.
-On at least one X11 machine, clicks above roughly 20-30/s arrive at the kernel perfectly —
-correct alternation, one `SYN_REPORT` per event, exact cadence, all verified by reading the
-device node back — and are then collapsed by libinput into a single held button. Nothing
-about the device shape changes it: a stripped-down 100-line reference clicker
-(`contrib/minimal_uinput_click.py`), declaring nothing but `BTN_LEFT` and the pointer axes,
-hits the same wall at the same rate. Two independent implementations, one ceiling.
-
-**On an X11 session this is handled automatically.** There is a second injection backend,
-XTEST, which puts events into the X server's own queue — above libinput, the same layer
-`xdotool` and pynput-based autoclickers use — so the ceiling does not apply. When `$DISPLAY`
-names an X11 session, the clicker uses it without being asked; `sequencer doctor` reports
-which backend is active (`inject:` line). The hotkey is still read through evdev either way.
-
-It is a second sink, not a replacement: XTEST is X11-only, and reaching Wayland and the
-console is why this tool writes input devices directly in the first place. On those sessions
-the uinput backend and its ceiling still apply. The `xtest` feature is on by default; build
-`--no-default-features` without it for a uinput-only binary.
-
-To see your own machine's uinput ceiling independently of this project,
-`contrib/minimal_uinput_click.py` measures it in about a minute:
-
-```sh
-sudo python3 contrib/minimal_uinput_click.py --cps 20    # then 30, then 40
-```
+| Platform | Status |
+|---|---|
+| Linux — X11 | XTEST + key grabs, no setup |
+| Linux — Wayland, console | uinput + evdev, needs device access |
+| Windows | not written (`WH_KEYBOARD_LL` + `SendInput` would be the shape) |
+| macOS | not written (`CGEventTap` + `CGEventPost` would be the shape) |
 
 ## Limitations
 
 - **Synthesised input is detectable.** Events come from a virtual device with a
-  recognisable name and no physical device behind it. Anything protected by Vanguard, EAC
-  or BattlEye will not work and using it there risks the account. Don't.
-- **Clicks land at the pointer and cannot move it.** The virtual device declares buttons
-  and keys but no pointer axes, which is what lets it click without touching the cursor.
-- **The trigger key is not hidden** from the focused application. Hiding it would mean
-  grabbing the keyboard exclusively and re-injecting every other keystroke, which puts this
-  process between you and your keyboard — if it hangs, the keyboard stops responding until
-  it is killed from another virtual terminal. Not a trade worth making here.
-- **`input` group membership is required**, with the keylogging implications described
-  above.
-- **Linux only** for now.
+  recognisable name, or from XTEST, which is equally visible. Anything protected by
+  Vanguard, EAC or BattlEye will not work, and using it there risks the account. Don't.
+- **Clicks land at the pointer.** The tool never moves the cursor.
+- **The trigger key reaches the focused application** on the device backends. On X11 the
+  grab is exclusive, so there it does not.
+- **What is sent is not necessarily received.** See [Rate ceiling](#rate-ceiling); the
+  clicker's own report says "sent" for exactly this reason.
+- **Linux only.**
 
 ## Licence
 

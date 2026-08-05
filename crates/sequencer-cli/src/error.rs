@@ -23,6 +23,14 @@ pub enum Error {
     #[error(transparent)]
     Bench(#[from] sequencer_input::linux::BenchError),
 
+    /// An X11 hotkey could not be grabbed.
+    ///
+    /// A usage error, not a runtime one: the fix is a different `--activate` or `--quit`
+    /// key, which is the user's command line rather than their machine.
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    #[error(transparent)]
+    Grab(#[from] sequencer_input::x11::GrabError),
+
     /// The injection side failed.
     #[error(transparent)]
     Sink(#[from] SinkError),
@@ -72,6 +80,9 @@ impl Error {
             // Bad settings are the user's command line being wrong, which is a usage
             // error even when the parser accepted each flag on its own.
             Self::Config(_) | Self::Script { .. } => exit::USAGE,
+            // The offending key came from the command line, and the fix is to change it.
+            #[cfg(all(feature = "xtest", target_os = "linux"))]
+            Self::Grab(_) => exit::USAGE,
             #[cfg(all(feature = "evdev", target_os = "linux"))]
             Self::Capture(_) | Self::Bench(_) => exit::FAILURE,
             Self::Sink(_)

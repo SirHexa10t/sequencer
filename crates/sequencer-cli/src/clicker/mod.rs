@@ -13,8 +13,8 @@ pub mod args;
 
 pub use args::{ClickerArgs, MouseButton};
 
-use sequencer_core::clicker::{ActivationMode, ClickAction, ClickConfig};
 use sequencer_core::CompiledProfile;
+use sequencer_core::clicker::{ActivationMode, ClickAction, ClickConfig};
 
 use crate::cmd::run_profile;
 use crate::runtime::{RunSummary, fuse_limit};
@@ -42,25 +42,12 @@ pub fn clicker(args: &ClickerArgs, deps: &mut Deps<'_>) -> Result<u8> {
     let summary = run_profile(
         profile,
         fuse_limit(config.cps),
-        cadence_of(config.cps),
+        crate::runtime::cadence_of(config.cps),
         &hotkeys,
         deps,
     )?;
     report(&summary, args, deps)?;
     Ok(exit::OK)
-}
-
-/// The requested period, for the burst-accounting window in [`crate::runtime`].
-///
-/// Falls back to a tenth of a second for a rate that has no sensible period (zero or
-/// non-finite). Such a rate never reaches here — `to_profile` rejects it first — and a
-/// window is only ever used to tell one burst from another, so a placeholder is harmless
-/// where a panic would not be.
-pub(crate) fn cadence_of(cps: f64) -> sequencer_core::time::Duration {
-    sequencer_core::time::Period::from_cps(cps)
-        .map_or(sequencer_core::time::Duration::from_millis(100), |period| {
-            sequencer_core::time::Duration::from_nanos(period.nanos())
-        })
 }
 
 /// Prints the settings in the words a user would use, so a surprising result can be
@@ -84,7 +71,11 @@ fn describe(config: &ClickConfig, deps: &mut Deps<'_>) -> Result<()> {
     // Only when there is one: "no limit" is the default and saying so every run is noise.
     if config.limit > 0 {
         use std::fmt::Write as _;
-        let _ = write!(line, " | Limit: {}", crate::style::key(&config.limit.to_string()));
+        let _ = write!(
+            line,
+            " | Limit: {}",
+            crate::style::key(&config.limit.to_string())
+        );
     }
     writeln!(deps.out, "{line}")?;
     Ok(())
@@ -150,7 +141,11 @@ mod tests {
             cps: 20.0,
             ..ClickerArgs::new()
         });
-        assert_eq!(line.trim(), "left click 20/s | HOLD: F9 | Quit: F8", "{line:?}");
+        assert_eq!(
+            line.trim(),
+            "left click 20/s | HOLD: F9 | Quit: F8",
+            "{line:?}"
+        );
     }
 
     /// Toggle says TOGGLE, and a key action names the key rather than a button.
@@ -162,7 +157,11 @@ mod tests {
             kb_key: Some("f".parse().expect("f is a key")),
             ..ClickerArgs::new()
         });
-        assert_eq!(line.trim(), "f key 30/s | TOGGLE: F9 | Quit: F8", "{line:?}");
+        assert_eq!(
+            line.trim(),
+            "f key 30/s | TOGGLE: F9 | Quit: F8",
+            "{line:?}"
+        );
     }
 
     /// A limit is stated only when there is one — "no limit" on every run is noise.
