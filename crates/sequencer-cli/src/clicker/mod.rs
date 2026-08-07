@@ -86,21 +86,21 @@ fn report(summary: &RunSummary, args: &ClickerArgs, deps: &mut Deps<'_>) -> Resu
         return Ok(());
     }
     // "sent", everywhere, and never "achieved": every number here is counted as this process
-    // hands events to the backend. What a application ends up acting on can be lower — the
+    // hands events to the backend. What an application ends up acting on can be lower — the
     // input stack above us may coalesce or discard, which is exactly the gap the README's
-    // rate-ceiling section documents and `bench` measures. Reporting these as delivered would
-    // be the tool telling a comfortable lie about the one thing it cannot see.
+    // rate-ceiling section documents and `bench` measures. "Not all may arrive" keeps that
+    // caveat on the line itself; dropping it would be the tool telling a comfortable lie
+    // about the one thing it cannot see.
     match summary.sent_cps() {
         Some(rate) => writeln!(
             deps.out,
-            "sent {} actions over {} repetitions at {rate:.0}/s (asked for {}/s) \
-             — sent, not necessarily received.",
-            summary.emitted, summary.iterations, args.cps
+            "sent {} repetitions ({} actions) at {rate:.0}/s, asked {}/s — not all may arrive.",
+            summary.iterations, summary.emitted, args.cps
         )?,
         None => writeln!(
             deps.out,
-            "sent {} actions over {} repetitions — sent, not necessarily received.",
-            summary.emitted, summary.iterations
+            "sent {} repetitions ({} actions) — not all may arrive.",
+            summary.iterations, summary.emitted
         )?,
     }
     if summary.slots_skipped > 0 {
@@ -118,6 +118,10 @@ fn report(summary: &RunSummary, args: &ClickerArgs, deps: &mut Deps<'_>) -> Resu
             summary.throttled
         )?;
     }
+    // A stopwatch, not a statistic: the user decides when a run starts and stops, so this
+    // measures their session rather than the tool. That is also why it is wall time and
+    // not `active` — a rate against it would mean nothing.
+    writeln!(deps.out, "ran {:.1}s", summary.wall.as_secs_f64())?;
     Ok(())
 }
 

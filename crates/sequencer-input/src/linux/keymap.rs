@@ -64,6 +64,12 @@ static KEYS: &[(Key, KeyCode)] = &[
     (Key::PrintScreen, KeyCode::KEY_SYSRQ), (Key::ScrollLock, KeyCode::KEY_SCROLLLOCK),
     (Key::Pause, KeyCode::KEY_PAUSE),
 
+    (Key::VolumeUp, KeyCode::KEY_VOLUMEUP), (Key::VolumeDown, KeyCode::KEY_VOLUMEDOWN),
+    (Key::Mute, KeyCode::KEY_MUTE), (Key::PlayPause, KeyCode::KEY_PLAYPAUSE),
+    (Key::NextTrack, KeyCode::KEY_NEXTSONG), (Key::PrevTrack, KeyCode::KEY_PREVIOUSSONG),
+    (Key::BrightnessUp, KeyCode::KEY_BRIGHTNESSUP),
+    (Key::BrightnessDown, KeyCode::KEY_BRIGHTNESSDOWN),
+
     (Key::NumLock, KeyCode::KEY_NUMLOCK), (Key::KeypadDivide, KeyCode::KEY_KPSLASH),
     (Key::KeypadMultiply, KeyCode::KEY_KPASTERISK), (Key::KeypadMinus, KeyCode::KEY_KPMINUS),
     (Key::KeypadPlus, KeyCode::KEY_KPPLUS), (Key::KeypadEnter, KeyCode::KEY_KPENTER),

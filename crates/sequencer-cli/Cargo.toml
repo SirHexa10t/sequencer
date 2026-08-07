@@ -11,15 +11,17 @@ repository.workspace = true
 default = ["cli", "logging", "evdev", "xtest"]
 # The clap surface: Cli, Command, the *Args types, and run/try_run. Turn it off to embed
 # just the engine wiring with no clap in your dependency graph.
-cli = ["dep:clap"]
+# `nix` rides along for detect-key's terminal raw mode (termios); serde+toml parse
+# apply-profile's binds files.
+cli = ["dep:clap", "dep:nix", "dep:serde", "dep:toml"]
 # init_logging(). Off for embedders that own the global tracing subscriber themselves.
 logging = ["dep:tracing-subscriber"]
 # The Linux input backend. On by default so `cargo build` produces a working clicker;
 # inert on other platforms. `nix` rides along for session mode's privilege drop.
 evdev = ["sequencer-input/evdev", "dep:nix"]
-# The XTEST backend, for X11 sessions where libinput throttles the device path. Chosen at
-# runtime over `evdev` when $DISPLAY is set; needs `evdev` present for the shared keymap and
-# the hotkey capture, so it is not a standalone backend.
+# The X11 backend. On by default: on an X11 session it makes the whole run need no device
+# access and so no password, which is the difference between a tool you set up and one you
+# just run.
 xtest = ["sequencer-input/xtest"]
 
 [dependencies]
@@ -38,9 +40,11 @@ clap = { workspace = true, optional = true, features = [
     "wrap_help",
 ] }
 tracing-subscriber = { workspace = true, optional = true, features = ["fmt", "ansi"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
+toml = { workspace = true, optional = true, features = ["parse"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, optional = true, features = ["user"] }
+nix = { workspace = true, optional = true, features = ["user", "term"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

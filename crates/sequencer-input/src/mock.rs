@@ -1,4 +1,4 @@
-//! An in-memory sink, for tests and for `simulate`.
+//! An in-memory sink, for tests.
 
 use std::sync::{Arc, Mutex};
 

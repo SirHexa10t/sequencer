@@ -5,16 +5,20 @@
 //! makes "the engine is testable without a display server" a fact about the build rather
 //! than a promise in a comment.
 //!
-//! Two Linux backends, picked per session at runtime by the caller:
+//! Two Linux backends, chosen per session by the caller:
 //!
-//! - [`linux`] — reads `/dev/input`, writes `/dev/uinput`. Sits *below* the display
-//!   server, so one code path covers X11, Wayland and the bare console. Needs read access
-//!   to the device nodes.
-//! - [`x11`] — XTEST out, passive key grabs in. Sits *above* libinput, which is what lets
-//!   it exceed the device path's click-rate ceiling, and needs no device access at all.
-//!   X11 only, so it never replaces [`linux`].
+//! - [`linux`] — reads `/dev/input`, writes `/dev/uinput`. Below the display server, so
+//!   one code path covers X11, Wayland and the bare console, and it is the only way to
+//!   reach the last two. Needs access to the device nodes, which is what a user has to
+//!   grant.
+//! - [`x11`] — XTEST out, passive key grabs in. X11 only, and **needs no device access at
+//!   all**: an X11 run is an ordinary X client, so it asks for no permissions and no
+//!   password. It also sits above libinput, which historically mattered for the click rate.
 //!
-//! They share [`linux::keymap`], which is why `x11` is gated on `evdev` being present too.
+//! They share [`linux::keymap`] — an X keycode on Linux is the evdev code plus a fixed
+//! offset — which is why `xtest` pulls `evdev` in for the tables even though it opens no
+//! device.
+//!
 //! Other platforms would be new modules behind their own target-gated features; nothing
 //! here anticipates them beyond that.
 

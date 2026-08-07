@@ -9,10 +9,10 @@
 //!
 //! Three outcomes, decided in order:
 //!
-//! 1. **No elevation needed** — the command doesn't touch devices (`doctor`, `simulate`,
-//!    `write-script`), access is already there (group membership, running as root), or the
-//!    session is X11 and the whole run goes through the X server. Runs directly; sudo is
-//!    never mentioned.
+//! 1. **No elevation needed** — the session is X11, so the whole run goes through the X
+//!    server and opens no device at all; or the command doesn't touch devices (`doctor`,
+//!    `apply-profile`, `write-script`, `detect-key --no-sudo`); or access is already
+//!    there (group membership, running as root). Runs directly; sudo is never mentioned.
 //! 2. **Elevation needed, terminal available** — explain what sudo is for and what will
 //!    happen to the privilege, then re-exec this same command line under sudo. The child
 //!    lands in [`drop_root_after_open`] and continues as the invoking user plus the
@@ -69,18 +69,20 @@ pub fn run_with_sudo_prompt(cli: &Cli, doctor_hint: &str) -> u8 {
 /// Whether running `command` calls for the sudo round-trip: it will open input devices,
 /// we aren't root, and the devices aren't accessible as we stand.
 fn session_needs_sudo(command: &Command) -> bool {
-    wants_devices(command) && !platform::is_root() && !platform::has_device_access()
+    wants_devices(command) && !platform::is_root() && !platform::has_device_access(command)
 }
 
 /// Whether the X11 backend will handle both halves of a run — injection through XTEST and
 /// hotkeys through key grabs — leaving no input device for anything to open.
 ///
-/// Takes the answer rather than computing it, so the decision is testable: the workspace
-/// denies `unsafe_code`, and `std::env::set_var` is unsafe.
+/// This, not the click rate, is XTEST's durable reason to exist: it turns an X11 session
+/// into a tool you just run, with no group membership widened and no password asked for.
 ///
-/// The caller passes [`sequencer_input::x11::is_usable`], which *connects* rather than
-/// trusting `$DISPLAY` to be set. A stale variable would otherwise convince this that no
-/// password is needed, and the run would then fail on devices it never asked to open.
+/// Takes the answer rather than computing it, so the decision is testable: the workspace
+/// denies `unsafe_code`, and `std::env::set_var` is unsafe. The caller passes
+/// [`sequencer_input::x11::is_usable`], which *connects* rather than trusting `$DISPLAY` —
+/// a stale variable would otherwise convince this that no password is needed, and the run
+/// would then fail on devices it had already decided it would not touch.
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 const fn x11_handles_everything(x11_usable: bool) -> bool {
     cfg!(feature = "xtest") && x11_usable
@@ -97,9 +99,38 @@ fn wants_devices(command: &Command) -> bool {
     match command {
         Command::Clicker(args) => args.config().to_profile().is_ok(),
         Command::Bench(_) => true,
-        // `doctor` must see the machine as it really is, and `simulate` never leaves the
-        // engine — elevating either would be theatre.
+        // Exact detection reads the devices; `--no-sudo` reads the terminal instead.
+        Command::DetectKey(args) => !args.no_sudo,
+        // `doctor` must see the machine as it really is; `apply-profile` goes through
+        // the X server. Elevating either would be theatre.
         _ => false,
+    }
+}
+
+/// Whether a usable X11 session spares `command` the devices entirely.
+///
+/// True for a normal run: XTEST injects and grabs listen. False for `detect-key`, which
+/// must hear *every* key — a grab names its keys in advance, so no grab can serve it,
+/// and letting X11 waive the password would just move the failure to the device open.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+fn x11_serves(command: &Command) -> bool {
+    !matches!(command, Command::DetectKey(_))
+}
+
+/// The device requirements `command` actually has.
+///
+/// `detect-key` only reads: no virtual device is created, so demanding a writable
+/// /dev/uinput would ask for a password (or a kernel module) the run has no use for.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+fn requirements_of(command: &Command) -> &'static [sequencer_input::Requirement] {
+    use sequencer_input::Requirement;
+    match command {
+        Command::DetectKey(_) => &[Requirement::EvdevReadable],
+        _ => &[
+            Requirement::UinputModuleLoaded,
+            Requirement::UinputNodeWritable,
+            Requirement::EvdevReadable,
+        ],
     }
 }
 
@@ -177,6 +208,25 @@ fn silent_sudo(args: &[&str]) -> bool {
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 pub(crate) use platform::{drop_root_after_open, load_uinput_if_root};
 
+/// No-ops for the X11-only Linux build — the one configuration that has a run path but no
+/// device backend. There is no module to load and no privilege to shed, because nothing
+/// there ever opens a device. Kept as functions rather than call sites gated with `cfg` so
+/// the run path reads the same everywhere.
+#[cfg(all(feature = "xtest", not(feature = "evdev"), target_os = "linux"))]
+mod noop {
+    pub(crate) const fn load_uinput_if_root() {}
+
+    // The Result is not unnecessary: it is the signature the real one has, and matching it
+    // is the entire point of this module.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) const fn drop_root_after_open() -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "xtest", not(feature = "evdev"), target_os = "linux"))]
+pub(crate) use noop::{drop_root_after_open, load_uinput_if_root};
+
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 mod platform {
     use nix::unistd::{Gid, Group, Uid, geteuid, setgid, setgroups, setuid};
@@ -220,22 +270,17 @@ mod platform {
 
     /// Whether the devices are usable as this process stands — the same three checks
     /// `doctor` reports.
-    pub(crate) fn has_device_access() -> bool {
-        use sequencer_input::Requirement;
-        // On a usable X11 session a run touches no input device at all: XTEST injects
-        // through the server and the hotkeys arrive by key grab. Nothing for sudo to open,
-        // so nothing to ask for — which is the whole point of that backend existing, and
-        // why this returns early rather than checking anything.
-        if super::x11_handles_everything(x11_usable()) {
+    pub(crate) fn has_device_access(command: &crate::Command) -> bool {
+        // On a usable X11 session a normal run touches no input device at all: XTEST
+        // injects through the server and the hotkeys arrive by key grab. Nothing for
+        // sudo to open, so nothing to ask for. `detect-key` is the exception — see
+        // `x11_serves` — and its requirement set is smaller — see `requirements_of`.
+        if super::x11_serves(command) && super::x11_handles_everything(x11_usable()) {
             return true;
         }
-        [
-            Requirement::UinputModuleLoaded,
-            Requirement::UinputNodeWritable,
-            Requirement::EvdevReadable,
-        ]
-        .into_iter()
-        .all(|requirement| requirement.check().is_pass())
+        super::requirements_of(command)
+            .iter()
+            .all(|requirement| requirement.check().is_pass())
     }
 
     /// Loads the `uinput` module if the node is missing and we can (root). Best-effort:
@@ -297,7 +342,7 @@ mod platform {
         false
     }
 
-    pub(crate) const fn has_device_access() -> bool {
+    pub(crate) const fn has_device_access(_command: &crate::Command) -> bool {
         true
     }
 }
@@ -320,6 +365,41 @@ mod tests {
             !wants_devices(&doctor),
             "doctor reports missing access; elevating it would blind it"
         );
+        assert!(
+            wants_devices(&Command::DetectKey(crate::args::DetectKeyArgs::new())),
+            "exact detection reads every device"
+        );
+        assert!(
+            !wants_devices(&Command::DetectKey(crate::args::DetectKeyArgs {
+                no_sudo: true,
+                ..crate::args::DetectKeyArgs::new()
+            })),
+            "--no-sudo reads the terminal; sudo would be theatre"
+        );
+    }
+
+    /// A grab must name its keys in advance, so no X11 session can serve a command that
+    /// exists to hear every key. Waiving the password here would only move the failure
+    /// two lines down, to a device open the run had been told it would not need.
+    #[cfg(all(feature = "evdev", target_os = "linux"))]
+    #[test]
+    fn detect_key_never_lets_x11_waive_its_device_access() {
+        assert!(!x11_serves(&Command::DetectKey(
+            crate::args::DetectKeyArgs::new()
+        )));
+        assert!(x11_serves(&Command::Clicker(ClickerArgs::new())));
+    }
+
+    /// detect-key only reads, so it must not demand a writable /dev/uinput — that would
+    /// ask for a password (or a kernel module) the run has no use for.
+    #[cfg(all(feature = "evdev", target_os = "linux"))]
+    #[test]
+    fn detect_key_requires_only_the_readable_half() {
+        use sequencer_input::Requirement;
+        assert_eq!(
+            requirements_of(&Command::DetectKey(crate::args::DetectKeyArgs::new())),
+            &[Requirement::EvdevReadable]
+        );
     }
 
     /// The reason `x11_handles_everything` takes a probed answer rather than reading
@@ -329,28 +409,21 @@ mod tests {
     #[cfg(all(feature = "xtest", feature = "evdev", target_os = "linux"))]
     #[test]
     fn a_stale_display_variable_does_not_count_as_an_x11_session() {
-        // `is_usable()` is what the caller passes; a false answer must put the run back on
-        // the device path regardless of how the environment looks.
         assert!(
             !x11_handles_everything(false),
             "an unreachable X server must not suppress the password prompt"
         );
     }
 
-    /// The X11 backend's whole point: a session that injects through XTEST and hears its
-    /// hotkeys through key grabs opens no input device, so it must never reach the password
-    /// prompt. Guarded here because it is a user-visible promise, and the check that keeps
-    /// it is one `if` somebody could reasonably delete as redundant.
+    /// The X11 backend's whole point, and the reason removing it was a mistake: a session
+    /// that injects through XTEST and hears its hotkeys through key grabs opens no input
+    /// device, so it must never reach the password prompt.
     #[cfg(all(feature = "xtest", feature = "evdev", target_os = "linux"))]
     #[test]
     fn an_x11_session_needs_no_device_access_and_so_no_password() {
         assert!(
             x11_handles_everything(true),
             "an X11 run touches no device: XTEST injects and grabs listen, so sudo is moot"
-        );
-        assert!(
-            !x11_handles_everything(false),
-            "with no usable X server the run is back on the devices, and may need a password"
         );
     }
 

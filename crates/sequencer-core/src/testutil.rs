@@ -1,7 +1,7 @@
 //! Test doubles, and a harness that drives the engine with them.
 //!
 //! Exported unconditionally rather than behind a feature, because the same doubles power
-//! the CLI's tests and its `simulate` subcommand. A tool in this space lives or dies on
+//! the CLI's tests. A tool in this space lives or dies on
 //! whether a user's "it does the wrong thing" can be turned into a reproducible case
 //! without their hardware.
 

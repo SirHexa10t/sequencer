@@ -5,12 +5,12 @@
 //! what makes this backend work on X11, on Wayland, and on a bare console alike, and it is
 //! the only one that reaches Wayland and the console at all.
 //!
-//! It is the *shortest* path to the kernel — emitting a click is a couple of `write(2)`
-//! calls with no display-server round trip — but not necessarily the fastest to an
-//! application: everything written here passes through libinput on the way up. See
-//! [`crate::x11::inject`] for the X11 backend that goes over the top of it, and
-//! [`UinputSink::open`] for the device shape that keeps libinput routing these events at
-//! all.
+//! It is the shortest path to the kernel — emitting a click is a couple of `write(2)`
+//! calls with no display-server round trip — but everything written here still passes
+//! through libinput on the way up to an application. What that costs depends entirely on
+//! the shape of the device; see [`UinputSink::open`], where the axes exist for no reason
+//! other than keeping libinput routing these events. [`crate::x11::inject`] is the X11
+//! backend that goes over the top of libinput instead.
 //!
 //! Clicks land wherever the pointer already is. The device advertises pointer axes (see
 //! [`UinputSink::open`]) but never sends a motion event, so it can press and release

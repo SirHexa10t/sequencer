@@ -268,6 +268,12 @@ pub struct RunSummary {
     /// activations into the total — tap the trigger a few times over a minute and a perfect
     /// 20/s reads as 3/s, which looks like a broken tool rather than a user thinking.
     pub active: Duration,
+    /// Wall-clock length of the whole run, first tick to shutdown.
+    ///
+    /// Unlike [`Self::active`] this includes idle time waiting for the trigger — it is a
+    /// stopwatch for the user, not a denominator for a rate. Dividing anything by it would
+    /// recreate the bug `active` exists to avoid.
+    pub wall: Duration,
     /// Gaps counted into [`Self::active`] — the denominator's matching numerator.
     ///
     /// Not `iterations - 1`: that counts the spans BETWEEN bursts too, which `active`
@@ -331,6 +337,7 @@ pub fn run_engine(
     // may be while still counting as the same burst.
     let mut previous_iteration: Option<Timestamp> = None;
     let same_burst = burst_gap(cadence);
+    let run_started = clock.now();
 
     'run: loop {
         let now = clock.now();
@@ -380,7 +387,9 @@ pub fn run_engine(
 
     // Always, on every path out including the failing one. A second error here would add
     // nothing to the first, so it is dropped rather than masking it.
-    engine.shutdown(clock.now(), &mut buf);
+    let run_ended = clock.now();
+    summary.wall = run_ended.saturating_sub(run_started);
+    engine.shutdown(run_ended, &mut buf);
     for emit in buf.as_slice() {
         let _ = guard.sink.emit(emit);
         summary.emitted += 1;

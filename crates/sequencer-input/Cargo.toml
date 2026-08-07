@@ -9,16 +9,14 @@ repository.workspace = true
 
 [features]
 default = []
-# The Linux backend: reads /dev/input for capture, writes /dev/uinput for injection.
-# One code path that works identically on X11, Wayland and the console, which is also
-# why there is no X11-protocol backend -- this one covers those sessions too.
-# Inert off-Linux: the dependencies below are target-gated.
+# The device backend: reads /dev/input for capture, writes /dev/uinput for injection.
+# The only one that reaches Wayland and the console. Inert off-Linux: target-gated below.
 evdev = ["dep:evdev"]
-# XTEST injection for X11 sessions: the same events, delivered above libinput instead of
-# below it. See the README's rate-ceiling section for why that layer matters.
+# The X11 backend: XTEST out, passive key grabs in. Needs no device access at all, which
+# is what makes an X11 run require no setup. Shares `linux::keymap`, so it pulls `evdev`
+# in for the tables even though it opens no device.
 xtest = ["dep:x11rb", "dep:evdev"]
 # Reserved so the feature names are stable:
-#   x11     -- only if a zero-setup X11-only mode is ever wanted
 #   windows -- WH_KEYBOARD_LL hooks + SendInput
 #   macos   -- CGEventTap + CGEventPost
 

@@ -1,3 +1,0 @@
-# Hold F9 for just over half a second, then let go.
-0    down f9
-520  up   f9

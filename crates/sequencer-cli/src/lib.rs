@@ -69,6 +69,10 @@
 pub mod clicker;
 #[cfg(feature = "cli")]
 pub mod cmd;
+#[cfg(feature = "cli")]
+mod detect_key;
+#[cfg(feature = "cli")]
+mod profile;
 pub mod runtime;
 #[cfg(feature = "cli")]
 pub mod write_script;
@@ -97,7 +101,9 @@ pub use sequencer_core as core;
 pub use sequencer_input as input;
 
 #[cfg(feature = "cli")]
-pub use crate::args::{BenchArgs, Cli, Command, DoctorArgs, GlobalArgs, SimulateArgs};
+pub use crate::args::{
+    ApplyProfileArgs, BenchArgs, Cli, Command, DetectKeyArgs, DoctorArgs, GlobalArgs,
+};
 #[cfg(feature = "cli")]
 pub use crate::clicker::{ClickerArgs, MouseButton};
 pub use crate::error::Error;
@@ -294,7 +300,8 @@ pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
         Command::WriteScript(args) => write_script::write_script(args, deps),
         Command::Bench(args) => cmd::bench(args, deps),
         Command::Doctor(args) => cmd::doctor(args, deps),
-        Command::Simulate(args) => cmd::simulate(args, deps),
+        Command::DetectKey(args) => detect_key::detect_key(args, deps),
+        Command::ApplyProfile(args) => profile::apply_profile(args, deps),
     }
 }
 

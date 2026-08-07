@@ -59,8 +59,10 @@ pub enum Command {
     Bench(BenchArgs),
     /// Report what this machine can and cannot do, and how to fix what it cannot.
     Doctor(DoctorArgs),
-    /// Replay a scripted list of input events through the engine and print the timeline.
-    Simulate(SimulateArgs),
+    /// Print the name of each key as it is pressed, once per press.
+    DetectKey(DetectKeyArgs),
+    /// Apply a binds profile: remap keys and run sequences until stopped.
+    ApplyProfile(ApplyProfileArgs),
     /// Run a scripted sequence of input events. Not implemented yet.
     WriteScript(WriteScriptArgs),
 }
@@ -73,7 +75,8 @@ impl Command {
             Self::Clicker(args) => &args.global,
             Self::Bench(args) => &args.global,
             Self::Doctor(args) => &args.global,
-            Self::Simulate(args) => &args.clicker.global,
+            Self::DetectKey(args) => &args.global,
+            Self::ApplyProfile(args) => &args.global,
             Self::WriteScript(args) => &args.global,
         }
     }
@@ -183,25 +186,50 @@ impl Default for DoctorArgs {
     }
 }
 
-/// `sequencer simulate`.
-#[derive(Args, Debug, Clone, PartialEq)]
-pub struct SimulateArgs {
-    // No `global` of its own: `click` already flattens `GlobalArgs`, and flattening it
-    // twice into one command makes clap reject the whole definition for duplicate
-    // argument names.
-    /// A script of input events, one per line: `<milliseconds> <down|up> <key>`.
+/// `sequencer detect-key`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct DetectKeyArgs {
+    /// Read the terminal instead of the input devices: no sudo, works anywhere.
     ///
-    /// Blank lines and `#` comments are ignored. Use `-` to read standard input.
-    #[arg(value_name = "SCRIPT")]
-    pub script: PathBuf,
+    /// The trade is that a terminal only knows characters — keys that type nothing
+    /// (modifiers alone, media keys, mouse buttons) print nothing, and with NumLock on
+    /// kp8 is indistinguishable from 8. The default reads the devices and is exact.
+    #[arg(short = 'n', long)]
+    pub no_sudo: bool,
 
-    /// The clicker settings to replay the script against.
+    /// Shared options.
     #[command(flatten)]
-    pub clicker: ClickerArgs,
+    pub global: GlobalArgs,
+}
 
-    /// Stop after this many milliseconds of simulated time.
-    #[arg(long, default_value_t = 2000, value_name = "MS")]
-    pub until_ms: u64,
+impl DetectKeyArgs {
+    /// Every flag at its command-line default.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            no_sudo: false,
+            global: GlobalArgs::new(),
+        }
+    }
+}
+
+impl Default for DetectKeyArgs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `sequencer apply-profile`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ApplyProfileArgs {
+    /// The binds file to apply. `binds.example.toml` in the repository documents the
+    /// format.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Shared options.
+    #[command(flatten)]
+    pub global: GlobalArgs,
 }
 
 /// Rejects a bad rate at parse time, so `--cps 0` is a clean usage error rather than a
@@ -274,6 +302,16 @@ mod tests {
     }
 
     #[test]
+    fn no_sudo_parses_long_and_short() {
+        for flag in ["-n", "--no-sudo"] {
+            let Command::DetectKey(args) = parse(&["sequencer", "detect-key", flag]) else {
+                panic!("should be detect-key");
+            };
+            assert!(args.no_sudo, "{flag} should set no_sudo");
+        }
+    }
+
+    #[test]
     fn verbose_and_quiet_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["sequencer", "clicker", "-v", "-q"]).is_err());
     }
@@ -287,10 +325,10 @@ mod tests {
             Command::Clicker(ClickerArgs::new()),
             Command::Bench(BenchArgs::new()),
             Command::Doctor(DoctorArgs::new()),
-            Command::Simulate(SimulateArgs {
-                script: PathBuf::new(),
-                clicker: ClickerArgs::new(),
-                until_ms: 0,
+            Command::DetectKey(DetectKeyArgs::new()),
+            Command::ApplyProfile(ApplyProfileArgs {
+                file: PathBuf::new(),
+                global: GlobalArgs::new(),
             }),
             Command::WriteScript(WriteScriptArgs::new()),
         ];

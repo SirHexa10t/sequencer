@@ -5,6 +5,10 @@
 //! exact actions produced. The black-box ones spawn the real binary, and cover only what
 //! the in-process tier cannot see: exit codes and real standard output.
 
+// Everything here drives the clap surface, which the `cli` feature owns. Without it the
+// crate exports no parser to test, so the whole file stands down rather than failing to
+// compile a build that is deliberately clap-free.
+#![cfg(feature = "cli")]
 // Test code: unwrapping is how a test reports a failure.
 #![allow(clippy::unwrap_used)]
 
@@ -12,7 +16,10 @@ use assert_cmd::Command as ProcessCommand;
 use predicates::prelude::*;
 
 use sequencer_cli::runtime::ScriptedPump;
-use sequencer_cli::{ClickerArgs, Command, Deps, DoctorArgs, dispatch, exit};
+use sequencer_cli::{
+    ApplyProfileArgs, ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, GlobalArgs, dispatch,
+    exit,
+};
 use sequencer_core::emit::EmitAction;
 use sequencer_core::input::{Button, EventKind, InputEvent, Key};
 use sequencer_core::testutil::VirtualClock;
@@ -21,6 +28,13 @@ use sequencer_input::MockInjector;
 
 fn bin() -> ProcessCommand {
     ProcessCommand::cargo_bin("sequencer").expect("binary should build")
+}
+
+fn press(key: Key) -> (Timestamp, InputEvent) {
+    (
+        Timestamp::ZERO,
+        InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(key)),
+    )
 }
 
 // -------------------------------------------------------------------------- in-process
@@ -56,6 +70,85 @@ fn clicking_through_dispatch_reaches_the_injected_sink() {
         1,
         "the drop guard must release"
     );
+}
+
+/// The exit report's two promises: the sent line carries its own caveat — this process
+/// counts what it hands to the backend and cannot see what arrives — and the run closes
+/// with a stopwatch line, because the user chose when to stop and may want to know how
+/// long that was.
+#[test]
+fn the_exit_report_caveats_sent_and_ends_with_a_stopwatch() {
+    let mut out = Vec::new();
+    let clock = VirtualClock::new();
+    let mut sink = MockInjector::new();
+    let mut pump = ScriptedPump::new([(
+        Timestamp::ZERO,
+        InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::F9)),
+    )]);
+
+    let mut deps = Deps::new(&mut out, &clock);
+    deps.sink = Some(&mut sink);
+    deps.pump = Some(&mut pump);
+    dispatch(&Command::Clicker(ClickerArgs::new()), &mut deps).expect("should run");
+
+    let report = String::from_utf8(out).expect("the report is text");
+    assert!(
+        report.contains("sent") && report.contains("not all may arrive"),
+        "the sent line must say the count is what was sent, not what arrived: {report}"
+    );
+    assert!(
+        report.lines().last().unwrap().starts_with("ran "),
+        "the last line is the stopwatch: {report}"
+    );
+}
+
+/// detect-key's contract: every press prints its bindable name exactly once, releases
+/// print nothing, and mouse buttons use the binds spelling (`mouse1`), not `left` —
+/// which would be indistinguishable from the arrow key.
+#[test]
+fn detect_key_names_each_press_once_and_nothing_else() {
+    let mut out = Vec::new();
+    let clock = VirtualClock::new();
+    let mut pump = ScriptedPump::new(
+        [
+            EventKind::KeyDown(Key::F9),
+            EventKind::KeyUp(Key::F9),
+            EventKind::ButtonDown(Button::Left),
+            EventKind::ButtonUp(Button::Left),
+            EventKind::KeyDown(Key::F9),
+        ]
+        .map(|kind| (Timestamp::ZERO, InputEvent::physical(Timestamp::ZERO, kind))),
+    );
+
+    let mut deps = Deps::new(&mut out, &clock);
+    deps.pump = Some(&mut pump);
+    let code = dispatch(&Command::DetectKey(DetectKeyArgs::new()), &mut deps).expect("should run");
+
+    assert_eq!(code, exit::OK);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.ends_with("F9\nmouse1\nF9\n"),
+        "one line per press, none per release: {text}"
+    );
+    assert!(
+        text.contains("capslock"),
+        "the illustrative keyboard prints first: {text}"
+    );
+    // The reference is the ONLY place these sets are listed now — the binds template
+    // points here instead of repeating them — so their presence is a contract.
+    for set_member in [
+        "wheel-up",
+        "pad-south",
+        "volume-up",
+        "mouse4",
+        "rctrl",
+        "hid:",
+    ] {
+        assert!(
+            text.contains(set_member),
+            "the printed reference must list `{set_member}`: {text}"
+        );
+    }
 }
 
 #[test]
@@ -166,67 +259,99 @@ fn an_unknown_key_names_itself_in_the_error() {
 #[test]
 fn the_prototypes_flags_still_work() {
     // `--toggle --cps 30 --key_press f` is a command line someone may have in their shell
-    // history from the Python version.
-    bin()
-        .args([
-            "simulate",
-            "tests/fixtures/hold.txt",
-            "--toggle",
-            "--cps",
-            "30",
-            "--key_press",
-            "f",
-            // Past the fixture's 520ms release: toggle latches ON there, so the window has
-            // to outlast it for anything to be emitted at all.
-            "--until-ms",
-            "1000",
-        ])
-        .assert()
-        .success()
-        // The timeline proves the flags took EFFECT, not merely that they parsed: `--key_press f`
-        // makes the emitted actions key presses (`KD:f`) rather than the default button clicks.
-        .stdout(predicate::str::contains("KD:f").and(predicate::str::contains("BD:left").not()));
+    // history from the Python version. In-process with an injected pair, so the flags are
+    // proven to take EFFECT — the emitted action is a key press, not the default click —
+    // rather than merely to parse.
+    use sequencer_cli::clap::Parser as _;
+    let cli = sequencer_cli::Cli::try_parse_from([
+        "sequencer",
+        "clicker",
+        "--toggle",
+        "--cps",
+        "30",
+        "--key_press",
+        "f",
+    ])
+    .expect("the prototype's flags should parse");
+
+    let mut out = Vec::new();
+    let clock = VirtualClock::new();
+    let mut sink = MockInjector::new();
+    let watcher = sink.clone();
+    // Toggle latches on at the release, and the engine phase-locks to the event's own
+    // timestamp — so both edges sit at zero, where the virtual clock already is. The
+    // pump then ends and shutdown releases whatever the toggle began.
+    let mut pump = ScriptedPump::new([
+        press(Key::F9),
+        (
+            Timestamp::ZERO,
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyUp(Key::F9)),
+        ),
+    ]);
+    let mut deps = Deps::new(&mut out, &clock);
+    deps.sink = Some(&mut sink);
+    deps.pump = Some(&mut pump);
+    dispatch(&cli.command, &mut deps).expect("should run");
+
+    let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+    assert!(
+        actions.contains(&EmitAction::KeyDown(Key::F)),
+        "--key_press f must emit key presses: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, EmitAction::ButtonDown(_))),
+        "no default clicks once --key_press takes effect: {actions:?}"
+    );
+}
+
+/// The shipped template is a runnable profile: apply-profile accepts it, describes every
+/// binding in the words of the file, and runs its loop against the injected pair.
+#[test]
+fn apply_profile_accepts_the_shipped_template() {
+    let mut out = Vec::new();
+    let clock = VirtualClock::new();
+    let mut sink = MockInjector::new();
+    let mut pump = ScriptedPump::new([press(Key::PageUp)]);
+    let mut deps = Deps::new(&mut out, &clock);
+    deps.sink = Some(&mut sink);
+    deps.pump = Some(&mut pump);
+
+    let args = ApplyProfileArgs {
+        file: concat!(env!("CARGO_MANIFEST_DIR"), "/../../binds.example.toml").into(),
+        global: GlobalArgs::new(),
+    };
+    let code = dispatch(&Command::ApplyProfile(args), &mut deps).expect("should run");
+
+    assert_eq!(code, exit::OK);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("PgUp -> volume-up"), "{text}");
+    assert!(text.contains("Ctrl+C stops"), "{text}");
 }
 
 #[test]
-fn simulate_replays_a_script_and_prints_the_timeline() {
-    bin()
-        .args(["simulate", "tests/fixtures/hold.txt", "--until-ms", "1000"])
-        .assert()
-        .success()
-        .stdout(
-            // Eleven clicks, one every 50ms, from a 520ms hold at 20/s — and each one is a
-            // press held 8ms before its release, never a press and release at the same
-            // instant, which applications discard as a zero-duration click.
-            predicate::str::contains("0 BD:left | 8 BU:left | 50 BD:left | 58 BU:left")
-                .and(predicate::str::contains("| 500 BD:left | 508 BU:left"))
-                .and(predicate::str::contains("11 repetitions"))
-                .and(predicate::str::contains("nothing left held")),
-        );
-}
-
-#[test]
-fn a_broken_script_line_is_a_usage_error_that_says_which_line() {
+fn an_invalid_profile_is_a_usage_error_that_names_the_problem() {
     let dir = std::env::temp_dir().join("sequencer-cli-tests");
     std::fs::create_dir_all(&dir).expect("temp dir");
-    let script = dir.join("broken.txt");
-    std::fs::write(&script, "0 down f9\nthis is not an event\n").expect("write script");
+    let file = dir.join("dangling-hold.toml");
+    std::fs::write(&file, "[binds.F6]\nseq = [\"HOLD ctrl\"]\n").expect("write profile");
 
     bin()
-        .arg("simulate")
-        .arg(&script)
+        .arg("apply-profile")
+        .arg(&file)
         .assert()
         .failure()
         .code(i32::from(exit::USAGE))
-        .stderr(predicate::str::contains("line 2"));
+        .stderr(predicate::str::contains("never RELEASEd"));
 
-    std::fs::remove_file(&script).ok();
+    std::fs::remove_file(&file).ok();
 }
 
 #[test]
-fn a_missing_script_fails_without_a_backtrace() {
+fn a_missing_profile_fails_without_a_backtrace() {
     bin()
-        .args(["simulate", "/nonexistent/script.txt"])
+        .args(["apply-profile", "/nonexistent/binds.toml"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error:"));

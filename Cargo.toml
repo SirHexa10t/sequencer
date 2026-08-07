@@ -26,11 +26,14 @@ tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
 spin_sleep = "1.3"
 evdev = "0.13"
+# X11 XTEST injection and key grabs — pure Rust, no libX11.
+x11rb = { version = "0.13", default-features = false, features = ["xtest"] }
+# Binds profiles are TOML; serde only ever derives Deserialize here.
+serde = { version = "1", default-features = false }
+toml = { version = "0.8", default-features = false }
 # Privilege drop for session mode (setgroups/setgid/setuid). Same version evdev already
 # pulls transitively, so this adds no new crate to the tree.
 nix = { version = "0.29", default-features = false }
-# X11 XTEST injection — pure Rust, no libX11. Only the xtest extension feature is enabled.
-x11rb = { version = "0.13", default-features = false, features = ["xtest"] }
 
 insta = { version = "1", default-features = false }
 proptest = "1"

@@ -1,8 +1,6 @@
 //! What each subcommand actually does.
 
-use sequencer_core::input::{EventKind, InputEvent, Key};
-use sequencer_core::testutil::Harness;
-use sequencer_core::time::Timestamp;
+use sequencer_core::input::Key;
 use sequencer_core::{CompiledProfile, Engine};
 // Only the benchmark's live progress asks whether stderr is a terminal.
 #[cfg(all(feature = "evdev", target_os = "linux"))]
@@ -11,16 +9,24 @@ use std::io::IsTerminal as _;
 use sequencer_input::probe::{CheckResult, Step as FixStep};
 use sequencer_input::{Requirement, SessionInfo};
 
-use crate::args::{BenchArgs, DoctorArgs, SimulateArgs};
+#[cfg(not(all(feature = "evdev", target_os = "linux")))]
+use crate::Error;
+use crate::args::{BenchArgs, DoctorArgs};
 use crate::runtime::{RunSummary, run_engine};
-use crate::{Deps, Error, Result, exit};
+use crate::{Deps, Result, exit};
 
-/// Every requirement the Linux backend needs, in report order.
+/// Every requirement the device backend needs, in report order.
+///
+/// Empty in an X11-only build: nothing there opens a device, so there is nothing to check
+/// and reporting failures would be reporting on a code path that was compiled out.
+#[cfg(feature = "evdev")]
 const REQUIREMENTS: &[Requirement] = &[
     Requirement::UinputModuleLoaded,
     Requirement::UinputNodeWritable,
     Requirement::EvdevReadable,
 ];
+#[cfg(not(feature = "evdev"))]
+const REQUIREMENTS: &[Requirement] = &[];
 
 /// Runs a validated profile, using the injected sink and pump if there are any.
 pub(crate) fn run_profile(
@@ -137,14 +143,20 @@ impl sequencer_input::linux::BenchObserver for BenchProgress {
     }
 }
 
-/// `sequencer bench`, on a platform with no backend.
+/// `sequencer bench`, without the device backend.
 ///
 /// # Errors
 ///
-/// Always: there is nothing to measure.
+/// Always. Measuring delivery means reading the emitted events back off a device node,
+/// which is the one thing the X11 backend cannot do: XTEST hands events to the server and
+/// there is nothing underneath to read them from.
 #[cfg(not(all(feature = "evdev", target_os = "linux")))]
 pub fn bench(_args: &BenchArgs, _deps: &mut Deps<'_>) -> Result<u8> {
-    platform::unsupported()
+    Err(Error::NotImplemented(
+        "bench needs the device backend: it measures delivery by reading its own events \
+         back, and only /dev/input can be read back."
+            .to_owned(),
+    ))
 }
 
 /// `sequencer doctor`.
@@ -154,6 +166,9 @@ pub fn bench(_args: &BenchArgs, _deps: &mut Deps<'_>) -> Result<u8> {
 /// If writing the report fails.
 pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     let info = SessionInfo::detect();
+    // Probed once and reused: every call opens a fresh X connection, and two calls could
+    // in principle straddle a session ending and have the report contradict itself.
+    let on_x11 = x11_handles_the_run();
 
     writeln!(
         deps.out,
@@ -163,7 +178,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         std::env::consts::ARCH
     )?;
     writeln!(deps.out, "session: {}", info.session)?;
-    writeln!(deps.out, "backend: {}", injection_backend())?;
+    writeln!(deps.out, "backend: {}", backend_pair(on_x11))?;
     if args.global.verbose > 0 {
         for (label, value) in [
             ("DISPLAY", info.display.as_deref()),
@@ -205,29 +220,50 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     }
 
     if unmet.is_empty() {
+        if REQUIREMENTS.is_empty() && !on_x11 {
+            writeln!(
+                deps.out,
+                "[fail] no X server answered, and this build has only the X11 backend. \
+                 Rebuild with the `evdev` feature to run outside X."
+            )?;
+            return Ok(exit::FAILURE);
+        }
         writeln!(deps.out, "\nReady.")?;
         return Ok(exit::OK);
     }
-    if x11_handles_the_run() {
+    if on_x11 {
         writeln!(
             deps.out,
             "\nNone of that is needed here: this is an X11 session, so clicks go through \
-             XTEST and hotkeys through key grabs. The checks above matter only if you \
-             later run without X."
+             XTEST and hotkeys through key grabs, and neither opens a device. The checks \
+             above matter only if you later run without X."
         )?;
         return Ok(exit::OK);
     }
     {
         writeln!(
             deps.out,
-            "\nUntil that is fixed, `sequencer simulate` still works: it runs the engine \
-             without touching an input device."
+            "\nUntil that is fixed, `sequencer detect-key` still works: it reads the \
+             terminal, not the devices."
         )?;
         Ok(exit::FAILURE)
     }
 }
 
+/// Which backend pair a run would choose, for `doctor` to report.
+const fn backend_pair(on_x11: bool) -> &'static str {
+    if on_x11 {
+        "X11 — XTEST for clicks, key grabs for hotkeys (no device access, no sudo)"
+    } else {
+        "uinput device for clicks, evdev for hotkeys"
+    }
+}
+
 /// Whether the X11 pair will handle the whole run, making the device checks informational.
+///
+/// Asks the same question `platform::open_pair` will — [`sequencer_input::x11::is_usable`],
+/// which connects rather than reading `$DISPLAY` — so the report cannot promise one backend
+/// and the run pick the other.
 fn x11_handles_the_run() -> bool {
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
@@ -261,114 +297,20 @@ fn write_remediation(requirement: Requirement, deps: &mut Deps<'_>) -> Result<()
     Ok(())
 }
 
-/// `sequencer simulate`.
-///
-/// # Errors
-///
-/// If the script cannot be read or parsed, or the settings are not runnable.
-pub fn simulate(args: &SimulateArgs, deps: &mut Deps<'_>) -> Result<u8> {
-    let source = if args.script == std::path::Path::new("-") {
-        std::io::read_to_string(std::io::stdin())?
-    } else {
-        std::fs::read_to_string(&args.script).map_err(|source| Error::ScriptRead {
-            path: args.script.display().to_string(),
-            source,
-        })?
-    };
-    let script = parse_script(&source)?;
-
-    let profile = CompiledProfile::validate(args.clicker.config().to_profile()?)?;
-    let mut harness = Harness::new(profile, 0);
-    for (at, kind) in script {
-        harness.at(at, InputEvent::physical(at, kind));
-    }
-    harness.run_until(Timestamp::from_millis(args.until_ms));
-
-    writeln!(deps.out, "{}", harness.timeline())?;
-    if !args.clicker.global.quiet {
-        writeln!(
-            deps.out,
-            "\n{} actions, {} repetitions, {} skipped.",
-            harness.sink().emitted.len(),
-            harness.stats.iterations_started,
-            harness.stats.slots_skipped
-        )?;
-        let leaked = harness.sink().leaked();
-        if leaked.is_empty() {
-            writeln!(deps.out, "nothing left held.")?;
-        } else {
-            writeln!(deps.out, "STILL HELD: {leaked:?}")?;
-        }
-    }
-    Ok(exit::OK)
-}
-
-/// Parses `<milliseconds> <down|up> <key>` lines.
-fn parse_script(source: &str) -> Result<Vec<(Timestamp, EventKind)>> {
-    let mut events = Vec::new();
-    for (number, raw) in source.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let at = number + 1;
-        let mut parts = line.split_whitespace();
-        let (Some(ms), Some(edge), Some(key), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(Error::Script {
-                line: at,
-                detail: format!("expected `<milliseconds> <down|up> <key>`, got `{line}`"),
-            });
-        };
-
-        let ms: u64 = ms.parse().map_err(|_| Error::Script {
-            line: at,
-            detail: format!("`{ms}` is not a whole number of milliseconds"),
-        })?;
-        let key: Key = key.parse().map_err(|err| Error::Script {
-            line: at,
-            detail: format!("{err}"),
-        })?;
-        let kind = match edge {
-            "down" => EventKind::KeyDown(key),
-            "up" => EventKind::KeyUp(key),
-            other => {
-                return Err(Error::Script {
-                    line: at,
-                    detail: format!("expected `down` or `up`, got `{other}`"),
-                });
-            }
-        };
-        events.push((Timestamp::from_millis(ms), kind));
-    }
-    Ok(events)
-}
-
-/// Which backend pair a run would choose right now, for `doctor` to report.
-///
-/// Asks the same question `platform::open_pair` will — [`sequencer_input::x11::is_usable`],
-/// which connects rather than reading `$DISPLAY` — so the report cannot promise one backend
-/// and the run pick the other.
-///
-/// On the X11 pair the uinput requirements listed below are informational: neither half
-/// touches a device, and a refused grab is a hard error rather than a fall back to them.
-fn injection_backend() -> &'static str {
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    if sequencer_input::x11::is_usable() {
-        return "X11 — XTEST for clicks, key grabs for hotkeys (no device access, no sudo)";
-    }
-    "uinput device for clicks, evdev for hotkeys"
-}
-
 /// The parts that need a real operating system, and the stubs that stand in when there is
 /// no backend for this one.
-#[cfg(all(feature = "evdev", target_os = "linux"))]
+///
+/// Either backend alone is a complete one, so this is gated on having *a* backend rather
+/// than on having the device one. `--features cli,xtest` is a legitimate build: X11 only,
+/// no device access, and no evdev in the consumer's dependency graph.
+#[cfg(all(any(feature = "evdev", feature = "xtest"), target_os = "linux"))]
 mod platform {
     use super::{Result, RunSummary, run_engine};
     use sequencer_core::Engine;
     use sequencer_core::emit::InputSink;
-    use sequencer_input::{Epoch, EvdevCapture, SystemClock};
+    use sequencer_input::{Epoch, SystemClock};
+    #[cfg(feature = "evdev")]
+    use sequencer_input::{EvdevCapture, UinputSink};
 
     pub(super) const AVAILABLE: bool = true;
 
@@ -415,8 +357,8 @@ mod platform {
     /// Opens the injection sink and the hotkey source as a **pair**.
     ///
     /// The two halves are chosen together, never independently. On a usable X11 session
-    /// both go through the X server; everywhere else both go through the input devices.
-    /// A mixed pair would be the worst of each: XTEST's rate with evdev's permission
+    /// both go through the X server; everywhere else both go through the input devices. A
+    /// mixed pair would be the worst of each — XTEST's rate with evdev's permission
     /// requirement, and a run that decided it needed no password discovering otherwise
     /// halfway through opening.
     ///
@@ -426,9 +368,15 @@ mod platform {
     /// disagree.
     ///
     /// A grab the X server refuses — another program already owns the key — is a hard
-    /// error rather than a fallback. Dropping to the device path there would demand
-    /// device access, and possibly a password, for a problem no privilege can fix: the
-    /// answer is a different `--activate` key, and the error says so.
+    /// error rather than a fallback. Dropping to the device path there would demand device
+    /// access, and possibly a password, for a problem no privilege can fix: the answer is
+    /// a different `--activate` key, and the error says so.
+    ///
+    /// On the device path the sink opens first, because capture skips our own virtual
+    /// device by name and so needs it to exist before the reader threads enumerate.
+    ///
+    /// In an X11-only build there is no device path to fall back to, and a session with no
+    /// X server is simply out of backends.
     fn open_pair(
         epoch: &Epoch,
         hotkeys: &[sequencer_core::input::Key],
@@ -439,7 +387,7 @@ mod platform {
             let (capture, stream) = sequencer_input::GrabCapture::start(epoch, hotkeys)?;
             tracing::info!(
                 keys = hotkeys.len(),
-                "X11: injecting through XTEST, hotkeys through key grabs"
+                "X11: injecting through XTEST, hotkeys through key grabs (no device access)"
             );
             return Ok((Box::new(sink), Capture::Grab(capture, Some(stream))));
         }
@@ -447,18 +395,31 @@ mod platform {
         // Only the X11 grab has to name individual keys; the device backend watches every
         // device and lets the engine decide what it cares about.
         let _ = hotkeys;
-        let sink = sequencer_input::UinputSink::open()?;
-        let mut capture = EvdevCapture::new(epoch.clone());
-        let stream = capture.start()?;
-        tracing::info!(
-            devices = capture.watching(),
-            "devices: injecting through uinput, hotkeys from /dev/input"
-        );
-        Ok((Box::new(sink), Capture::Evdev(capture, Some(stream))))
+        #[cfg(feature = "evdev")]
+        {
+            let sink = UinputSink::open()?;
+            let mut capture = EvdevCapture::new(epoch.clone());
+            let stream = capture.start()?;
+            tracing::info!(
+                devices = capture.watching(),
+                "devices: injecting through uinput, hotkeys from /dev/input"
+            );
+            Ok((Box::new(sink), Capture::Evdev(capture, Some(stream))))
+        }
+        #[cfg(not(feature = "evdev"))]
+        {
+            let _ = epoch;
+            Err(super::Error::NotImplemented(
+                "this build has only the X11 backend, and no X server answered. Rebuild \
+                 with the `evdev` feature for Wayland and the console."
+                    .to_owned(),
+            ))
+        }
     }
 
     /// Whichever capture backend the run picked, with one shape for the caller.
     enum Capture {
+        #[cfg(feature = "evdev")]
         Evdev(EvdevCapture, Option<sequencer_input::CaptureStream>),
         #[cfg(feature = "xtest")]
         Grab(
@@ -468,9 +429,10 @@ mod platform {
     }
 
     impl Capture {
-        /// Takes the event stream. Called once; the backend keeps filling it until `stop`.
+        /// Takes the event stream. Called once, right after opening.
         fn stream(&mut self) -> sequencer_input::CaptureStream {
             match self {
+                #[cfg(feature = "evdev")]
                 Self::Evdev(_, stream) => stream.take(),
                 #[cfg(feature = "xtest")]
                 Self::Grab(_, stream) => stream.take(),
@@ -480,6 +442,7 @@ mod platform {
 
         fn stop(&mut self) {
             match self {
+                #[cfg(feature = "evdev")]
                 Self::Evdev(capture, _) => capture.stop(),
                 #[cfg(feature = "xtest")]
                 Self::Grab(capture, _) => capture.stop(),
@@ -488,7 +451,7 @@ mod platform {
     }
 }
 
-#[cfg(not(all(feature = "evdev", target_os = "linux")))]
+#[cfg(not(all(any(feature = "evdev", feature = "xtest"), target_os = "linux")))]
 mod platform {
     use super::{Error, Result, RunSummary};
     use sequencer_core::Engine;
@@ -497,8 +460,7 @@ mod platform {
 
     pub(super) fn unsupported<T>() -> Result<T> {
         Err(Error::NotImplemented(format!(
-            "no input backend for {}; only Linux is supported. `sequencer simulate` \
-             works anywhere.",
+            "no input backend for {}; only Linux is supported.",
             std::env::consts::OS
         )))
     }
@@ -510,50 +472,5 @@ mod platform {
         _hotkeys: &[sequencer_core::input::Key],
     ) -> Result<RunSummary> {
         unsupported()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_script_parses_with_comments_and_blank_lines() {
-        let script = "\
-# start clicking
-0 down f9
-
-520 up f9   # and stop
-";
-        let events = parse_script(script).expect("should parse");
-        assert_eq!(
-            events,
-            vec![
-                (Timestamp::ZERO, EventKind::KeyDown(Key::F9)),
-                (Timestamp::from_millis(520), EventKind::KeyUp(Key::F9)),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_bad_script_line_says_which_line() {
-        for (script, expected_line) in [
-            ("0 down f9\nnonsense\n", 2),
-            ("0 sideways f9\n", 1),
-            ("abc down f9\n", 1),
-            ("0 down nosuchkey\n", 1),
-            ("0 down f9 extra\n", 1),
-        ] {
-            let err = parse_script(script).expect_err("should reject");
-            let Error::Script { line, .. } = err else {
-                panic!("expected a script error, got {err:?}");
-            };
-            assert_eq!(line, expected_line, "for {script:?}");
-        }
-    }
-
-    #[test]
-    fn an_empty_script_is_valid_and_produces_nothing() {
-        assert_eq!(parse_script("\n\n# only comments\n").unwrap(), Vec::new());
     }
 }

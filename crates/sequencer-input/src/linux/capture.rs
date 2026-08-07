@@ -151,30 +151,38 @@ fn pump_device(mut device: Device, queue: &EventQueue, epoch: &Epoch, running: &
 
 /// Turns an evdev event into one this crate understands, or `None` to ignore it.
 fn translate(event: evdev::InputEvent) -> Option<EventKind> {
-    let EventSummary::Key(_, code, value) = event.destructure() else {
-        return None;
-    };
-    // 0 is release, 1 is press, 2 is the kernel's auto-repeat. The engine derives its own
-    // edges from transitions, so forwarding repeats would be noise.
-    let pressed = match value {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-
-    if let Some(button) = keymap::code_to_button(code) {
-        return Some(if pressed {
-            EventKind::ButtonDown(button)
-        } else {
-            EventKind::ButtonUp(button)
-        });
+    match event.destructure() {
+        EventSummary::Key(_, code, value) => {
+            // 0 is release, 1 is press, 2 is the kernel's auto-repeat. The engine derives
+            // its own edges from transitions, so forwarding repeats would be noise.
+            let pressed = match value {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            if let Some(button) = keymap::code_to_button(code) {
+                return Some(if pressed {
+                    EventKind::ButtonDown(button)
+                } else {
+                    EventKind::ButtonUp(button)
+                });
+            }
+            let key = keymap::code_to_key(code)?;
+            Some(if pressed {
+                EventKind::KeyDown(key)
+            } else {
+                EventKind::KeyUp(key)
+            })
+        }
+        // Wheel notches. Only the classic per-notch axes: the HI_RES twins describe the
+        // same motion in 120ths, and forwarding both would double-report every notch.
+        EventSummary::RelativeAxis(_, axis, value) => match axis {
+            evdev::RelativeAxisCode::REL_WHEEL => Some(EventKind::Scroll { dx: 0, dy: value }),
+            evdev::RelativeAxisCode::REL_HWHEEL => Some(EventKind::Scroll { dx: value, dy: 0 }),
+            _ => None,
+        },
+        _ => None,
     }
-    let key = keymap::code_to_key(code)?;
-    Some(if pressed {
-        EventKind::KeyDown(key)
-    } else {
-        EventKind::KeyUp(key)
-    })
 }
 
 /// Capture could not start.
@@ -226,6 +234,23 @@ mod tests {
             translate(key_event(KeyCode::BTN_SIDE, 0)),
             Some(EventKind::ButtonUp(Button::Back))
         );
+    }
+
+    #[test]
+    fn wheel_notches_become_scroll_events() {
+        let wheel = |axis: evdev::RelativeAxisCode, value: i32| {
+            translate(evdev::InputEvent::new(EventType::RELATIVE.0, axis.0, value))
+        };
+        assert_eq!(
+            wheel(evdev::RelativeAxisCode::REL_WHEEL, 1),
+            Some(EventKind::Scroll { dx: 0, dy: 1 })
+        );
+        assert_eq!(
+            wheel(evdev::RelativeAxisCode::REL_HWHEEL, -1),
+            Some(EventKind::Scroll { dx: -1, dy: 0 })
+        );
+        // HI_RES describes the same notch again in 120ths; forwarding it would double-report.
+        assert_eq!(wheel(evdev::RelativeAxisCode::REL_WHEEL_HI_RES, 120), None);
     }
 
     #[test]

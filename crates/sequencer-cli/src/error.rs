@@ -44,12 +44,12 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A simulation script line does not parse.
-    #[error("line {line}: {detail}")]
-    Script {
-        /// Which line, counting from one.
-        line: usize,
-        /// What was wrong with it.
+    /// A binds profile file is invalid.
+    #[error("{path}: {detail}")]
+    Profile {
+        /// The file that was refused.
+        path: String,
+        /// Why, in the words of the format.
         detail: String,
     },
 
@@ -79,7 +79,7 @@ impl Error {
         match self {
             // Bad settings are the user's command line being wrong, which is a usage
             // error even when the parser accepted each flag on its own.
-            Self::Config(_) | Self::Script { .. } => exit::USAGE,
+            Self::Config(_) | Self::Profile { .. } => exit::USAGE,
             // The offending key came from the command line, and the fix is to change it.
             #[cfg(all(feature = "xtest", target_os = "linux"))]
             Self::Grab(_) => exit::USAGE,
@@ -103,12 +103,12 @@ mod tests {
         let err = Error::Config(ConfigError::CpsOutOfRange(0.0));
         assert_eq!(err.exit_code(), exit::USAGE);
 
-        let err = Error::Script {
-            line: 3,
+        let err = Error::Profile {
+            path: "binds.toml".into(),
             detail: "nope".into(),
         };
         assert_eq!(err.exit_code(), exit::USAGE);
-        assert!(err.to_string().starts_with("line 3:"));
+        assert!(err.to_string().starts_with("binds.toml:"));
     }
 
     #[test]
