@@ -570,6 +570,21 @@ impl InputMap {
         }
     }
 
+    /// Input → name as owned text, with the nameless tail covered: where
+    /// [`InputMap::name_of`] gives up (a `hid:` key, an extra mouse button), the input's
+    /// own `Display` answers instead. The form banners, errors and live reporting print.
+    #[must_use]
+    pub fn display_name(&self, input: Holdable) -> alloc::string::String {
+        use alloc::string::ToString as _;
+        self.name_of(input).map_or_else(
+            || match input {
+                Holdable::Key(key) => key.to_string(),
+                Holdable::Button(button) => button.to_string(),
+            },
+            alloc::string::ToString::to_string,
+        )
+    }
+
     /// Canonical name → the other accepted spellings, worst habits included.
     ///
     /// Single-character entries are excluded on purpose: those are the shifted twins

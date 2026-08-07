@@ -166,22 +166,6 @@ fn sleep(clock: &dyn Clock, duration: Duration) {
     clock.sleep_until(clock.now().saturating_add_nanos(nanos));
 }
 
-/// The binds-file spelling of anything pressable, for banners and errors.
-///
-/// The map answers for everything with a canonical name; the fallback `Display` covers
-/// the nameless tail (`hid:` keys, extra mouse buttons).
-pub(crate) fn pressable_name(target: Holdable) -> String {
-    sequencer_core::input::INPUT_MAP
-        .name_of(target)
-        .map_or_else(
-            || match target {
-                Holdable::Key(key) => key.to_string(),
-                Holdable::Button(button) => button.to_string(),
-            },
-            str::to_owned,
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

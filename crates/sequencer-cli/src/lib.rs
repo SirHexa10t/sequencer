@@ -66,11 +66,15 @@
 // `run_clicker` -- which is exactly what an embedder who wants the engine and not the
 // command line asks for.
 #[cfg(feature = "cli")]
+mod backend;
+#[cfg(feature = "cli")]
+pub mod bench;
+#[cfg(feature = "cli")]
 pub mod clicker;
 #[cfg(feature = "cli")]
-pub mod cmd;
-#[cfg(feature = "cli")]
 mod detect_key;
+#[cfg(feature = "cli")]
+pub mod doctor;
 #[cfg(feature = "cli")]
 mod profile;
 pub mod runtime;
@@ -298,8 +302,8 @@ pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
     match command {
         Command::Clicker(args) => clicker::clicker(args, deps),
         Command::WriteScript(args) => write_script::write_script(args, deps),
-        Command::Bench(args) => cmd::bench(args, deps),
-        Command::Doctor(args) => cmd::doctor(args, deps),
+        Command::Bench(args) => bench::bench(args, deps),
+        Command::Doctor(args) => doctor::doctor(args, deps),
         Command::DetectKey(args) => detect_key::detect_key(args, deps),
         Command::ApplyProfile(args) => profile::apply_profile(args, deps),
     }

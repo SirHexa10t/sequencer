@@ -113,7 +113,7 @@ fn describe(bind: &Bind) -> String {
         Action::Mirror(target) => format!(
             "  {} -> {}",
             bind.trigger_text,
-            run::pressable_name(*target)
+            sequencer_core::input::INPUT_MAP.display_name(*target)
         ),
         Action::Seq(steps) => format!(
             "  {} -> sequence of {} steps",
@@ -329,7 +329,7 @@ fn parse_seq(lines: &[String]) -> std::result::Result<Vec<Step>, String> {
                     let Some(position) = held.iter().rposition(|h| h == key) else {
                         return Err(format!(
                             "step {number} `{line}`: RELEASE {} — nothing is holding it",
-                            run::pressable_name(*key)
+                            sequencer_core::input::INPUT_MAP.display_name(*key)
                         ));
                     };
                     held.remove(position);
@@ -342,7 +342,7 @@ fn parse_seq(lines: &[String]) -> std::result::Result<Vec<Step>, String> {
     if let Some(leftover) = held.first() {
         return Err(format!(
             "HOLD {} is never RELEASEd — a sequence must let go of what it grabbed",
-            run::pressable_name(*leftover)
+            sequencer_core::input::INPUT_MAP.display_name(*leftover)
         ));
     }
     Ok(steps)

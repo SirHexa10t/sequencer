@@ -2,8 +2,8 @@
 //!
 //! One product's worth of behaviour — its arguments ([`args`]), the banner it prints, how it
 //! lowers settings into a profile, and how it reports what it sent. Everything it stands on is
-//! general and stays outside: the run loop ([`crate::runtime`]), backend selection and the
-//! other subcommands ([`crate::cmd`]), the engine and step IR in `sequencer_core`.
+//! general and stays outside: the run loop ([`crate::runtime`]), backend selection
+//! (the crate-private `backend` module), the engine and step IR in `sequencer_core`.
 //!
 //! The point of the separation is the planned second product. A scripted-sequence runner
 //! should arrive as a sibling directory reusing all of the above unchanged, rather than
@@ -16,7 +16,7 @@ pub use args::{ClickerArgs, MouseButton};
 use sequencer_core::CompiledProfile;
 use sequencer_core::clicker::{ActivationMode, ClickAction, ClickConfig};
 
-use crate::cmd::run_profile;
+use crate::backend::run_profile;
 use crate::runtime::{RunSummary, fuse_limit};
 use crate::{Deps, Result, exit};
 
