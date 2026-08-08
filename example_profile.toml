@@ -1,37 +1,29 @@
-# sequencer binds file — the format reference, as a working example.
+# sequencer binds profile — the format reference, as a working example.
 # Every feature appears here at least once, with the reasoning next to it.
 #
-# A file is a set of bindings: a trigger on the left, what it does on the right. Each
-# binding is one [binds.<trigger>] section holding exactly ONE of:
 #
-#   bind = "<key>"    An edge mirror: the trigger's own down/up drive the target's
-#                     down/up. Holding the trigger holds the target, so key-repeat works.
+# binding is one [binds.<trigger>] section pressing exactly ONE of:
+#
+#   bind = "<key>"    An edge mirror: the trigger's own down/up drive the target's down/up. Pressing the trigger presses the target, so key-repeat works.
 #   seq  = [ ... ]    A sequence, fired once each time the trigger is pressed.
 #
 # Case never matters, anywhere: "a" == "A", "Ctrl" == "ctrl" == "CTRL"
-# HOLD / RELEASE / WAIT keywords are equally legal lowercase.
-# A capital letter is a name, not a shifted key — to send an actual capital A, write the chord "shift a".
+# PRESS / RELEASE / WAIT keywords are equally legal lowercase.
+# A capitalized letter is a name, not a shifted key — to send an actual capital A, write the chord "shift a".
 # The same rule for every shifted char: `{` names the `[` key and `!` names the `1` key — it's the
 # same physical key, and writing it never implies shift. To send the symbol itself, chord it: "shift [".
 # Within a multi-character name, `-` and `_` are interchangeable and optional: "volume-up" == "volume_up" == "volumeup".
 
-[defaults]
-# Timing every sequence inherits unless a bind overrides it (see F6) or a WAIT replaces
-# it at one seam. These are also the built-in values — delete this whole section and
-# nothing changes.
-tap = "8ms"     # how long a tap holds the key down before releasing it
-gap = "30ms"    # pause between consecutive steps, where no explicit WAIT says otherwise
 
-# Bound keys are consumed: the application never sees the trigger itself, only what it
-# was bound to. `true` is the only accepted value for now — on X11 a grab consumes the
-# key by nature — and writing `false` is a refusal, not a silent surprise, so no file
-# quietly changes meaning when passthrough support arrives.
-suppress = true
+[defaults]
+tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key-up (release)
+gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise
+suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to
 
 
 # ------------------------------------------------------------------- edge mirrors
 
-# The classic remap. Hold PgUp and the volume keeps rising, exactly as if the keyboard
+# The classic remap. Press PgUp and the volume keeps rising, exactly as if the keyboard
 # had a volume key in that position.
 [binds.PgUp]
 bind = "volume-up"
@@ -46,7 +38,7 @@ bind = "volume-down"
 #
 #   "<key> [key ...]"        Tap: down, wait `tap`, up. Several names in one string are
 #                            a chord — down in listed order, up in reverse.
-#   "HOLD <key> [key ...]"   Press and keep down until a later RELEASE.
+#   "PRESS <key> [key ...]"   Press and keep down until a later RELEASE.
 #   "RELEASE <key> [key ...]"
 #   "WAIT <duration>"        Pause here, REPLACING the default gap at this seam only.
 #
@@ -54,15 +46,15 @@ bind = "volume-down"
 # "WAIT 200ms", "WAIT 1.5s", "WAIT 2m", "WAIT 1h".
 # Zero alone may drop the unit ("0ms" == "0h"), and only zero — "WAIT 5" is an error.
 # That makes "WAIT 0" the idiom for NO pause at one seam, and `gap = "0"` for none
-# anywhere in a bind; the rule holds wherever a duration appears, `tap` included.
+# anywhere in a bind; the rule presses wherever a duration appears, `tap` included.
 
 # A combo, with per-bind timing overrides.
 [binds.F6]
-tap = "25ms"    # this game polls slowly, so taps must linger to register
+tap = "25ms"    # when game polls slowly, linger for the key to register
 gap = "50ms"
 seq = [
     "shift",           # a plain tap
-    "HOLD ctrl",       # ctrl stays down across the next steps
+    "PRESS ctrl",       # ctrl stays down across the next steps
     "space d",         # a chord: space and d together
     "WAIT 200ms",      # explicit pause — the 50ms gap does not also apply here
     "w p",
