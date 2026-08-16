@@ -129,7 +129,9 @@ fn report(summary: &RunSummary, args: &ClickerArgs, deps: &mut Deps<'_>) -> Resu
 mod tests {
     use super::*;
 
-    /// Renders the banner for `args`, with colour off (tests capture stdout).
+    /// Renders the banner for `args`. Colour follows the process's ambient gate —
+    /// libtest captures prints, not the stdout fd — so expectations are composed
+    /// through the same [`crate::style`] helpers rather than written as plain text.
     fn banner(args: &ClickerArgs) -> String {
         let clock = sequencer_core::testutil::VirtualClock::default();
         let mut out: Vec<u8> = Vec::new();
@@ -145,9 +147,16 @@ mod tests {
             cps: 20.0,
             ..ClickerArgs::new()
         });
+        let key = crate::style::key;
         assert_eq!(
             line.trim(),
-            "left click 20/s | HOLD: F9 | Quit: F8",
+            format!(
+                "left click {} | {}: {} | Quit: {}",
+                key("20/s"),
+                key("HOLD"),
+                key("F9"),
+                key("F8")
+            ),
             "{line:?}"
         );
     }
@@ -161,9 +170,16 @@ mod tests {
             kb_key: Some("f".parse().expect("f is a key")),
             ..ClickerArgs::new()
         });
+        let key = crate::style::key;
         assert_eq!(
             line.trim(),
-            "f key 30/s | TOGGLE: F9 | Quit: F8",
+            format!(
+                "f key {} | {}: {} | Quit: {}",
+                key("30/s"),
+                key("TOGGLE"),
+                key("F9"),
+                key("F8")
+            ),
             "{line:?}"
         );
     }
@@ -176,6 +192,7 @@ mod tests {
             limit: 5,
             ..ClickerArgs::new()
         });
-        assert!(limited.trim().ends_with("| Limit: 5"), "{limited:?}");
+        let expected_tail = format!("| Limit: {}", crate::style::key("5"));
+        assert!(limited.trim().ends_with(&expected_tail), "{limited:?}");
     }
 }

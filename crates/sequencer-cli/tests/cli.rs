@@ -373,9 +373,16 @@ fn a_missing_profile_fails_without_a_backtrace() {
 
 #[test]
 fn clicking_without_device_access_fails_with_something_actionable() {
-    // Only meaningful where the devices are unavailable: on a machine that is set up,
+    // Only meaningful where NO backend is available: on a machine that is set up,
     // `clicker` would block waiting for the trigger key rather than return. That is also
-    // exactly the case whose error message needs to be good.
+    // exactly the case whose error message needs to be good. Both backends count — a
+    // usable X11 session serves the clicker by key grab, so it would block there too
+    // (and grab the developer's real F9 while doing it).
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    if sequencer_cli::input::x11::is_usable() {
+        eprintln!("skipping: X11 serves the clicker here, so it would block on its trigger");
+        return;
+    }
     if std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/uinput")

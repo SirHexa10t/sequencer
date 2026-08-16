@@ -338,6 +338,26 @@ pub fn run_clicker(
     )
 }
 
+/// The signal (SIGINT/SIGTERM) that ended a run this process served, if any.
+///
+/// A `main` that owns the process should, after this returns `Some`, terminate *by*
+/// that signal (default disposition) rather than exit normally: cleanup already ran —
+/// held keys released, state cleared — and dying of the signal is what tells the
+/// parent shell the interrupt landed, so it redraws its prompt instead of leaving the
+/// terminal looking stuck. This library never re-raises on its own: killing the
+/// process is the process owner's decision, and an embedder may well want to survive.
+#[must_use]
+pub fn caught_interrupt() -> Option<i32> {
+    #[cfg(all(feature = "cli", feature = "xtest", target_os = "linux"))]
+    {
+        profile::caught_interrupt()
+    }
+    #[cfg(not(all(feature = "cli", feature = "xtest", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// Installs a `tracing` subscriber.
 ///
 /// The library never calls this; `main` does. Doing it twice in one process fails, which

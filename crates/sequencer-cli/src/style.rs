@@ -20,12 +20,22 @@ const ALARM: &str = "\u{1b}[1;31m";
 const STOPPER: &str = "\u{1b}[1;38;5;208m";
 const RESET: &str = "\u{1b}[0m";
 
-/// Whether to emit colour at all. Resolved once: the answer cannot change mid-run, and
-/// re-checking per word would mean an `isatty` syscall per banner field.
+/// The decision itself, kept pure so its truth table is testable: colour needs a
+/// terminal and the absence of a veto.
+fn colours(no_color_set: bool, stdout_is_terminal: bool) -> bool {
+    !no_color_set && stdout_is_terminal
+}
+
+/// [`colours`] asked about this run, resolved once: the answer cannot change mid-run,
+/// and re-checking per word would mean an `isatty` syscall per banner field.
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal())
+    *ENABLED.get_or_init(|| {
+        colours(
+            std::env::var_os("NO_COLOR").is_some(),
+            std::io::stdout().is_terminal(),
+        )
+    })
 }
 
 /// `text` in bold blue, or unchanged when colour is off.
@@ -55,11 +65,16 @@ fn paint(colour: &str, text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Tests capture stdout, so colour is off and the helper is the identity function —
-    /// which is exactly the property a captured banner needs.
+    /// The gate itself: NO_COLOR always wins, a pipe or file never gets escape codes,
+    /// and only an unvetoed terminal gets colour. (The ambient answer depends on where
+    /// the test run's stdout points — libtest captures prints, not the fd — so tests
+    /// assert on this table and compose expected strings through the helpers.)
     #[test]
-    fn a_captured_run_gets_plain_text() {
-        assert_eq!(key("F9"), "F9");
+    fn colour_needs_a_terminal_and_no_veto() {
+        assert!(colours(false, true));
+        assert!(!colours(true, true), "NO_COLOR wins even on a terminal");
+        assert!(!colours(false, false), "a pipe gets plain text");
+        assert!(!colours(true, false));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+[defaults]
+suppress = true
+emergency_stop = "ctrl shift u"
+program = "*terminal*"
+
+
+[binds."ctrl w"]
+bind = "Ctrl Shift Q"
+
+
+

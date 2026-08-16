@@ -50,15 +50,23 @@ optional = true
 features = ["iterator"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, optional = true, features = ["user", "term", "poll", "signal"] }
+nix = { workspace = true, optional = true, features = ["user", "term", "poll", "signal", "process"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
+# The live suite sends real SIGINT to the manager it spawns.
+nix = { workspace = true, features = ["signal"] }
 
 [[bin]]
 name = "sequencer"
 path = "src/bin/sequencer.rs"
+required-features = ["cli"]
+
+# The live suite drives the real binary (CARGO_BIN_EXE), so it needs the same gate.
+[[test]]
+name = "live"
+path = "tests/live/main.rs"
 required-features = ["cli"]
 
 [lints]

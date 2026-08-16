@@ -395,8 +395,11 @@ impl<'a> Executor<'a> {
                         if pumps.stop_keys.contains(&key) {
                             return Ok(Heard::Emergency);
                         }
+                        // The grab fires a chord as its one ordinary key, so a
+                        // re-press arrives as the primary alone — never the full
+                        // chord. Bare keys are their own primary.
                         if let Some(bind) = bind
-                            && bind.trigger.as_slice() == [key]
+                            && super::format::primary_key(&bind.trigger) == Some(key)
                         {
                             return Ok(Heard::StopBind);
                         }
@@ -438,7 +441,7 @@ impl<'a> Executor<'a> {
                         if pumps.stop_keys.contains(&key) {
                             return Ok(Heard::Emergency);
                         }
-                        if bind.trigger.as_slice() == [key] {
+                        if super::format::primary_key(&bind.trigger) == Some(key) {
                             return Ok(Heard::StopBind);
                         }
                     }
@@ -689,6 +692,26 @@ mod tests {
                 EmitAction::KeyUp(Key::LeftCtrl)
             ],
             "stop mid-wait, then release the pressed key"
+        );
+    }
+
+    /// A chord-triggered loop is stopped the same way: the grab fires the chord as its
+    /// primary key, so the re-press arrives as that key alone and must still match.
+    /// (Caught live: `[binds."ctrl shift f6"]` looped forever, the field's re-press
+    /// falling into "input during a sequence ignored".)
+    #[test]
+    fn a_repress_stops_a_chord_triggered_loop_too() {
+        let actions = run_events(
+            "[binds.\"ctrl shift F6\"]\nloop = \"inf\"\nseq = [\"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\"]",
+            vec![press(Key::F6), press(Key::F6)],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftCtrl),
+                EmitAction::KeyUp(Key::LeftCtrl)
+            ],
+            "the primary-key re-press stops the chord's loop"
         );
     }
 

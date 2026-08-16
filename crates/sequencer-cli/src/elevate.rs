@@ -110,11 +110,13 @@ fn wants_devices(command: &Command) -> bool {
 /// Whether a usable X11 session spares `command` the devices entirely.
 ///
 /// True for a normal run: XTEST injects and grabs listen. False for `detect-key`, which
-/// must hear *every* key — a grab names its keys in advance, so no grab can serve it,
-/// and letting X11 waive the password would just move the failure to the device open.
+/// must hear *every* key — a grab names its keys in advance, so no grab can serve it —
+/// and false for `bench`, whose entire point is measuring the uinput round-trip: an X
+/// session cannot stand in for the device it exists to measure. Letting X11 waive the
+/// password for either would just move the failure to the device open.
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 fn x11_serves(command: &Command) -> bool {
-    !matches!(command, Command::DetectKey(_))
+    !matches!(command, Command::DetectKey(_) | Command::Bench(_))
 }
 
 /// The device requirements `command` actually has.
@@ -388,6 +390,15 @@ mod tests {
             crate::args::DetectKeyArgs::new()
         )));
         assert!(x11_serves(&Command::Clicker(ClickerArgs::new())));
+    }
+
+    /// bench measures the uinput round-trip itself, so an X session cannot stand in
+    /// for it. (Caught live: on an X11 desktop, session mode skipped sudo and bench
+    /// fell over on a /dev/uinput it had been told it would not need.)
+    #[cfg(all(feature = "evdev", target_os = "linux"))]
+    #[test]
+    fn bench_never_lets_x11_waive_its_device_access() {
+        assert!(!x11_serves(&Command::Bench(crate::args::BenchArgs::new())));
     }
 
     /// detect-key only reads, so it must not demand a writable /dev/uinput — that would

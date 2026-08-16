@@ -3,6 +3,7 @@ suppress = true
 emergency_stop = "ctrl shift q"
 program = "*celluloid*"
 
+
 # k: pause
 [binds.k]
 bind = "space"
@@ -27,8 +28,25 @@ bind = "["
 # fullscreen already uses 'f' for both
 
 
-# youtube's captions = celluloid's subtitles (just does activation/deactivation, if any; cycling not included)
+# youtube's captions = celluloid's subtitles
+# (just does activation/deactivation, if any; cycling not included... it's "j" on `mpv`, and youtube hadn't implement that)
+[binds.c]
+bind = "v"
 
 
 # up / down: app volume-up/down
+[binds.up]
+bind = "0"
+
+[binds.down]
+bind = "9"
+
+
+# next / prev
+[binds."shift N"]
+bind = "shift >"
+
+[binds."shift P"]
+bind = "shift <"
+
 

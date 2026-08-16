@@ -14,7 +14,7 @@ use sequencer_core::input::Key;
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
-use super::format::{chord_text, primary_key, program_matches};
+use super::format::{primary_key, program_matches};
 use super::state::{LockGuard, scan_active};
 use super::{Profile, parse, run};
 use crate::runtime::{CapturePump, EventPump, Wake};
@@ -27,8 +27,22 @@ use sequencer_input::{Epoch, FocusWatcher, GrabCapture, SystemClock, XTestSink};
 /// A signal that killed the process outright would skip the release ledger, and an
 /// injected key-down with no matching up is a key stuck on the real keyboard — the
 /// exact failure this whole path exists to prevent.
-static INTERRUPTED: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+static INTERRUPTED: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicUsize>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+
+/// The signal that ended a managed run, if one did.
+///
+/// The binary asks after the run and terminates *by* that signal (cleanup is already
+/// done by then) — dying of the signal rather than exiting 0 is how the parent shell
+/// learns the user's Ctrl+C landed, so it redraws its prompt instead of leaving the
+/// terminal looking stuck. The library itself never re-raises; killing the process is
+/// the process owner's call.
+pub(crate) fn caught_interrupt() -> Option<i32> {
+    match INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        signal => i32::try_from(signal).ok(),
+    }
+}
 
 /// Asks for SIGINT/SIGTERM to set [`INTERRUPTED`] instead of ending the process.
 ///
@@ -36,7 +50,13 @@ static INTERRUPTED: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::Atomic
 /// the old (worse) story, not a new one.
 fn catch_interrupts() {
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        let _ = signal_hook::flag::register(signal, std::sync::Arc::clone(&INTERRUPTED));
+        if let Ok(value) = usize::try_from(signal) {
+            let _ = signal_hook::flag::register_usize(
+                signal,
+                std::sync::Arc::clone(&INTERRUPTED),
+                value,
+            );
+        }
     }
 }
 
@@ -121,7 +141,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
     catch_interrupts();
     let mut next_maintenance = clock.now();
     let outcome: Result<&str> = loop {
-        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) != 0 {
             break Ok("interrupted");
         }
         if clock.now() >= next_maintenance {
@@ -177,10 +197,15 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
     // claiming profiles are live with nothing running them.
     let cleared = super::state::clear_active().unwrap_or(0);
     let reason = outcome?;
-    writeln!(
-        out,
-        "stopped ({reason}); {cleared} profile(s) unapplied — nothing is enforced now"
-    )?;
+    if !lost_terminal() {
+        // A caught Ctrl+C already echoed `^C` and left the cursor mid-line; start clean.
+        let lead = if reason == "interrupted" { "\n" } else { "" };
+        writeln!(
+            out,
+            "{lead}stopped ({reason}); {cleared} profile(s) unapplied — nothing is enforced now"
+        )?;
+        out.flush()?;
+    }
     Ok(exit::OK)
 }
 
@@ -283,6 +308,24 @@ fn stop_slot(
     writeln!(out, "emergency stop: {name} unapplied")?;
     out.flush()?;
     Ok(())
+}
+
+/// Whether stdout is a terminal whose foreground has already moved on from us.
+///
+/// It happens when Ctrl+C kills an intermediary (a wrapper script, `cargo run` on old
+/// versions) faster than this process finishes its teardown: the shell reaps the
+/// intermediary and draws its prompt while we are still cleaning up. Writing the
+/// farewell then would land *below* that prompt — a terminal that looks hung until
+/// the user presses Enter — and under `stty tostop` the write would suspend us
+/// outright. Cleanup itself already happened; only the goodbye is skipped.
+fn lost_terminal() -> bool {
+    use std::io::IsTerminal as _;
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return false;
+    }
+    let fd = std::os::fd::AsFd::as_fd(&stdout);
+    nix::unistd::tcgetpgrp(fd).is_ok_and(|owner| owner != nix::unistd::getpgrp())
 }
 
 /// Lets every slot go of what it held, whatever ended the run.
@@ -474,7 +517,7 @@ fn reconcile_set(
                     "profile applied: {name} ({} binds)",
                     profile.binds.len()
                 )?;
-                write_stop_hint(out, &profile)?;
+                super::write_stop_hint(out, &profile)?;
                 slots.insert(
                     name.clone(),
                     Slot {
@@ -491,19 +534,6 @@ fn reconcile_set(
                 failed.insert(name.clone());
             }
         }
-    }
-    Ok(())
-}
-
-/// The one line worth knowing after a profile lands: how to make it stop.
-fn write_stop_hint(out: &mut dyn std::io::Write, profile: &Profile) -> Result<()> {
-    if let Some(chord) = &profile.emergency_stop {
-        writeln!(
-            out,
-            "to {} this script, press: {}",
-            crate::style::stopper("stop"),
-            crate::style::stopper(&chord_text(chord))
-        )?;
     }
     Ok(())
 }

@@ -25,6 +25,9 @@ use crate::{Deps, Error, Result, exit};
 mod check;
 mod format;
 
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+pub(crate) use manager::caught_interrupt;
+
 pub(crate) use check::profile_check;
 pub(crate) use format::{Action, Bind, Loops, Profile, Step, parse};
 
@@ -58,24 +61,20 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
 
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
+        let mut placed = Vec::with_capacity(parsed.len());
         for (file, profile) in args.files.iter().zip(&parsed) {
-            match state::link_into_active(file)? {
-                state::Applied::Linked(link) => {
-                    writeln!(
-                        deps.out,
-                        "applied: {} ({} binds)",
-                        link.display(),
-                        profile.binds.len()
-                    )?;
-                }
-                state::Applied::AlreadyActive(link) => {
-                    writeln!(deps.out, "already applied: {}", link.display())?;
-                }
-            }
+            placed.push((state::link_into_active(file)?, profile));
         }
-        deps.out.flush()?;
+        // Custody is decided before announcing because it decides the announcement:
+        // attaching to a live manager means ITS announcements land in another window,
+        // so this window repeats each stop hint; becoming the manager means they land
+        // right below in this same window, where repeating them is noise. The links
+        // are on disk first either way — the manager's opening scan must find them.
         match state::acquire_lock()? {
             state::Custody::Theirs(pid) => {
+                for (applied, profile) in &placed {
+                    announce(deps.out, applied, profile, true)?;
+                }
                 writeln!(
                     deps.out,
                     "{} to an {} manager (PID {pid})",
@@ -85,6 +84,10 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
                 Ok(exit::OK)
             }
             state::Custody::Ours(lock) => {
+                for (applied, profile) in &placed {
+                    announce(deps.out, applied, profile, false)?;
+                }
+                deps.out.flush()?;
                 let outcome = manager::manage(deps.out, lock);
                 if outcome.is_err() {
                     // The manager never got going, so nothing is being enforced: the
@@ -209,6 +212,48 @@ fn resolve_names(given: &[String], names: &[String]) -> std::result::Result<Vec<
         .iter()
         .map(|token| resolve_one(token, names))
         .collect()
+}
+
+/// One profile's apply-time line; `with_hint` adds its stop chord (the attach case,
+/// where the manager's own hint-bearing announcement lands in another window).
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+fn announce(
+    out: &mut dyn std::io::Write,
+    applied: &state::Applied,
+    profile: &Profile,
+    with_hint: bool,
+) -> Result<()> {
+    match applied {
+        state::Applied::Linked(link) => {
+            writeln!(
+                out,
+                "applied: {} ({} binds)",
+                link.display(),
+                profile.binds.len()
+            )?;
+            if with_hint {
+                write_stop_hint(out, profile)?;
+            }
+        }
+        state::Applied::AlreadyActive(link) => {
+            writeln!(out, "already applied: {}", link.display())?;
+        }
+    }
+    Ok(())
+}
+
+/// The one line worth knowing after a profile lands: how to make it stop.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+fn write_stop_hint(out: &mut dyn std::io::Write, profile: &Profile) -> Result<()> {
+    if let Some(chord) = &profile.emergency_stop {
+        writeln!(
+            out,
+            "to {} this script, press: {}",
+            crate::style::stopper("stop"),
+            crate::style::stopper(&format::chord_text(chord))
+        )?;
+    }
+    Ok(())
 }
 
 fn resolve_one(token: &str, names: &[String]) -> std::result::Result<String, String> {

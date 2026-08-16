@@ -43,8 +43,13 @@ fn main() -> ExitCode {
             return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2));
         }
     };
-    ExitCode::from(sequencer_cli::run_with_sudo_prompt(
-        &cli,
-        "sequencer doctor",
-    ))
+    let code = sequencer_cli::run_with_sudo_prompt(&cli, "sequencer doctor");
+    // A run ended by Ctrl+C has already cleaned up; now die *by* the signal instead of
+    // exiting 0, so the shell knows the interrupt landed and redraws its prompt (the
+    // POSIX cooperative-exit convention). Only the process owner may do this.
+    #[cfg(target_os = "linux")]
+    if let Some(signal) = sequencer_cli::caught_interrupt() {
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+    }
+    ExitCode::from(code)
 }

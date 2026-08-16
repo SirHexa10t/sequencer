@@ -1,6 +1,6 @@
 [defaults]
 suppress = true
-emergency_stop = "ctrl shift w"
+emergency_stop = "ctrl shift q"
 
 
 [binds.PgUp]

@@ -405,11 +405,25 @@ expressed in that.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 250 tests, all headless
+cargo test --workspace --all-features    # 256 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
 ```
+
+What the headless suite cannot prove — live grabs, injection reaching the desktop,
+the manager's lifecycle, per-profile emergency stops, signal handling, the sudo-backed
+device path — lives in the `live` test target (`crates/sequencer-cli/tests/live/`),
+whose hardware-touching tests are `#[ignore]`d so a plain `cargo test` stays safe
+anywhere. Run them on an X11 session via [`SUDO-TEST.sh`](SUDO-TEST.sh) (a thin
+launcher that also caches the sudo ticket the device tests use), or directly:
+
+```sh
+cargo test -p sequencer-cli --test live -- --ignored --test-threads=1 --nocapture
+```
+
+They refuse to start while a real manager is running, keep all state in temp
+directories, and the only key they synthesize at your desktop is Pause.
 
 Tests that need a real `/dev/uinput` skip themselves with a note when it is absent, so the
 suite is green in a container and exercises the device on a real machine.
