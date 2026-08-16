@@ -5,8 +5,8 @@
 
 #[cfg(target_os = "linux")]
 use super::decode::{Decoded, decode};
+#[cfg(target_os = "linux")]
 use crate::exit;
-
 #[cfg(target_os = "linux")]
 use crate::{Error, Result};
 
@@ -155,8 +155,18 @@ impl Drop for Silencer {
 /// Reads the terminal until Ctrl+C or EOF, printing each press by name.
 pub(super) fn run(out: &mut dyn std::io::Write) -> Result<u8> {
     let _guard = RawGuard::enable()?;
+    let mut focus = super::FocusPoll::new();
+    focus.report(out)?;
     let mut buf = Vec::with_capacity(16);
     loop {
+        // Wait for a key with a timeout rather than blocking outright, so focus changes
+        // are noticed between presses. poll(2) also keeps EOF unambiguous — a timeout
+        // and a hangup look identical to a bare read, and confusing them would either
+        // spin forever on a dead terminal or exit on an idle one.
+        if !wait_for_input()? {
+            focus.report(out)?;
+            continue;
+        }
         RawGuard::read_burst(&mut buf)?;
         if buf.is_empty() {
             return Ok(exit::OK); // EOF
@@ -171,6 +181,21 @@ pub(super) fn run(out: &mut dyn std::io::Write) -> Result<u8> {
         }
         out.flush()?;
     }
+}
+
+/// Polls stdin for up to 200ms. `true` means readable (a key, or EOF for the read to
+/// discover); `false` means the wait timed out and the caller may do idle work.
+#[cfg(target_os = "linux")]
+fn wait_for_input() -> Result<bool> {
+    use std::os::fd::AsFd as _;
+    let stdin = std::io::stdin();
+    let mut fds = [nix::poll::PollFd::new(
+        stdin.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    let ready = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(200_u16))
+        .map_err(|err| Error::NotImplemented(format!("polling the terminal: {err}")))?;
+    Ok(ready > 0)
 }
 
 #[cfg(not(target_os = "linux"))]

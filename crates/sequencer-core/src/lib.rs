@@ -94,7 +94,7 @@ pub mod emit;
 pub mod engine;
 pub mod input;
 pub mod ir;
-mod rng;
+pub mod rng;
 mod seq;
 pub mod time;
 pub mod validate;

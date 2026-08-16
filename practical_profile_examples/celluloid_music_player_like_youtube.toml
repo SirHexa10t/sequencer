@@ -1,0 +1,34 @@
+[defaults]
+suppress = true
+emergency_stop = "ctrl shift q"
+program = "*celluloid*"
+
+# k: pause
+[binds.k]
+bind = "space"
+
+
+# '<' / '>': playback slow-down/speed-up
+[binds."rshift >"]
+bind = "]"
+
+[binds."rshift <"]
+bind = "["
+
+
+# playback halfing/doubling (no, youtube doesn't distinguish between SHIFTS, but I think it makes sense)
+# [binds."shift >"]
+# bind = "shift ]"
+# 
+# [binds."shift <"]
+# bind = "shift ["
+
+
+# fullscreen already uses 'f' for both
+
+
+# youtube's captions = celluloid's subtitles (just does activation/deactivation, if any; cycling not included)
+
+
+# up / down: app volume-up/down
+

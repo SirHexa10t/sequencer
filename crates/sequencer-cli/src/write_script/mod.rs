@@ -10,7 +10,7 @@
 //! [`Profile`](sequencer_core::ir::Profile) of emit-and-wait steps, and a script is the same
 //! IR with the steps read from a file instead of generated from a rate. What is missing is a
 //! script format, its parser, and the validation to reject a sequence that would leave a key
-//! held. `apply-profile` already runs key-triggered *output* sequences for
+//! held. `profile-apply` already runs key-triggered *output* sequences for
 //! testing; this is the other direction — scripted *output*.
 
 pub mod args;
@@ -31,7 +31,7 @@ pub fn write_script(_args: &WriteScriptArgs, deps: &mut Deps<'_>) -> Result<u8> 
     writeln!(
         deps.out,
         "TODO: write-script is not implemented yet — it will record what you do into a \
-         binds-file sequence. For now, `clicker` repeats one action and `apply-profile` \
+         binds-file sequence. For now, `clicker` repeats one action and `profile-apply` \
          runs the sequences a binds file spells out."
     )?;
     Ok(exit::OK)

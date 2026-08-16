@@ -13,7 +13,7 @@ default = ["cli", "logging", "evdev", "xtest"]
 # just the engine wiring with no clap in your dependency graph.
 # `nix` rides along for detect-key's terminal raw mode (termios); serde+toml parse
 # apply-profile's binds files.
-cli = ["dep:clap", "dep:nix", "dep:serde", "dep:toml"]
+cli = ["dep:clap", "dep:nix", "dep:serde", "dep:toml", "dep:toml_edit", "dep:signal-hook"]
 # init_logging(). Off for embedders that own the global tracing subscriber themselves.
 logging = ["dep:tracing-subscriber"]
 # The Linux input backend. On by default so `cargo build` produces a working clicker;
@@ -42,9 +42,15 @@ clap = { workspace = true, optional = true, features = [
 tracing-subscriber = { workspace = true, optional = true, features = ["fmt", "ansi"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 toml = { workspace = true, optional = true, features = ["parse"] }
+toml_edit = { workspace = true, optional = true, features = ["parse", "display"] }
+
+[target.'cfg(target_os = "linux")'.dependencies.signal-hook]
+workspace = true
+optional = true
+features = ["iterator"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, optional = true, features = ["user", "term"] }
+nix = { workspace = true, optional = true, features = ["user", "term", "poll", "signal"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -61,8 +61,12 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Print the name of each key as it is pressed, once per press.
     DetectKey(DetectKeyArgs),
-    /// Apply a binds profile: remap keys and run sequences until stopped.
-    ApplyProfile(ApplyProfileArgs),
+    /// Apply binds profiles: remap keys and run sequences until stopped.
+    ProfileApply(ProfileApplyArgs),
+    /// Remove applied profiles from the active set.
+    ProfileUnapply(ProfileUnapplyArgs),
+    /// Check binds files for problems without applying them.
+    ProfileCheck(ProfileCheckArgs),
     /// Run a scripted sequence of input events. Not implemented yet.
     WriteScript(WriteScriptArgs),
 }
@@ -76,7 +80,9 @@ impl Command {
             Self::Bench(args) => &args.global,
             Self::Doctor(args) => &args.global,
             Self::DetectKey(args) => &args.global,
-            Self::ApplyProfile(args) => &args.global,
+            Self::ProfileApply(args) => &args.global,
+            Self::ProfileUnapply(args) => &args.global,
+            Self::ProfileCheck(args) => &args.global,
             Self::WriteScript(args) => &args.global,
         }
     }
@@ -219,13 +225,43 @@ impl Default for DetectKeyArgs {
     }
 }
 
-/// `sequencer apply-profile`.
+/// `sequencer profile-apply`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct ApplyProfileArgs {
-    /// The binds file to apply. `binds.example.toml` in the repository documents the
-    /// format.
-    #[arg(value_name = "FILE")]
-    pub file: PathBuf,
+pub struct ProfileApplyArgs {
+    /// Binds files to apply. `example_profile.toml` in the repository documents the
+    /// format. Each is linked into the active set; the first invocation becomes the
+    /// manager, later ones just add to it.
+    #[arg(value_name = "FILE", num_args = 1.., required = true)]
+    pub files: Vec<PathBuf>,
+
+    /// Shared options.
+    #[command(flatten)]
+    pub global: GlobalArgs,
+}
+
+/// `sequencer profile-check`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ProfileCheckArgs {
+    /// Binds files to check. Nothing is applied and no state is touched.
+    #[arg(value_name = "FILE", num_args = 1.., required = true)]
+    pub files: Vec<PathBuf>,
+
+    /// Rewrite each sound file tidily in place, keeping every comment.
+    #[arg(short, long)]
+    pub format: bool,
+
+    /// Shared options.
+    #[command(flatten)]
+    pub global: GlobalArgs,
+}
+
+/// `sequencer profile-unapply`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ProfileUnapplyArgs {
+    /// Profiles to remove from the active set, by name (`gaming` or `gaming.toml`).
+    /// With none given, an interactive picker lists what is applied.
+    #[arg(value_name = "PROFILE")]
+    pub names: Vec<String>,
 
     /// Shared options.
     #[command(flatten)]
@@ -326,8 +362,17 @@ mod tests {
             Command::Bench(BenchArgs::new()),
             Command::Doctor(DoctorArgs::new()),
             Command::DetectKey(DetectKeyArgs::new()),
-            Command::ApplyProfile(ApplyProfileArgs {
-                file: PathBuf::new(),
+            Command::ProfileApply(ProfileApplyArgs {
+                files: Vec::new(),
+                global: GlobalArgs::new(),
+            }),
+            Command::ProfileUnapply(ProfileUnapplyArgs {
+                names: Vec::new(),
+                global: GlobalArgs::new(),
+            }),
+            Command::ProfileCheck(ProfileCheckArgs {
+                files: Vec::new(),
+                format: false,
                 global: GlobalArgs::new(),
             }),
             Command::WriteScript(WriteScriptArgs::new()),

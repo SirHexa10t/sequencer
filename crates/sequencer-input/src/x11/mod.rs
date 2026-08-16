@@ -8,14 +8,18 @@
 //! - [`capture`]: the hotkeys arrive by passive key grab, so nothing here reads
 //!   `/dev/input` — which means an X11 session needs **no group membership and no sudo at
 //!   all**: the whole run is an ordinary X client.
+//! - [`focus`]: which program is focused, for reporting today and per-program profiles
+//!   later.
 //!
 //! Neither reaches a Wayland client or the console; the [`crate::linux`] backend remains the
 //! one that works everywhere, and callers pick per session at runtime.
 
 pub mod capture;
+pub mod focus;
 pub mod inject;
 
 pub use capture::{GrabCapture, GrabError};
+pub use focus::FocusWatcher;
 pub use inject::XTestSink;
 
 /// Whether this really is an X11 session that both halves can use.

@@ -31,6 +31,13 @@ x11rb = { version = "0.13", default-features = false, features = ["xtest"] }
 # Binds profiles are TOML; serde only ever derives Deserialize here.
 serde = { version = "1", default-features = false }
 toml = { version = "0.8", default-features = false }
+# Format-preserving TOML for `check-profile --format`: rewrites layout while keeping
+# every comment the user wrote. `toml`'s own parser stays for reading.
+toml_edit = { version = "0.22", default-features = false }
+# Ctrl+C must run teardown rather than kill the process mid-injection: a signal that
+# skips the release ledger leaves a key pressed on the user's real keyboard. Registering
+# a handler is `unsafe` in std/nix; signal-hook's flag API is the safe wrapper.
+signal-hook = { version = "0.3", default-features = false }
 # Privilege drop for session mode (setgroups/setgid/setuid). Same version evdev already
 # pulls transitively, so this adds no new crate to the tree.
 nix = { version = "0.29", default-features = false }

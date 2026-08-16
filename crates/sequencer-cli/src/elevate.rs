@@ -11,7 +11,7 @@
 //!
 //! 1. **No elevation needed** — the session is X11, so the whole run goes through the X
 //!    server and opens no device at all; or the command doesn't touch devices (`doctor`,
-//!    `apply-profile`, `write-script`, `detect-key --no-sudo`); or access is already
+//!    `profile-apply`, `write-script`, `detect-key --no-sudo`); or access is already
 //!    there (group membership, running as root). Runs directly; sudo is never mentioned.
 //! 2. **Elevation needed, terminal available** — explain what sudo is for and what will
 //!    happen to the privilege, then re-exec this same command line under sudo. The child
@@ -101,7 +101,7 @@ fn wants_devices(command: &Command) -> bool {
         Command::Bench(_) => true,
         // Exact detection reads the devices; `--no-sudo` reads the terminal instead.
         Command::DetectKey(args) => !args.no_sudo,
-        // `doctor` must see the machine as it really is; `apply-profile` goes through
+        // `doctor` must see the machine as it really is; `profile-apply` goes through
         // the X server. Elevating either would be theatre.
         _ => false,
     }

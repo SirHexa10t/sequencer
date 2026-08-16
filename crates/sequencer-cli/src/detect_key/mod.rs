@@ -112,6 +112,7 @@ fn reference() -> String {
     text.push_str(
         "\nKeys that have no char to go by are named: backspace, enter, the modifiers (ctl, shift...), the arrows (up, down..), space (separator for chord members).\n",
     );
+    text.push_str("\nOn X11, the focused program prints as `focus: <name>` whenever it changes.\n");
     text
 }
 
@@ -195,6 +196,57 @@ fn pressed_name(kind: EventKind) -> Option<String> {
 mod decode;
 mod tty;
 
+/// Prints the focused program's name whenever it changes — `focus: firefox` — the
+/// identifier a per-program profile will match on later. Keys print constantly; focus
+/// only on a switch, which is what makes both readable in one stream.
+///
+/// Best-effort by design: on Wayland or without the `xtest` feature there is nothing to
+/// ask, and the run simply reports keys alone (the intro says focus is X11-only).
+struct FocusPoll {
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    watcher: Option<sequencer_input::FocusWatcher>,
+    last: Option<String>,
+}
+
+impl FocusPoll {
+    fn new() -> Self {
+        Self {
+            #[cfg(all(feature = "xtest", target_os = "linux"))]
+            watcher: sequencer_input::FocusWatcher::open(),
+            last: None,
+        }
+    }
+
+    /// Asks for the current focus and prints it if it changed.
+    fn report(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let Some(class) = self.current() else {
+            // Unreadable focus keeps the last known name: a window flickering through
+            // an unnamed state must not re-announce its neighbour afterwards.
+            return Ok(());
+        };
+        if self.last.as_deref() != Some(class.as_str()) {
+            writeln!(out, "focus: {class}")?;
+            out.flush()?;
+            self.last = Some(class);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    fn current(&self) -> Option<String> {
+        self.watcher.as_ref()?.focused_class()
+    }
+
+    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the stub keeps both builds on one call shape"
+    )]
+    fn current(&self) -> Option<String> {
+        None
+    }
+}
+
 /// The device side: exact keys off `/dev/input`, with the terminal silenced meanwhile.
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 mod platform {
@@ -218,8 +270,15 @@ mod platform {
         // so without this every press would also type into the shell. Absent a terminal
         // (piped stdin) there is nothing to silence and Ctrl+C falls back to the signal.
         let silencer = tty::Silencer::enable();
+        let mut focus = super::FocusPoll::new();
+        if let Err(err) = focus.report(out) {
+            return Err(err.into());
+        }
 
         let mut pump = crate::runtime::CapturePump::new(stream, &clock);
+        // Focus is re-read every fourth quit-poll wake (~200ms): a human notices no lag
+        // at that cadence, and the X round trips stay off the key-reporting path.
+        let mut wakes: u32 = 0;
         let outcome = loop {
             use sequencer_core::time::Clock as _;
             let deadline = clock.now().saturating_add_nanos(QUIT_POLL_NANOS);
@@ -234,6 +293,12 @@ mod platform {
                 Wake::Deadline => {
                     if silencer.as_ref().is_some_and(tty::Silencer::quit_requested) {
                         break Ok(exit::OK);
+                    }
+                    wakes = wakes.wrapping_add(1);
+                    if wakes.is_multiple_of(4)
+                        && let Err(err) = focus.report(out)
+                    {
+                        break Err(err.into());
                     }
                 }
                 Wake::Interrupted => break Ok(exit::OK),

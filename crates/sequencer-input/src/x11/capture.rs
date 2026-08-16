@@ -55,6 +55,14 @@ pub enum GrabError {
     /// The key has no X keycode — nothing a grab could name.
     #[error("{0} has no X keycode to grab")]
     Unmappable(Key),
+    /// A chord names more than one ordinary key; X can grab only one plus modifiers.
+    #[error("`{0}` cannot join a chord trigger: X grabs one key plus modifiers")]
+    Unchordable(Key),
+
+    /// A chord of nothing but modifiers has no key to grab.
+    #[error("a trigger needs one non-modifier key, not modifiers alone")]
+    ModifiersOnly,
+
     /// Another client already owns a grab on this key (a desktop shortcut, usually).
     #[error(
         "{0} is already grabbed by another program (a desktop keyboard shortcut?) — \
@@ -79,31 +87,46 @@ impl GrabCapture {
     /// left half-done on failure: the connection drops, and dropping it releases any grabs
     /// this client took.
     pub fn start(epoch: &Epoch, keys: &[Key]) -> Result<(Self, CaptureStream), GrabError> {
+        let chords: Vec<Vec<Key>> = keys.iter().map(|key| alloc_one(*key)).collect();
+        let (queue, stream) = CaptureStream::channel(256);
+        let capture = Self::start_into(epoch, &chords, queue)?;
+        Ok((capture, stream))
+    }
+
+    /// [`GrabCapture::start`], feeding an existing queue instead of creating one.
+    ///
+    /// This is what lets several grabs — one per profile, plus an emergency grab —
+    /// share a single stream, so a run loop can *block* on all of them at once rather
+    /// than take turns polling each.
+    ///
+    /// # Errors
+    ///
+    /// As [`GrabCapture::start`].
+    pub fn start_into(
+        epoch: &Epoch,
+        chords: &[Vec<Key>],
+        queue: EventQueue,
+    ) -> Result<Self, GrabError> {
         let (conn, screen) =
             RustConnection::connect(None).map_err(|err| GrabError::Connect(Box::new(err)))?;
         let root = conn.setup().roots[screen].root;
 
-        for &key in keys {
+        for chord in chords {
+            let (mods, key) = split_chord(chord)?;
             let keycode = super::inject::x_keycode(key).ok_or(GrabError::Unmappable(key))?;
-            // ANY modifier state: F9 is F9 with NumLock on too. Checked immediately — an
-            // `Access` error here means another client got there first, and starting a run
-            // whose hotkey silently never fires would be far worse than refusing.
-            conn.grab_key(
-                false,
-                root,
-                ModMask::ANY,
-                keycode,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            )
-            .map_err(|err| GrabError::Connect(Box::new(err)))?
-            .check()
-            .map_err(|_| GrabError::AlreadyGrabbed(key))?;
+            // A bare key is grabbed with ModMask::ANY — F9 is F9 with NumLock on. A chord
+            // names its modifiers exactly, so the plain key stays usable on its own; the
+            // lock variants below are why NumLock does not break it either.
+            for mask in mask_variants(mods) {
+                conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC)
+                    .map_err(|err| GrabError::Connect(Box::new(err)))?
+                    .check()
+                    .map_err(|_| GrabError::AlreadyGrabbed(key))?;
+            }
         }
         conn.flush()
             .map_err(|err| GrabError::Connect(Box::new(err)))?;
 
-        let (queue, stream) = CaptureStream::channel(256);
         let running = Arc::new(AtomicBool::new(true));
         let thread = {
             let running = Arc::clone(&running);
@@ -113,13 +136,10 @@ impl GrabCapture {
                 .spawn(move || pump_events(&conn, &queue, &epoch, &running))
                 .map_err(|err| GrabError::Connect(Box::new(err)))?
         };
-        Ok((
-            Self {
-                running,
-                thread: Some(thread),
-            },
-            stream,
-        ))
+        Ok(Self {
+            running,
+            thread: Some(thread),
+        })
     }
 
     /// Stops the reader thread and, with it, the grabs (dropping the connection ungrabs).
@@ -142,6 +162,18 @@ fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running
     while running.load(Ordering::Relaxed) {
         match conn.poll_for_event() {
             Ok(Some(event)) => {
+                // A passive grab becomes an ACTIVE keyboard grab the instant its key
+                // goes down, and while that is in effect the server routes keyboard
+                // events to this client rather than activating anyone else's passive
+                // grab. Injected keys would therefore land back on us — the desktop's
+                // own binding for, say, XF86AudioRaiseVolume would never fire. Ending
+                // the active grab immediately (the passive registration survives, so
+                // the next press still arrives) is what lets injection reach the rest
+                // of the session.
+                if matches!(event, Event::KeyPress(_)) {
+                    let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+                    let _ = conn.flush();
+                }
                 let Some(kind) = translate(&event) else {
                     continue;
                 };
@@ -160,6 +192,70 @@ fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running
             }
         }
     }
+}
+
+/// One key as a one-element chord.
+fn alloc_one(key: Key) -> Vec<Key> {
+    vec![key]
+}
+
+/// Splits a chord into its modifier mask and the single key it decorates.
+///
+/// X grabs one keycode plus a modifier state, which is exactly a chord's shape — but it
+/// means a chord may carry only *one* non-modifier key: "ctrl i" is grabbable, "a b" is
+/// not, because no modifier state describes "a is also down".
+fn split_chord(chord: &[Key]) -> Result<(ModMask, Key), GrabError> {
+    let mut mods = ModMask::default();
+    let mut primary = None;
+    for &key in chord {
+        match modifier_mask(key) {
+            Some(mask) => mods |= mask,
+            None => {
+                if primary.replace(key).is_some() {
+                    return Err(GrabError::Unchordable(key));
+                }
+            }
+        }
+    }
+    // An all-modifier chord ("ctrl shift") has nothing to hang the grab on: X delivers
+    // modifier presses to a grab only as the state of some other key.
+    primary
+        .map(|key| (mods, key))
+        .ok_or(GrabError::ModifiersOnly)
+}
+
+/// The X modifier bit a key contributes, or `None` if it is not a modifier.
+///
+/// Left and right map to the same bit, as X itself does: `Shift` is `Shift` whichever
+/// one is held. Alt is Mod1 and Meta/Super is Mod4 by near-universal convention; AltGr
+/// (right alt) is Mod5 where a layout defines it.
+fn modifier_mask(key: Key) -> Option<ModMask> {
+    Some(match key {
+        Key::LeftShift | Key::RightShift => ModMask::SHIFT,
+        Key::LeftCtrl | Key::RightCtrl => ModMask::CONTROL,
+        Key::LeftAlt => ModMask::M1,
+        Key::LeftMeta | Key::RightMeta => ModMask::M4,
+        Key::RightAlt => ModMask::M5,
+        _ => return None,
+    })
+}
+
+/// The same chord with every combination of the "who cares" lock bits.
+///
+/// CapsLock (Lock) and NumLock (Mod2) sit in the same state field as real modifiers, so
+/// a grab that names neither simply never fires while either is on. Every hotkey tool
+/// grabs all four permutations for this reason.
+fn mask_variants(mods: ModMask) -> Vec<ModMask> {
+    if mods == ModMask::default() {
+        // A bare key wants ANY, which already covers the locks.
+        return vec![ModMask::ANY];
+    }
+    vec![
+        mods,
+        mods | ModMask::LOCK,
+        mods | ModMask::M2,
+        mods | ModMask::LOCK | ModMask::M2,
+    ]
 }
 
 /// A grabbed-key X event as the engine's event kind; anything else is `None`.

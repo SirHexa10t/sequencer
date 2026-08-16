@@ -1,0 +1,11 @@
+[defaults]
+suppress = true
+emergency_stop = "ctrl shift w"
+
+
+[binds.PgUp]
+bind = "volume-up"
+
+[binds.PgDn]
+bind = "volume-down"
+

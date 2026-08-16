@@ -4,7 +4,10 @@
 #
 # binding is one [binds.<trigger>] section pressing exactly ONE of:
 #
-#   bind = "<key>"    An edge mirror: the trigger's own down/up drive the target's down/up. Pressing the trigger presses the target, so key-repeat works.
+#   bind = "<key>"    A remap: each press of the trigger taps the target once — a key, or
+#                     a chord spelled like any step (bind = "shift ]"). Holding the trigger
+#                     repeats it (the keyboard's own auto-repeat), so PgUp held keeps
+#                     stepping the volume.
 #   seq  = [ ... ]    A sequence, fired once each time the trigger is pressed.
 #
 # Case never matters, anywhere: "a" == "A", "Ctrl" == "ctrl" == "CTRL"
@@ -19,6 +22,10 @@
 tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key-up (release)
 gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise
 suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to
+program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
+                 # run `sequencer detect-key` to print the name of programs you enter focus on. `focus: <name>`.
+emergency_stop = "F8"  # optional: pressing this unapplies THIS profile gracefully — everything it still pressed is released.
+                       # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord too, e.g. "ctrl alt q"
 
 
 # ------------------------------------------------------------------- edge mirrors
@@ -61,8 +68,24 @@ seq = [
     "RELEASE ctrl",
 ]
 
-# A trigger can be a chord too, spelled exactly like a step. TOML wants quotes around a
-# section key containing a space.
+# `loop` repeats the sequence per press: a count, or "inf" until stopped. Pressing the
+# trigger again stops it early, releasing anything the sequence still pressed.
+# RNG opens a chance block and GNR closes it (its `fi`): the block runs with the given
+# chance, spelled 0.25, 25% or 1/4 alike. Blocks nest.
+[binds.F7]
+loop = "inf"
+seq = [
+    "e",
+    "RNG 25%",         # a quarter of iterations do the following
+        "WAIT 300ms",  # your actions should be indented (non obligatory), for readability
+    "GNR",             # Shell-styled block; end of last "RNG" command
+    "WAIT 1s",
+]
+
+# A trigger can be a chord too, spelled exactly like a step: modifiers plus ONE ordinary
+# key, which is the shape a key grab can express. TOML wants quotes around a section key
+# containing a space. Note a bare key and a chord over it cannot both be triggers — `i`
+# and `ctrl i` grab the same keycode — but `ctrl i` and `alt i` are fine.
 [binds."ctrl i"]
 seq = [
     "Ctrl d",
@@ -76,3 +99,7 @@ seq = [
 # For the full list of valid key names — the keyboard plus the media, mouse, wheel and
 # controller sets — run: `sequencer detect-key`. It draws the layout, lists every set,
 # and prints the name of any key you press.
+#
+# To check a file without applying it (and optionally tidy it in place, comments kept):
+#   sequencer profile-check my-binds.toml
+#   sequencer profile-check --format my-binds.toml

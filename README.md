@@ -27,8 +27,8 @@ reports what it actually managed to send.
 - **`doctor`** reports what setup is missing and the exact commands to fix it.
 - **`bench`** measures what the machine really delivers, by reading its own virtual device
   back rather than trusting its own send count.
-- **`apply-profile`** applies a binds file — key remaps and key-triggered sequences —
-  until stopped. `binds.example.toml` in the repository is the annotated format reference.
+- **`profile-apply`** applies a binds file — key remaps and key-triggered sequences —
+  until stopped. `example_profile.toml` in the repository is the annotated format reference.
 - **`detect-key`** prints the name of every key you press, in the exact spelling a binds
   file accepts — reading the input devices for exact answers by default, or the terminal
   with `--no-sudo` for zero-permission use anywhere.
@@ -257,24 +257,56 @@ The uinput kernel module is not loaded
 ### Applying a binds profile
 
 ```sh
-sequencer apply-profile my-binds.toml
+sequencer profile-apply my-binds.toml     # first call becomes the manager
+sequencer profile-apply gaming.toml       # from any shell: adds to the running set
+sequencer unprofile-apply gaming          # removes; with no names, an interactive picker
+sequencer profile-check my-binds.toml     # validate without applying; --format tidies it
 ```
 
-Remaps keys and runs key-triggered sequences until stopped (Ctrl+C, or kill it if you sent
-it to the background with `&`). The format — mirrors like `PgUp -> volume-up`, sequences
-with `HOLD`/`RELEASE`/`WAIT` steps, chords, per-bind timing — is documented by example in
-[`binds.example.toml`](binds.example.toml), which doubles as the parser's test fixture, so
-the documentation cannot drift from what is accepted.
+Profiles stack dynamically. Each `profile-apply` validates the file and links it into
+`~/.config/sequencer/active/` — **the directory is the set**: `ls` shows what's applied,
+and removing a link (by hand or with `unprofile-apply`) takes it out of play within a
+moment. The first invocation finds no live manager, takes a PID lock and becomes one,
+managing everything in the directory; later invocations see the lock and just report.
+A crashed manager's stale lock is detected and replaced, and a manager whose set
+empties out — every profile unapplied or emergency-stopped — quits on its own.
+Ctrl+C on the manager stops everything: every held key is released **and the set is emptied** — `active/` describes
+what a running manager is enforcing, so it never outlives one. Ctrl+C is caught rather
+than fatal, precisely so that release happens. `SEQUENCER_CONFIG_DIR` overrides the
+state location.
+
+The format — mirrors like
+`PgUp -> volume-up` (each press taps the target; holding repeats it), sequences with
+`PRESS`/`RELEASE`/`WAIT` steps, chords, per-bind
+timing, `loop` counts (`4`, or `"inf"` until the trigger is pressed again), `RNG`/`GNR`
+chance blocks (`0.25` == `25%` == `1/4`), and a `program` pattern that applies the
+profile only while a matching program has focus — is documented by example in
+[`example_profile.toml`](example_profile.toml), which doubles as the parser's test
+fixture, so the documentation cannot drift from what is accepted.
+
+With `program` set, the run watches focus (~5×/s) and grabs or releases its triggers as
+the matching program comes and goes — a dormant profile eats no keys. The
+`emergency_stop` key keeps its own grab either way; pressing it unapplies exactly the
+profiles that named that key — nothing is global among scripts — and releases whatever
+they still pressed. A stopped `loop` does the same for its own keys.
 
 Bound keys are consumed: the application sees what the key was bound to, never the key
-itself. Validation is strict and speaks the format's language — a `HOLD` nobody releases,
+itself. Validation is strict and speaks the format's language — a `PRESS` nobody releases,
 two spellings of one trigger (`{` and `[` are the same key), or a `suppress = false`
 nothing can honour are refused with the reason, not reinterpreted.
 
+Chord triggers work: `[binds."ctrl i"]` grabs the key with its modifier mask (and the
+NumLock/CapsLock variants, so locks don't break it). A chord is modifiers plus one
+ordinary key — the shape an X grab can express — and a bare key cannot coexist with a
+chord over it, since both would grab the same keycode.
+
+`profile-check` runs the same validator without applying anything: no symlink, no lock,
+no grabs, so it is safe in an editor hook. `--format` rewrites sound files in place —
+keywords uppercased, chord modifiers first, operands column-aligned, RNG blocks indented
+— preserving every comment, and it is idempotent.
+
 X11 only for now: triggers are heard by key grab and output goes through XTEST, so it
-needs no device access and no password. Chord *triggers* (`[binds."ctrl i"]`) parse but
-do not run yet — matching one needs modifier-aware grabs — and Wayland arrives with the
-device backend.
+needs no device access and no password. Wayland arrives with the device backend.
 
 ### write-script
 
@@ -373,7 +405,7 @@ expressed in that.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 219 tests, all headless
+cargo test --workspace --all-features    # 250 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features

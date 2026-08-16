@@ -17,7 +17,7 @@ use predicates::prelude::*;
 
 use sequencer_cli::runtime::ScriptedPump;
 use sequencer_cli::{
-    ApplyProfileArgs, ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, GlobalArgs, dispatch,
+    ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, GlobalArgs, ProfileApplyArgs, dispatch,
     exit,
 };
 use sequencer_core::emit::EmitAction;
@@ -306,28 +306,42 @@ fn the_prototypes_flags_still_work() {
     );
 }
 
-/// The shipped template is a runnable profile: apply-profile accepts it, describes every
-/// binding in the words of the file, and runs its loop against the injected pair.
+/// The shipped template is a runnable profile: profile-apply accepts it and its PgUp
+/// mirror actually fires against the injected pair. Its chord bind is grabbable now,
+/// so nothing about the file is skipped.
 #[test]
-fn apply_profile_accepts_the_shipped_template() {
+fn profile_apply_accepts_the_shipped_template() {
     let mut out = Vec::new();
     let clock = VirtualClock::new();
     let mut sink = MockInjector::new();
-    let mut pump = ScriptedPump::new([press(Key::PageUp)]);
+    let watcher = sink.clone();
+    let mut pump = ScriptedPump::new([
+        press(Key::PageUp),
+        (
+            Timestamp::ZERO,
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyUp(Key::PageUp)),
+        ),
+    ]);
     let mut deps = Deps::new(&mut out, &clock);
     deps.sink = Some(&mut sink);
     deps.pump = Some(&mut pump);
 
-    let args = ApplyProfileArgs {
-        file: concat!(env!("CARGO_MANIFEST_DIR"), "/../../binds.example.toml").into(),
+    let args = ProfileApplyArgs {
+        files: vec![concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_profile.toml").into()],
         global: GlobalArgs::new(),
     };
-    let code = dispatch(&Command::ApplyProfile(args), &mut deps).expect("should run");
+    let code = dispatch(&Command::ProfileApply(args), &mut deps).expect("should run");
 
     assert_eq!(code, exit::OK);
-    let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("PgUp -> volume-up"), "{text}");
-    assert!(text.contains("Ctrl+C stops"), "{text}");
+    let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+    assert_eq!(
+        actions,
+        vec![
+            EmitAction::KeyDown(Key::VolumeUp),
+            EmitAction::KeyUp(Key::VolumeUp)
+        ],
+        "the template's PgUp mirror must fire"
+    );
 }
 
 #[test]
@@ -335,10 +349,10 @@ fn an_invalid_profile_is_a_usage_error_that_names_the_problem() {
     let dir = std::env::temp_dir().join("sequencer-cli-tests");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let file = dir.join("dangling-hold.toml");
-    std::fs::write(&file, "[binds.F6]\nseq = [\"HOLD ctrl\"]\n").expect("write profile");
+    std::fs::write(&file, "[binds.F6]\nseq = [\"PRESS ctrl\"]\n").expect("write profile");
 
     bin()
-        .arg("apply-profile")
+        .arg("profile-apply")
         .arg(&file)
         .assert()
         .failure()
@@ -351,7 +365,7 @@ fn an_invalid_profile_is_a_usage_error_that_names_the_problem() {
 #[test]
 fn a_missing_profile_fails_without_a_backtrace() {
     bin()
-        .args(["apply-profile", "/nonexistent/binds.toml"])
+        .args(["profile-apply", "/nonexistent/binds.toml"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error:"));

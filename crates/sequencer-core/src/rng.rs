@@ -1,16 +1,18 @@
-//! A tiny deterministic generator, for jitter.
+//! A tiny deterministic generator, for jitter and chance rolls.
 //!
-//! Seeded by the runner and advanced only from the engine, so a given seed replays a
-//! given run exactly. That property is worth more here than statistical quality: jitter
-//! exists to break up a recognisable cadence, not to generate cryptographic material.
+//! Seeded by the runner, so a given seed replays a given run exactly. That property is
+//! worth more here than statistical quality: jitter exists to break up a recognisable
+//! cadence, and a profile's `RNG` steps exist to vary behaviour — neither is
+//! cryptographic material, and both are worth being able to replay under a fixed seed.
 
 /// xorshift64\*.
 #[derive(Clone, Debug)]
-pub(crate) struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
     /// Seeds the generator. A zero seed is replaced, since xorshift is stuck at zero.
-    pub(crate) const fn new(seed: u64) -> Self {
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
         Self(if seed == 0 {
             0x9E37_79B9_7F4A_7C15
         } else {
@@ -18,7 +20,9 @@ impl Rng {
         })
     }
 
-    pub(crate) const fn next_u64(&mut self) -> u64 {
+    /// The next raw 64-bit value.
+    #[must_use]
+    pub const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -31,12 +35,30 @@ impl Rng {
     ///
     /// Uses the multiply-shift reduction, which has a negligible modulo bias for the
     /// small ranges jitter uses and needs no rejection loop.
-    pub(crate) const fn at_most(&mut self, max: u64) -> u64 {
+    #[must_use]
+    pub const fn at_most(&mut self, max: u64) -> u64 {
         if max == u64::MAX {
             return self.next_u64();
         }
         let span = max + 1;
         ((self.next_u64() as u128 * span as u128) >> 64) as u64
+    }
+}
+
+impl Rng {
+    /// A value in `[0, 1)`, from the top 53 bits — every f64 in the interval exactly
+    /// representable, which is what makes `roll < chance` behave at both ends:
+    /// a chance of 1.0 always passes and a chance of 0.0 never does.
+    #[must_use]
+    pub const fn unit(&mut self) -> f64 {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "53 bits into an f64 mantissa is exact by construction, divisor included"
+        )]
+        {
+            let top = (self.next_u64() >> 11) as f64;
+            top / ((1_u64 << 53) as f64)
+        }
     }
 }
 
@@ -68,6 +90,15 @@ mod tests {
             for _ in 0..1000 {
                 assert!(r.at_most(max) <= max, "exceeded {max}");
             }
+        }
+    }
+
+    #[test]
+    fn unit_stays_in_the_half_open_interval() {
+        let mut r = Rng::new(9);
+        for _ in 0..10_000 {
+            let roll = r.unit();
+            assert!((0.0..1.0).contains(&roll), "{roll}");
         }
     }
 

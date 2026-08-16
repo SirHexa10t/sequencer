@@ -106,7 +106,8 @@ pub use sequencer_input as input;
 
 #[cfg(feature = "cli")]
 pub use crate::args::{
-    ApplyProfileArgs, BenchArgs, Cli, Command, DetectKeyArgs, DoctorArgs, GlobalArgs,
+    BenchArgs, Cli, Command, DetectKeyArgs, DoctorArgs, GlobalArgs, ProfileApplyArgs,
+    ProfileCheckArgs, ProfileUnapplyArgs,
 };
 #[cfg(feature = "cli")]
 pub use crate::clicker::{ClickerArgs, MouseButton};
@@ -305,7 +306,9 @@ pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
         Command::Bench(args) => bench::bench(args, deps),
         Command::Doctor(args) => doctor::doctor(args, deps),
         Command::DetectKey(args) => detect_key::detect_key(args, deps),
-        Command::ApplyProfile(args) => profile::apply_profile(args, deps),
+        Command::ProfileApply(args) => profile::profile_apply(args, deps),
+        Command::ProfileUnapply(args) => profile::unprofile_apply(args, deps),
+        Command::ProfileCheck(args) => profile::profile_check(args, deps),
     }
 }
 

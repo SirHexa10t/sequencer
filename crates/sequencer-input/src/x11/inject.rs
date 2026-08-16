@@ -75,10 +75,21 @@ impl XTestSink {
     /// Sends one `XTestFakeInput`. `detail` is an X keycode for a key, or a button number
     /// (1-5, 8, 9) for a button. Time 0 means "now"; the root window is the one the pointer
     /// is on, which for a click-in-place is wherever it already is.
+    ///
+    /// **Flushed immediately, on purpose.** x11rb buffers requests until something forces
+    /// a write, so a caller that emits without flushing produces *nothing* — and then the
+    /// backlog lands all at once whenever the buffer happens to fill, which can strand a
+    /// key-down in the server with its release still queued behind it. That is a stuck
+    /// key on the user's real keyboard, so the flush is not the caller's to remember.
+    /// One `write(2)` per event is the price; injection is already a syscall-per-event
+    /// path, and the device backend measures rate for anyone who needs it faster.
     fn fake(&self, event_type: u8, detail: u8) -> Result<(), SinkError> {
         self.conn
             .xtest_fake_input(event_type, detail, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
             .map(|_cookie| ())
+            .map_err(|err| SinkError::Backend(Box::new(err)))?;
+        self.conn
+            .flush()
             .map_err(|err| SinkError::Backend(Box::new(err)))
     }
 
@@ -137,6 +148,10 @@ fn button_detail(button: Button) -> u8 {
 
 impl InputSink for XTestSink {
     fn emit(&mut self, emit: &Emit) -> Result<(), SinkError> {
+        // Visible with `-v`: the exact X keycode leaving this process. When a key seems
+        // to do nothing, this is the line that separates "we never sent it" from "we
+        // sent it and the desktop ignored it" — two very different bugs.
+        tracing::debug!(action = ?emit.action, "XTEST inject");
         match emit.action {
             EmitAction::KeyDown(key) => {
                 let detail = x_keycode(key).ok_or(SinkError::UnmappableKey(key))?;
@@ -184,6 +199,16 @@ impl InputSink for XTestSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The media keys land where a standard Linux X keymap puts them — the numbers a
+    /// user can check against `xmodmap -pke`. Off-by-one here is invisible at runtime:
+    /// the server accepts any keycode and simply does nothing useful with a wrong one.
+    #[test]
+    fn volume_keys_land_on_the_standard_x_keycodes() {
+        assert_eq!(x_keycode(Key::VolumeUp), Some(123));
+        assert_eq!(x_keycode(Key::VolumeDown), Some(122));
+        assert_eq!(x_keycode(Key::Mute), Some(121));
+    }
 
     /// The XTEST button numbering, including the gap X leaves for scroll detents.
     #[test]
