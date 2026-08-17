@@ -10,11 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use sequencer_core::emit::Holdable;
-use sequencer_core::input::Key;
+use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
-use super::format::{primary_key, program_matches};
+use super::format::{chord_mods, primary_key, program_matches};
 use super::state::{LockGuard, scan_active};
 use super::{Profile, parse, run};
 use crate::runtime::{CapturePump, EventPump, Wake};
@@ -89,18 +89,18 @@ impl Slot {
             .collect()
     }
 
-    /// The key this profile's emergency chord fires on, if it names one.
-    fn stop_key(&self) -> Option<Key> {
-        self.profile.emergency_stop.as_deref().and_then(primary_key)
+    /// This profile's emergency chord the way its event arrives: primary + held
+    /// modifier classes.
+    fn stop_chord(&self) -> Option<(Key, Mods)> {
+        run::stop_chord(&self.profile)
     }
 
-    /// The keys those grabs actually fire on: a chord arrives as its ordinary key.
-    fn primaries(&self) -> Vec<Key> {
-        self.profile
-            .binds
-            .iter()
-            .filter_map(|bind| primary_key(&bind.trigger))
-            .collect()
+    /// Whether an arriving event (primary + held modifier classes) is exactly one
+    /// of this profile's triggers.
+    fn owns_trigger(&self, key: Key, mods: Mods) -> bool {
+        self.profile.binds.iter().any(|bind| {
+            primary_key(&bind.trigger) == Some(key) && chord_mods(&bind.trigger) == mods
+        })
     }
 }
 
@@ -129,6 +129,8 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
     let mut failed: BTreeSet<String> = BTreeSet::new();
     let mut emergency: Option<(BTreeSet<Vec<Key>>, GrabCapture)> = None;
     let mut focus: Option<FocusWatcher> = None;
+    // One live connection for "is that key still down?" — the deferred-tap question.
+    let probe = sequencer_input::KeyProbe::open();
     let mut passes: u32 = 0;
 
     writeln!(
@@ -181,6 +183,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
                     &mut rng,
                     &mut pump,
                     &mut slots,
+                    probe.as_ref(),
                     focus.as_ref(),
                 ) {
                     break Err(err);
@@ -214,9 +217,9 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
 /// keys — a race with an ungrab — are ignored.
 ///
 /// Stops are per-profile — nothing is global among scripts, so the manager keeps
-/// going; Ctrl+C on the manager is the stop-everything. Routing matches the
-/// chord's ordinary key (queued events carry no modifier state), so stop chords
-/// sharing a primary key stop together.
+/// going; Ctrl+C on the manager is the stop-everything. Events carry the modifier
+/// classes held when they fired, so routing matches full chords: `ctrl w` is not
+/// `ctrl shift w`, and only an exact stop-chord press stops its profiles.
 #[allow(
     clippy::too_many_arguments,
     reason = "the manager's whole state, one event"
@@ -229,6 +232,7 @@ fn dispatch(
     rng: &mut Rng,
     pump: &mut CapturePump<'_>,
     slots: &mut BTreeMap<String, Slot>,
+    probe: Option<&sequencer_input::KeyProbe>,
     focus: Option<&FocusWatcher>,
 ) -> Result<()> {
     let (sequencer_core::input::EventKind::KeyDown(key)
@@ -239,7 +243,7 @@ fn dispatch(
     if matches!(event.kind, sequencer_core::input::EventKind::KeyDown(_)) {
         let stopping: Vec<String> = slots
             .iter()
-            .filter(|(_, slot)| slot.stop_key() == Some(key))
+            .filter(|(_, slot)| slot.stop_chord() == Some((key, event.mods)))
             .map(|(name, _)| name.clone())
             .collect();
         if !stopping.is_empty() {
@@ -251,7 +255,7 @@ fn dispatch(
     }
     let Some((name, slot)) = slots
         .iter_mut()
-        .find(|(_, slot)| slot.capture.is_some() && slot.primaries().contains(&key))
+        .find(|(_, slot)| slot.capture.is_some() && slot.owns_trigger(key, event.mods))
     else {
         return Ok(());
     };
@@ -266,17 +270,21 @@ fn dispatch(
             .and_then(FocusWatcher::focused_class)
             .is_none_or(|class| program_matches(pattern, &class)),
     };
-    // Only this slot's own stop chord may end its in-flight sequence; another
-    // profile's stop is not its business.
-    let own_stop: BTreeSet<Key> = slot.stop_key().into_iter().collect();
+    // A deferred tap asks the server whether the trigger's modifiers are still
+    // physically down; with no probe the answer is "no" and taps fire immediately.
+    let mods_down_fn =
+        move |mods: Mods| probe.is_some_and(|probe| probe.any_down(&mods.watch_keys()));
     let mut pumps = run::Pumps {
         triggers: pump,
-        stop_keys: &own_stop,
+        // Only this slot's own stop chord may end its in-flight sequence; another
+        // profile's stop is not its business.
+        stop: slot.stop_chord(),
         gate: slot
             .profile
             .program
             .as_ref()
             .map(|_| &gate_fn as &dyn Fn() -> bool),
+        mods_down: Some(&mods_down_fn as &dyn Fn(Mods) -> bool),
     };
     let mut executor = run::Executor::new(&slot.profile, sink, clock, rng, &mut slot.held);
     let outcome = executor.handle(event, &mut pumps)?;

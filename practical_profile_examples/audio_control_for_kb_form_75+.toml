@@ -1,6 +1,6 @@
 [defaults]
 suppress = true
-emergency_stop = "ctrl shift q"
+emergency_stop = "ctrl shift e"
 
 
 [binds.PgUp]
@@ -8,4 +8,6 @@ bind = "volume-up"
 
 [binds.PgDn]
 bind = "volume-down"
+
+
 

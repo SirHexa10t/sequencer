@@ -42,4 +42,4 @@ pub use crate::linux::{EvdevCapture, UinputSink};
 pub use crate::mock::MockInjector;
 pub use crate::probe::{CheckResult, Remediation, Requirement, Session, SessionInfo};
 #[cfg(all(feature = "xtest", target_os = "linux"))]
-pub use crate::x11::{FocusWatcher, GrabCapture, XTestSink};
+pub use crate::x11::{FocusWatcher, GrabCapture, KeyProbe, XTestSink};

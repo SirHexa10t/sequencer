@@ -32,7 +32,7 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, ModMask};
 use x11rb::rust_connection::RustConnection;
 
-use sequencer_core::input::{InputEvent, Key};
+use sequencer_core::input::{InputEvent, Key, Mods};
 
 use crate::capture::{CaptureStream, Epoch, EventQueue};
 
@@ -174,12 +174,12 @@ fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running
                     let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
                     let _ = conn.flush();
                 }
-                let Some(kind) = translate(&event) else {
+                let Some((kind, mods)) = translate(&event) else {
                     continue;
                 };
                 // Stamped on arrival, on the runner's timeline — same rule as the evdev
                 // reader, so cadence phase-locks to the press either way.
-                if !queue.offer(InputEvent::physical(epoch.now(), kind)) {
+                if !queue.offer(InputEvent::physical(epoch.now(), kind).with_mods(mods)) {
                     tracing::trace!("capture queue full, event dropped");
                 }
             }
@@ -258,19 +258,82 @@ fn mask_variants(mods: ModMask) -> Vec<ModMask> {
     ]
 }
 
-/// A grabbed-key X event as the engine's event kind; anything else is `None`.
+/// A grabbed-key X event as the engine's event kind plus the modifier classes that
+/// were held; anything else is `None`.
+///
+/// The modifiers matter because this is the only place they exist: a grab fires a
+/// chord as one key-down of its ordinary key, and the chord's other half lives in the
+/// event's `state` field. Dropping it here once made `ctrl w` indistinguishable from
+/// `ctrl shift w` downstream.
 ///
 /// X's auto-repeat arrives as release/press pairs at the same timestamp; unlike the evdev
 /// path there is no repeat flag to filter on. Harmless here: the engine derives its own
 /// edges from state transitions, so a re-press of a held key is a no-op — the same reason
 /// the evdev reader could afford to drop kernel repeats rather than needing to.
-fn translate(event: &Event) -> Option<sequencer_core::input::EventKind> {
+fn translate(event: &Event) -> Option<(sequencer_core::input::EventKind, Mods)> {
     use sequencer_core::input::EventKind;
     match event {
-        Event::KeyPress(press) => Some(EventKind::KeyDown(key_from_x(press.detail)?)),
-        Event::KeyRelease(release) => Some(EventKind::KeyUp(key_from_x(release.detail)?)),
+        Event::KeyPress(press) => Some((
+            EventKind::KeyDown(key_from_x(press.detail)?),
+            mods_of(press.state),
+        )),
+        Event::KeyRelease(release) => Some((
+            EventKind::KeyUp(key_from_x(release.detail)?),
+            mods_of(release.state),
+        )),
         // MappingNotify and friends: nothing the engine binds to.
         _ => None,
+    }
+}
+
+/// The engine's modifier classes for an X state mask. Locks (Lock, Mod2) are not
+/// modifiers a chord can name, so they are not classes either.
+fn mods_of(state: x11rb::protocol::xproto::KeyButMask) -> Mods {
+    use x11rb::protocol::xproto::KeyButMask;
+    [
+        (KeyButMask::SHIFT, Mods::SHIFT),
+        (KeyButMask::CONTROL, Mods::CTRL),
+        (KeyButMask::MOD1, Mods::ALT),
+        (KeyButMask::MOD5, Mods::RALT),
+        (KeyButMask::MOD4, Mods::META),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| state.contains(*bit))
+    .fold(Mods::NONE, |mods, (_, class)| mods.and(class))
+}
+
+/// Reads the server's live key state, for the one question grabs cannot answer:
+/// is a key still physically down *right now*?
+///
+/// A deferred tap needs it — after ungrabbing (see [`pump_events`]) the trigger's
+/// releases are routed elsewhere, so release events never arrive here; polling the
+/// server's keymap is the honest way to see the hand leave the keys.
+#[derive(Debug)]
+pub struct KeyProbe {
+    conn: RustConnection,
+}
+
+impl KeyProbe {
+    /// Connects; `None` when there is no server to ask.
+    #[must_use]
+    pub fn open() -> Option<Self> {
+        let (conn, _) = RustConnection::connect(None).ok()?;
+        Some(Self { conn })
+    }
+
+    /// Whether any of `keys` is down right now. Unaskable states read as "none down"
+    /// so a lost connection degrades to firing immediately, never to waiting forever.
+    #[must_use]
+    pub fn any_down(&self, keys: &[Key]) -> bool {
+        let Ok(cookie) = self.conn.query_keymap() else {
+            return false;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return false;
+        };
+        keys.iter()
+            .filter_map(|&key| super::inject::x_keycode(key))
+            .any(|code| reply.keys[usize::from(code / 8)] & (1 << (code % 8)) != 0)
     }
 }
 

@@ -18,7 +18,7 @@ pub mod capture;
 pub mod focus;
 pub mod inject;
 
-pub use capture::{GrabCapture, GrabError};
+pub use capture::{GrabCapture, GrabError, KeyProbe};
 pub use focus::FocusWatcher;
 pub use inject::XTestSink;
 

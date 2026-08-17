@@ -141,7 +141,13 @@ pub fn run(
         .into_iter()
         .next()
         .ok_or(BenchError::NoDevNode)?;
-    let device = Device::open(&node).map_err(BenchError::DevNodes)?;
+    let mut device = Device::open(&node).map_err(BenchError::DevNodes)?;
+    // Grab OUR OWN virtual device exclusively. The observe-only rule protects the
+    // user's real devices; this one is ours, and without the grab the desktop's
+    // libinput receives the whole measurement storm as real input — thousands of
+    // events a second that lag the pointer and flicker the session. Grabbed, only
+    // the counter thread sees them; the device (and grab) dies with this process.
+    device.grab().map_err(BenchError::DevNodes)?;
 
     let delivered = Arc::new(AtomicU64::new(0));
     // Everything that needs privilege has happened: the device exists and is open for

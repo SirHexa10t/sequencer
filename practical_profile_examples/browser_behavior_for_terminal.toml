@@ -1,6 +1,6 @@
 [defaults]
 suppress = true
-emergency_stop = "ctrl shift u"
+emergency_stop = "ctrl shift e"
 program = "*terminal*"
 
 

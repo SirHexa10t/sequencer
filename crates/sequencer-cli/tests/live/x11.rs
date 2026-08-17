@@ -1,9 +1,9 @@
-//! The manager against a real X session: grabs, injection, per-profile emergency
-//! stops, and signal handling. Keys are synthesized through our own XTEST sink —
-//! grabs intercept synthetic input exactly like physical input, so no external
-//! tool is needed. Every chord avoids `alt` (on some setups a synthesized alt
-//! never reaches the modifier state, seen in the field) and every injected
-//! *target* is Pause, which every desktop ignores.
+//! The manager against a real X session: grabs, injection, full-chord routing,
+//! deferred taps, per-profile emergency stops, and signal handling. Keys are
+//! synthesized through our own XTEST sink — grabs intercept synthetic input exactly
+//! like physical input, so no external tool is needed. Every chord avoids `alt` (on
+//! some setups a synthesized alt never reaches the modifier state, seen in the
+//! field) and every injected *target* is Pause, which every desktop ignores.
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -54,8 +54,24 @@ fn live_real_manager() -> Option<u32> {
 /// Presses a chord the way a hand would — mods down, key down, all up in reverse —
 /// through XTEST, which the manager's grabs hear exactly like a physical press.
 fn tap_chord(keys: &[Key]) {
+    press_keys(keys);
+    release_keys(keys);
+}
+
+/// Presses `keys` in order and leaves them down — the "hand still on the chord"
+/// half a deferred tap waits out. Pair with [`release_keys`].
+fn press_keys(keys: &[Key]) {
+    inject(keys.iter().map(|&key| EmitAction::KeyDown(key)));
+}
+
+/// Releases `keys` in reverse order.
+fn release_keys(keys: &[Key]) {
+    inject(keys.iter().rev().map(|&key| EmitAction::KeyUp(key)));
+}
+
+fn inject(actions: impl Iterator<Item = EmitAction>) {
     let mut sink = XTestSink::open().expect("XTEST is usable (ready() said so)");
-    let mut emit = |action: EmitAction| {
+    for action in actions {
         sink.emit(&Emit {
             at: Timestamp::ZERO,
             action,
@@ -63,13 +79,24 @@ fn tap_chord(keys: &[Key]) {
         })
         .expect("inject");
         std::thread::sleep(Duration::from_millis(15));
-    };
-    for &key in keys {
-        emit(EmitAction::KeyDown(key));
     }
-    for &key in keys.iter().rev() {
-        emit(EmitAction::KeyUp(key));
+}
+
+/// The injection count once it has stopped moving — a snapshot taken mid-tap would
+/// blame the tap's second half on whatever gets asserted next (seen in the field:
+/// a "parked tap fired after the stop" false alarm that was the previous tap's
+/// key-up landing late). Capped so a genuinely busy log fails loudly, not silently.
+fn settled_injections(log: &Path) -> usize {
+    let mut last = harness::inject_count(log);
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(400));
+        let now = harness::inject_count(log);
+        if now == last {
+            return now;
+        }
+        last = now;
     }
+    last
 }
 
 /// Polls until the log's injection count exceeds `above`, up to `secs`.
@@ -147,18 +174,41 @@ impl Manager {
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        if self.alive() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        // This runs on assertion failures too, so: graceful SIGINT first — the
+        // manager's own teardown releases held keys, drops every grab and clears
+        // its state, leaving nothing listening behind a red test — then SIGKILL
+        // only if that is ignored. And never panic: this Drop runs during panics.
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
         }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGINT,
+            );
+        }
+        for _ in 0..40 {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
+// The second bind shares its primary key with the profile's own emergency chord on
+// purpose: pressing ctrl+F10 must run the bind, and only ctrl+shift+F10 may stop the
+// profile — the field bug where any grab on a stop chord's primary stopped it.
 const MIRROR: &str = "\
 [defaults]
 suppress = true
 emergency_stop = \"ctrl shift f10\"
 [binds.\"ctrl shift f9\"]
+bind = \"pause\"
+[binds.\"ctrl f10\"]
 bind = \"pause\"
 ";
 
@@ -210,7 +260,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     let mut manager = Manager::start(&config, &[&p1]);
     let text = harness::read(manager.log());
     assert!(
-        text.contains("applied: ") && text.contains("(1 binds)"),
+        text.contains("applied: ") && text.contains("(2 binds)"),
         "{text}"
     );
     assert!(
@@ -253,14 +303,27 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "the miss lists what IS applied: {out}"
     );
 
+    // The mirror's target (pause) does not name the trigger's ctrl+shift, so its tap
+    // must stay parked while the chord's modifiers are genuinely held — injecting
+    // early would recolour the target — and land once they lift. This is the live
+    // proof of the KeyProbe: misread state fires early (count grows while held) or
+    // never (count stays flat after release), and either fails here.
     let before = harness::inject_count(manager.log());
-    tap_chord(&chord(Key::F9));
+    press_keys(&CTRL_SHIFT);
+    tap_chord(&[Key::F9]);
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        harness::inject_count(manager.log()),
+        before,
+        "the tap stays parked while the trigger's modifiers are held"
+    );
+    release_keys(&CTRL_SHIFT);
     assert!(
         injections_grow(manager.log(), before, 3),
-        "the mirror trigger fires (grab heard, tap injected)"
+        "the parked tap fires once the modifiers lift"
     );
 
-    let before = harness::inject_count(manager.log());
+    let before = settled_injections(manager.log());
     tap_chord(&chord(Key::F6));
     assert!(
         injections_grow(manager.log(), before + 4, 3),
@@ -276,11 +339,39 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "re-pressing the trigger stops the loop"
     );
 
-    tap_chord(&chord(Key::F10));
+    // ctrl+F10 shares the emergency's primary key but not its modifiers: it must run
+    // its own bind — deferred until our injected ctrl lifts — and stop nothing.
+    let before = settled_injections(manager.log());
+    tap_chord(&[Key::LeftCtrl, Key::F10]);
+    assert!(
+        injections_grow(manager.log(), before, 3),
+        "ctrl+F10 runs its bind rather than being mistaken for the stop chord"
+    );
+    assert!(
+        config.active().join("p1.toml").is_symlink(),
+        "a trigger sharing the stop chord's primary key must not stop the profile"
+    );
+
+    // A parked tap must still hear its profile's own stop chord: with ctrl+shift
+    // held, F9 parks a deferral, and F10 (completing the exact emergency chord,
+    // since ctrl+shift are already down) must stop p1 — and the parked tap must die
+    // with it rather than firing after.
+    let before = settled_injections(manager.log());
+    press_keys(&CTRL_SHIFT);
+    tap_chord(&[Key::F9]);
+    std::thread::sleep(Duration::from_millis(300));
+    tap_chord(&[Key::F10]);
+    release_keys(&CTRL_SHIFT);
     assert!(
         harness::await_line(manager.log(), "emergency stop: p1.toml unapplied", 3),
-        "p1's chord stops p1: {}",
+        "p1's chord stops p1 even while a tap is parked: {}",
         harness::read(manager.log())
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(
+        harness::inject_count(manager.log()),
+        before,
+        "the parked tap dies with its profile instead of firing after the stop"
     );
     assert!(
         !config.active().join("p1.toml").exists(),

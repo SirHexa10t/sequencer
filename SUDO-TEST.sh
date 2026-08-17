@@ -21,5 +21,7 @@ fi
 echo "sudo is used only by the device-backend tests; Ctrl+C the prompt to skip them."
 sudo -v || true
 
+echo "== pass 1/2: headless suite (compiling first — a fresh tree takes a few minutes of silence) =="
 cargo test --workspace --all-features
+echo "== pass 2/2: live suite — hands off keyboard and mouse for the ~20s it runs =="
 exec cargo test -p sequencer-cli --test live -- --ignored --test-threads=1 --nocapture

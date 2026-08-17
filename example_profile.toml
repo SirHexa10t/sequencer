@@ -25,7 +25,10 @@ suppress = true  # true (default): Bound keys are consumed, the application neve
 program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
                  # run `sequencer detect-key` to print the name of programs you enter focus on. `focus: <name>`.
 emergency_stop = "F8"  # optional: pressing this unapplies THIS profile gracefully — everything it still pressed is released.
-                       # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord too, e.g. "ctrl alt q"
+                       # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord too, e.g. "ctrl alt q".
+                       # chords fire on the EXACT combination: "ctrl alt q" does not fire on "ctrl q", nor the other way around.
+                       # a bind whose trigger holds modifiers its target doesn't name taps only once you release them —
+                       # injecting under a held shift would recolour the target ("]" would arrive as "}").
 
 
 # ------------------------------------------------------------------- edge mirrors

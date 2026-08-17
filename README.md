@@ -276,7 +276,10 @@ than fatal, precisely so that release happens. `SEQUENCER_CONFIG_DIR` overrides 
 state location.
 
 The format — mirrors like
-`PgUp -> volume-up` (each press taps the target; holding repeats it), sequences with
+`PgUp -> volume-up` (each press taps the target; holding repeats it — and a chord
+trigger fires on its exact combination, deferring the tap until modifiers the target
+does not name are released, so a held shift never recolours what gets typed),
+sequences with
 `PRESS`/`RELEASE`/`WAIT` steps, chords, per-bind
 timing, `loop` counts (`4`, or `"inf"` until the trigger is pressed again), `RNG`/`GNR`
 chance blocks (`0.25` == `25%` == `1/4`), and a `program` pattern that applies the
@@ -405,7 +408,7 @@ expressed in that.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 256 tests, all headless
+cargo test --workspace --all-features    # 262 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features

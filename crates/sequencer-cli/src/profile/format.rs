@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use sequencer_core::emit::Holdable;
-use sequencer_core::input::Key;
+use sequencer_core::input::{Key, Mods};
 use sequencer_core::time::Duration;
 
 /// A parsed, validated binds file.
@@ -192,9 +192,9 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
     // `shift >` are the SAME grab — the server cannot tell them apart, and the second
     // would fail (or worse, silently shadow). Alt is the exception: right alt is AltGr,
     // its own bit.
-    let mut grabs: BTreeMap<(Option<Key>, std::collections::BTreeSet<u8>), &str> = BTreeMap::new();
+    let mut grabs: BTreeMap<(Option<Key>, Mods), &str> = BTreeMap::new();
     for bind in &binds {
-        let signature = (primary_key(&bind.trigger), mask_classes(&bind.trigger));
+        let signature = (primary_key(&bind.trigger), chord_mods(&bind.trigger));
         if let Some(previous) = grabs.insert(signature, &bind.trigger_text) {
             return Err(format!(
                 "[binds.\"{previous}\"] and [binds.\"{}\"] are the same grab: X cannot \
@@ -229,19 +229,50 @@ pub(crate) fn primary_key(chord: &[Key]) -> Option<Key> {
     chord.iter().copied().find(|key| !is_modifier(*key))
 }
 
-/// The X modifier bit-class a key occupies, mirroring the grab layer's mask table:
-/// left and right shift/ctrl/meta fold to one class each, while right alt is AltGr —
-/// its own bit on nearly every layout.
-fn mask_classes(chord: &[Key]) -> std::collections::BTreeSet<u8> {
-    chord
+/// The modifier classes a chord names, folded the way the grab layer folds them —
+/// [`Mods`] is the one table for it, shared with the live event path so a trigger
+/// and the event it fires can never disagree about what "its modifiers" means.
+pub(crate) fn chord_mods(chord: &[Key]) -> Mods {
+    Mods::of_chord(chord)
+}
+
+/// The modifier classes a bind's *target* names — the keys it will synthesize.
+pub(crate) fn target_mods(targets: &[Holdable]) -> Mods {
+    Mods::of_chord(
+        &targets
+            .iter()
+            .filter_map(|target| match target {
+                Holdable::Key(key) => Some(*key),
+                Holdable::Button(_) => None,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Advisory notes for a profile that parses and validates fine but will surprise:
+/// a mirror whose trigger holds modifiers its target does not name cannot fire
+/// while the hand is still down — the held modifiers would recolour the injected
+/// keys (`]` under a held shift arrives as `}`) — so its tap is deferred until the
+/// trigger's modifiers are released.
+pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
+    profile
+        .binds
         .iter()
-        .filter_map(|key| match key {
-            Key::LeftShift | Key::RightShift => Some(0),
-            Key::LeftCtrl | Key::RightCtrl => Some(1),
-            Key::LeftAlt => Some(2),
-            Key::RightAlt => Some(3),
-            Key::LeftMeta | Key::RightMeta => Some(4),
-            _ => None,
+        .filter_map(|bind| {
+            let Action::Mirror(targets) = &bind.action else {
+                return None;
+            };
+            let held = chord_mods(&bind.trigger);
+            let wanted = target_mods(targets);
+            if wanted.covers(held) {
+                return None;
+            }
+            Some(format!(
+                "[binds.\"{}\"]: the held {held} would recolour the target, so this \
+                 tap fires only once {held} is released; a trigger without modifiers \
+                 is the straightforward alternative",
+                bind.trigger_text
+            ))
         })
         .collect()
 }
@@ -657,6 +688,31 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The advisory list: a mirror whose trigger holds modifiers its target does not
+    /// name gets one (its tap is deferred), everything else stays quiet — a target
+    /// that names the held classes, a bare trigger, and a sequence (whose steps are
+    /// the author's own to time).
+    #[test]
+    fn only_contaminated_mirrors_draw_a_warning() {
+        let warned = parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
+        let notes = warnings(&warned);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("shift") && notes[0].contains("without modifiers"),
+            "the note names the held class and the straightforward fix: {}",
+            notes[0]
+        );
+
+        for quiet in [
+            "[binds.\"shift n\"]\nbind = \"shift >\"",
+            "[binds.b]\nbind = \"p\"",
+            "[binds.\"ctrl b\"]\nseq = [\"p\"]",
+        ] {
+            let profile = parse(quiet).expect("parses");
+            assert_eq!(warnings(&profile), Vec::<String>::new(), "for {quiet}");
+        }
+    }
     use sequencer_core::input::Button;
 
     fn parse_ok(text: &str) -> Profile {

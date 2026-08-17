@@ -40,6 +40,13 @@ pub(crate) fn profile_check(args: &ProfileCheckArgs, deps: &mut Deps<'_>) -> Res
                 bad += 1;
             }
             Ok(profile) => {
+                for warning in super::format::warnings(&profile) {
+                    writeln!(
+                        deps.out,
+                        "{path}: {}",
+                        crate::style::alarm(&format!("warning: {warning}"))
+                    )?;
+                }
                 if args.format {
                     match reformat(&text) {
                         Some(tidied) if tidied != text => {

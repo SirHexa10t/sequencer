@@ -17,7 +17,7 @@
 //! released, in reverse order.
 
 use sequencer_core::emit::{Emit, Holdable, InputSink};
-use sequencer_core::input::{EventKind, Key};
+use sequencer_core::input::{EventKind, Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::{Clock, Duration};
 
@@ -38,15 +38,26 @@ pub(crate) enum Outcome {
 /// What a run listens to and answers to while executing.
 ///
 /// One pump carries everything — every grab feeds the same queue, which is what lets
-/// waits *block* instead of taking turns polling. `stop_keys` is this profile's own
-/// emergency key (another profile's stop is not its business), and
+/// waits *block* instead of taking turns polling. `stop` is this profile's own
+/// emergency chord as it arrives in an event: its primary key plus the modifier
+/// classes that must be held with it (another profile's stop is not its business).
 /// `gate` is the profile's licence to keep going: when it turns false mid-sequence —
 /// focus left the program — the sequence stops rather than keep typing into whatever
-/// is focused now.
+/// is focused now. `mods_down` answers "are any of these modifier classes physically
+/// held right now?" — the question a deferred tap waits on; without one (tests,
+/// headless seams) taps fire immediately.
 pub(super) struct Pumps<'a> {
     pub(super) triggers: &'a mut dyn EventPump,
-    pub(super) stop_keys: &'a std::collections::BTreeSet<Key>,
+    pub(super) stop: Option<(Key, Mods)>,
     pub(super) gate: Option<&'a dyn Fn() -> bool>,
+    pub(super) mods_down: Option<&'a dyn Fn(Mods) -> bool>,
+}
+
+impl Pumps<'_> {
+    /// Whether this event is the profile's own emergency chord.
+    fn is_stop(&self, key: Key, mods: Mods) -> bool {
+        self.stop == Some((key, mods))
+    }
 }
 
 /// Runs `profile` until the pump closes or the emergency key is pressed. Releases
@@ -61,16 +72,11 @@ pub(crate) fn run(
     let mut rng = Rng::new(seed);
     let mut held = Vec::new();
     let mut executor = Executor::new(profile, sink, clock, &mut rng, &mut held);
-    let stop_keys: std::collections::BTreeSet<Key> = profile
-        .emergency_stop
-        .as_deref()
-        .and_then(super::format::primary_key)
-        .into_iter()
-        .collect();
     let mut pumps = Pumps {
         triggers: pump,
-        stop_keys: &stop_keys,
+        stop: stop_chord(profile),
         gate: None,
+        mods_down: None,
     };
     let outcome = executor.event_loop(&mut pumps);
     // The exit invariant, on the error path too: nothing stays down because the run
@@ -78,6 +84,16 @@ pub(crate) fn run(
     drain_held(sink, clock, &mut held);
     sink.release_all();
     outcome
+}
+
+/// A profile's emergency chord the way its event will arrive: primary plus held
+/// modifier classes.
+pub(super) fn stop_chord(profile: &Profile) -> Option<(Key, Mods)> {
+    let chord = profile.emergency_stop.as_deref()?;
+    Some((
+        super::format::primary_key(chord)?,
+        super::format::chord_mods(chord),
+    ))
 }
 
 /// Releases a ledger in reverse — the exit invariant, callable by any loop owner. A
@@ -109,6 +125,10 @@ pub(super) struct Executor<'a> {
 /// With a gate to watch, waits are chunked so focus loss is noticed at least this often
 /// — the gate is a poll, not an event, so it cannot itself wake the wait.
 const CHUNK_NANOS: u64 = 50_000_000;
+
+/// How often a deferred tap re-asks whether the trigger's modifiers are still held —
+/// a poll, because after the ungrab their release events are routed elsewhere.
+const DEFER_POLL_NANOS: u64 = 15_000_000;
 
 /// What a wait-with-ears heard.
 enum Heard {
@@ -165,14 +185,27 @@ impl<'a> Executor<'a> {
         // trigger's release usually goes elsewhere anyway — ending our active grab
         // (see the capture backend) hands routing back to the server mid-press.
         if let EventKind::KeyDown(key) = event.kind {
-            if pumps.stop_keys.contains(&key) {
+            if pumps.is_stop(key, event.mods) {
                 return Ok(Some(Outcome::EmergencyStop));
             }
-            if let Some(bind) = bind_of(self.profile, key) {
+            if let Some(bind) = bind_of(self.profile, key, event.mods) {
                 match &bind.action {
                     Action::Mirror(targets) => {
                         let targets = targets.clone();
                         let tap = bind.tap;
+                        // Modifiers the trigger holds but the target does not name
+                        // would recolour the injected keys (a held shift turns `]`
+                        // into `}`), so such a tap waits for the hand to leave them.
+                        let held = super::format::chord_mods(&bind.trigger);
+                        if !super::format::target_mods(&targets).covers(held) {
+                            match self.await_mods_release(held, pumps)? {
+                                Heard::Nothing => {}
+                                Heard::StopBind | Heard::GateLost => return Ok(None),
+                                Heard::Emergency => {
+                                    return Ok(Some(Outcome::EmergencyStop));
+                                }
+                            }
+                        }
                         tracing::info!(
                             trigger = %key,
                             target = %targets
@@ -392,14 +425,14 @@ impl<'a> Executor<'a> {
             match pumps.triggers.wait_until(Some(chunk)) {
                 Wake::Event(event) => {
                     if let EventKind::KeyDown(key) = event.kind {
-                        if pumps.stop_keys.contains(&key) {
+                        if pumps.is_stop(key, event.mods) {
                             return Ok(Heard::Emergency);
                         }
-                        // The grab fires a chord as its one ordinary key, so a
-                        // re-press arrives as the primary alone — never the full
-                        // chord. Bare keys are their own primary.
+                        // The grab fires a chord as its one ordinary key with the
+                        // modifiers riding along as event state — so a re-press is
+                        // the primary plus the chord's exact modifier classes.
                         if let Some(bind) = bind
-                            && super::format::primary_key(&bind.trigger) == Some(key)
+                            && trigger_matches(bind, key, event.mods)
                         {
                             return Ok(Heard::StopBind);
                         }
@@ -423,6 +456,46 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Parks until none of `held`'s modifier classes is physically down, pumping all
+    /// the while: the emergency chord still stops everything, a closed gate abandons
+    /// the tap, and re-presses of the still-held trigger (X auto-repeat) are
+    /// swallowed so one press queues one tap. Without a probe the wait is a no-op —
+    /// better to fire recoloured than to never fire.
+    fn await_mods_release(&mut self, held: Mods, pumps: &mut Pumps<'_>) -> Result<Heard> {
+        let Some(mods_down) = pumps.mods_down else {
+            return Ok(Heard::Nothing);
+        };
+        loop {
+            if !mods_down(held) {
+                return Ok(Heard::Nothing);
+            }
+            if let Some(gate) = pumps.gate
+                && !gate()
+            {
+                return Ok(Heard::GateLost);
+            }
+            if self.pump_dead {
+                return Ok(Heard::Nothing);
+            }
+            let deadline = self.clock.now().saturating_add_nanos(DEFER_POLL_NANOS);
+            match pumps.triggers.wait_until(Some(deadline)) {
+                Wake::Event(event) => {
+                    if let EventKind::KeyDown(key) = event.kind
+                        && pumps.is_stop(key, event.mods)
+                    {
+                        return Ok(Heard::Emergency);
+                    }
+                    tracing::debug!("input while waiting out held modifiers ignored");
+                }
+                Wake::Deadline => {}
+                Wake::Interrupted => {
+                    self.pump_dead = true;
+                    return Ok(Heard::Nothing);
+                }
+            }
+        }
+    }
+
     /// Drains whatever the pumps already hold, without waiting: the zero-duration
     /// sibling of [`Executor::wait_with_ears`].
     fn poll_stop(&mut self, bind: &Bind, pumps: &mut Pumps<'_>) -> Result<Heard> {
@@ -438,10 +511,10 @@ impl<'a> Executor<'a> {
             match pumps.triggers.wait_until(Some(self.clock.now())) {
                 Wake::Event(event) => {
                     if let EventKind::KeyDown(key) = event.kind {
-                        if pumps.stop_keys.contains(&key) {
+                        if pumps.is_stop(key, event.mods) {
                             return Ok(Heard::Emergency);
                         }
-                        if super::format::primary_key(&bind.trigger) == Some(key) {
+                        if trigger_matches(bind, key, event.mods) {
                             return Ok(Heard::StopBind);
                         }
                     }
@@ -483,11 +556,19 @@ fn skip_block(steps: &[Step], from: usize) -> usize {
 /// A chord trigger arrives as its ordinary key — the grab already proved the modifiers
 /// were held — so both shapes match on the same lookup. Validation guarantees no two
 /// binds claim one key, so the first hit is the only hit.
-fn bind_of(profile: &Profile, key: Key) -> Option<&Bind> {
+fn bind_of(profile: &Profile, key: Key, mods: Mods) -> Option<&Bind> {
     profile
         .binds
         .iter()
-        .find(|bind| super::format::primary_key(&bind.trigger) == Some(key))
+        .find(|bind| trigger_matches(bind, key, mods))
+}
+
+/// Whether an event (primary key + held modifier classes) is exactly this bind's
+/// trigger chord. Exact, not superset: `ctrl w` must not pass for `ctrl shift w`,
+/// in either direction.
+fn trigger_matches(bind: &Bind, key: Key, mods: Mods) -> bool {
+    super::format::primary_key(&bind.trigger) == Some(key)
+        && super::format::chord_mods(&bind.trigger) == mods
 }
 
 /// Sleeps `duration` on the clock. Used only by the mirror tap, which owes nothing to
@@ -544,6 +625,15 @@ mod tests {
         )
     }
 
+    /// A press the way a chord's grab delivers it: primary key + held modifier
+    /// classes as event state.
+    fn press_with(key: Key, mods: Mods) -> (Timestamp, InputEvent) {
+        (
+            Timestamp::ZERO,
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(key)).with_mods(mods),
+        )
+    }
+
     fn release(key: Key) -> (Timestamp, InputEvent) {
         (
             Timestamp::ZERO,
@@ -567,7 +657,8 @@ mod tests {
     fn a_chord_bind_taps_in_order_and_releases_in_reverse() {
         let actions = run_events(
             "[binds.\"rshift >\"]\nbind = \"shift ]\"",
-            vec![press(Key::Period)], // the grab delivers the chord as its primary key
+            // The grab delivers the chord as its primary key + the held classes.
+            vec![press_with(Key::Period, Mods::of_chord(&[Key::RightShift]))],
         );
         assert_eq!(
             actions,
@@ -695,23 +786,87 @@ mod tests {
         );
     }
 
-    /// A chord-triggered loop is stopped the same way: the grab fires the chord as its
-    /// primary key, so the re-press arrives as that key alone and must still match.
-    /// (Caught live: `[binds."ctrl shift f6"]` looped forever, the field's re-press
-    /// falling into "input during a sequence ignored".)
+    /// A chord-triggered loop is stopped the same way: the grab fires the chord as
+    /// its primary key with the modifiers as event state, and the full chord must
+    /// match. (Caught live: `[binds."ctrl shift f6"]` looped forever, the field's
+    /// re-press falling into "input during a sequence ignored".)
     #[test]
     fn a_repress_stops_a_chord_triggered_loop_too() {
+        let chord = Mods::of_chord(&[Key::LeftCtrl, Key::LeftShift]);
         let actions = run_events(
-            "[binds.\"ctrl shift F6\"]\nloop = \"inf\"\nseq = [\"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\"]",
-            vec![press(Key::F6), press(Key::F6)],
+            "[binds.\"ctrl shift F6\"]\nloop = \"inf\"\nseq = [\"PRESS a\", \"WAIT 10s\", \"RELEASE a\"]",
+            vec![press_with(Key::F6, chord), press_with(Key::F6, chord)],
         );
         assert_eq!(
             actions,
+            vec![EmitAction::KeyDown(Key::A), EmitAction::KeyUp(Key::A)],
+            "the primary + its modifier classes stop the chord's loop"
+        );
+    }
+
+    /// The other half of full-chord matching: the primary alone, or with the wrong
+    /// modifiers, is NOT the trigger — `ctrl w` must never pass for `ctrl shift w`.
+    /// (Caught live: a `ctrl w` bind's press emergency-stopped a profile whose stop
+    /// chord was `ctrl shift w`.)
+    #[test]
+    fn the_wrong_modifiers_do_not_fire_a_chord_bind() {
+        let actions = run_events(
+            "[binds.\"ctrl shift F6\"]\nbind = \"p\"",
             vec![
-                EmitAction::KeyDown(Key::LeftCtrl),
-                EmitAction::KeyUp(Key::LeftCtrl)
+                press(Key::F6),
+                press_with(Key::F6, Mods::of_chord(&[Key::LeftCtrl])),
             ],
-            "the primary-key re-press stops the chord's loop"
+        );
+        assert!(
+            actions.is_empty(),
+            "bare F6 and ctrl+F6 are other chords entirely: {actions:?}"
+        );
+    }
+
+    /// A chord mirror whose target does not name the held modifiers defers its tap
+    /// until they are released — injecting under a held shift would recolour the
+    /// target (`]` arrives as `}`). The scripted probe releases after three asks.
+    #[test]
+    fn a_contaminated_mirror_waits_for_the_modifiers_to_lift() {
+        let profile = super::super::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut rng = Rng::new(0);
+        let mut held = Vec::new();
+        let shift = Mods::of_chord(&[Key::LeftShift]);
+
+        let asks = std::cell::Cell::new(0_u32);
+        let mods_down = |mods: Mods| {
+            assert_eq!(mods, shift, "the wait watches the trigger's own classes");
+            asks.set(asks.get() + 1);
+            asks.get() <= 3
+        };
+        // Inert releases keep the pump alive between polls — an exhausted pump reads
+        // as "no more input can come" and would rightly fire the tap at once.
+        let mut pump = ScriptedPump::new(vec![
+            release(Key::A),
+            release(Key::A),
+            release(Key::A),
+            release(Key::A),
+        ]);
+        let mut pumps = Pumps {
+            triggers: &mut pump,
+            stop: None,
+            gate: None,
+            mods_down: Some(&mods_down),
+        };
+        let mut executor = Executor::new(&profile, &mut sink, &clock, &mut rng, &mut held);
+        let event =
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::B)).with_mods(shift);
+        executor.handle(event, &mut pumps).expect("runs");
+
+        assert!(asks.get() > 3, "the tap waited out the held shift");
+        let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::P), EmitAction::KeyUp(Key::P)],
+            "the tap fires clean once the modifiers lift"
         );
     }
 
@@ -769,12 +924,12 @@ mod tests {
         // The gate is open for the first event, then latched shut.
         let open = std::cell::Cell::new(true);
         let gate = || open.get();
-        let stop_keys = std::collections::BTreeSet::new();
         let mut pump = ScriptedPump::new(vec![press(Key::F6)]);
         let mut pumps = Pumps {
             triggers: &mut pump,
-            stop_keys: &stop_keys,
+            stop: None,
             gate: Some(&gate),
+            mods_down: None,
         };
         // First event starts the loop; it presses ctrl and parks on the 10s WAIT, where
         // the closed gate (set just before the wait re-checks) ends it.
