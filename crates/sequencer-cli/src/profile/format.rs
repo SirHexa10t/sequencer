@@ -84,6 +84,11 @@ pub(crate) enum Step {
     Rng(f64),
     /// Closes an [`Step::Rng`] block, `fi` to its `if`.
     RngEnd,
+    /// Run the block this many times, then continue past the matching
+    /// [`Step::LoopEnd`]. Nests with itself and with RNG blocks.
+    Loop(u32),
+    /// Closes a [`Step::Loop`] block, `POOL` to its `LOOP`.
+    LoopEnd,
 }
 
 /// The built-in timing, used wherever the file does not say otherwise. These are the
@@ -573,14 +578,22 @@ fn parse_trigger(text: &str) -> Result<Vec<Key>, String> {
     Ok(keys)
 }
 
-/// Parses a `seq` list and proves its PRESSes/RELEASEs and RNG/GNR blocks pair up.
+/// One block a `seq` still has open while it is checked: what opened it, and (for
+/// LOOP) how much was held at entry — a repeated block must let go of what it pressed.
+enum OpenBlock {
+    Rng,
+    Loop { held_at_entry: usize },
+}
+
+/// Parses a `seq` list and proves its PRESSes/RELEASEs pair up and its RNG/GNR and
+/// LOOP/POOL blocks close properly — inside each other, never across.
 fn parse_seq(lines: &[String]) -> Result<Vec<Step>, String> {
     if lines.is_empty() {
         return Err("`seq` is empty".to_owned());
     }
     let mut steps = Vec::with_capacity(lines.len());
     let mut held: Vec<Holdable> = Vec::new();
-    let mut open_blocks = 0_u32;
+    let mut blocks: Vec<OpenBlock> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
         let step =
@@ -598,12 +611,56 @@ fn parse_seq(lines: &[String]) -> Result<Vec<Step>, String> {
                     held.remove(position);
                 }
             }
-            Step::Rng(_) => open_blocks += 1,
-            Step::RngEnd => {
-                open_blocks = open_blocks
-                    .checked_sub(1)
-                    .ok_or_else(|| format!("step {number} `{line}`: GNR without a matching RNG"))?;
-            }
+            Step::Rng(_) => blocks.push(OpenBlock::Rng),
+            Step::RngEnd => match blocks.pop() {
+                Some(OpenBlock::Rng) => {}
+                Some(OpenBlock::Loop { .. }) => {
+                    return Err(format!(
+                        "step {number} `{line}`: GNR without a matching RNG — the open \
+                         block is a LOOP; close it with POOL first"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "step {number} `{line}`: GNR without a matching RNG"
+                    ));
+                }
+            },
+            Step::Loop(_) => blocks.push(OpenBlock::Loop {
+                held_at_entry: held.len(),
+            }),
+            Step::LoopEnd => match blocks.pop() {
+                Some(OpenBlock::Loop { held_at_entry }) => {
+                    // A hold that leaks across POOL would stack up an extra press
+                    // every iteration; a release of an outer hold would find nothing
+                    // left after the first.
+                    if held.len() > held_at_entry {
+                        return Err(format!(
+                            "step {number} `{line}`: PRESS {} is never RELEASEd before \
+                             its POOL — each iteration must let go of what it pressed",
+                            sequencer_core::input::INPUT_MAP.display_name(held[held_at_entry])
+                        ));
+                    }
+                    if held.len() < held_at_entry {
+                        return Err(format!(
+                            "step {number} `{line}`: this block RELEASEs a key pressed \
+                             before it — after the first iteration there is nothing \
+                             left to release"
+                        ));
+                    }
+                }
+                Some(OpenBlock::Rng) => {
+                    return Err(format!(
+                        "step {number} `{line}`: POOL without a matching LOOP — the open \
+                         block is an RNG; close it with GNR first"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "step {number} `{line}`: POOL without a matching LOOP"
+                    ));
+                }
+            },
             Step::Tap(_) | Step::Wait(_) => {}
         }
         steps.push(step);
@@ -614,21 +671,27 @@ fn parse_seq(lines: &[String]) -> Result<Vec<Step>, String> {
             sequencer_core::input::INPUT_MAP.display_name(*leftover)
         ));
     }
-    if open_blocks > 0 {
-        return Err("RNG without a matching GNR — every chance block must close".to_owned());
+    match blocks.last() {
+        Some(OpenBlock::Rng) => {
+            Err("RNG without a matching GNR — every chance block must close".to_owned())
+        }
+        Some(OpenBlock::Loop { .. }) => {
+            Err("LOOP without a matching POOL — every loop block must close".to_owned())
+        }
+        None => Ok(steps),
     }
-    Ok(steps)
 }
 
-/// Parses one step line: keys (a tap), or PRESS/RELEASE/WAIT with their operands.
+/// Parses one step line: keys (a tap), or a keyword (PRESS/RELEASE/WAIT/RNG/GNR/
+/// LOOP/POOL) with its operands.
 fn parse_step(line: &str) -> Result<Step, String> {
     let mut tokens = line.split_whitespace();
     let Some(first) = tokens.next() else {
         return Err("the step is empty".to_owned());
     };
-    // The keywords cannot collide with keys: no keyboard has a press, release, wait or
-    // rng key, which is exactly why these words were chosen over `down`/`up` — both of
-    // which ARE keys.
+    // The keywords cannot collide with keys: no keyboard has a press, release, wait,
+    // rng, loop or pool key, which is exactly why these words were chosen over
+    // `down`/`up` — both of which ARE keys.
     match first.to_ascii_lowercase().as_str() {
         "press" => Ok(Step::Hold(parse_pressables(tokens, "PRESS")?)),
         "release" => Ok(Step::Release(parse_pressables(tokens, "RELEASE")?)),
@@ -648,6 +711,23 @@ fn parse_step(line: &str) -> Result<Step, String> {
                 ));
             }
             Ok(Step::RngEnd)
+        }
+        "loop" => {
+            let Some(spec) = tokens.next() else {
+                return Err("LOOP needs a count, like `LOOP 5`".to_owned());
+            };
+            if let Some(extra) = tokens.next() {
+                return Err(format!("unexpected `{extra}` after the count"));
+            }
+            Ok(Step::Loop(parse_count(spec)?))
+        }
+        "pool" => {
+            if let Some(extra) = tokens.next() {
+                return Err(format!(
+                    "POOL closes a block and takes nothing, got `{extra}`"
+                ));
+            }
+            Ok(Step::LoopEnd)
         }
         "wait" => {
             let Some(spec) = tokens.next() else {
@@ -698,6 +778,19 @@ fn parse_pressable(token: &str) -> Result<Holdable, String> {
         .parse::<Key>()
         .expect_err("input_of would have found a parseable key")
         .to_string())
+}
+
+/// Parses a LOOP count: a whole number of runs, at least one. (For a block that runs
+/// until stopped, the bind-level `loop = "inf"` is the tool — an endless block inside
+/// a sequence could never reach the steps after it.)
+fn parse_count(text: &str) -> Result<u32, String> {
+    let count: u32 = text
+        .parse()
+        .map_err(|_| format!("`{text}` is not a count; use a number, like `LOOP 5`"))?;
+    if count == 0 {
+        return Err("LOOP 0 would never run; drop the block or use 1".to_owned());
+    }
+    Ok(count)
 }
 
 /// Parses an RNG chance: `0.30`, `30%` or `3/10` — three spellings, one probability.
@@ -1137,6 +1230,64 @@ mod tests {
         assert!(err.contains("same trigger"), "{err}");
         let err = parse_err("[binds.F6]\nalso = []\nbind = \"p\"");
         assert!(err.contains("empty"), "{err}");
+    }
+
+    /// LOOP lowers with its count and POOL closes it — the RNG pair's repeat twin,
+    /// guarding its edges the same way.
+    #[test]
+    fn loop_blocks_lower_and_guard_their_edges() {
+        let profile = parse_ok("[binds.F6]\nseq = [\"LOOP 5\", \"a\", \"POOL\"]");
+        let Action::Seq(steps) = &profile.binds[0].action else {
+            panic!("a seq bind");
+        };
+        assert_eq!(
+            steps,
+            &[
+                Step::Loop(5),
+                Step::Tap(vec![Holdable::Key(Key::A)]),
+                Step::LoopEnd,
+            ]
+        );
+
+        assert!(parse_err("[binds.F6]\nseq = [\"LOOP\"]").contains("needs a count"));
+        assert!(parse_err("[binds.F6]\nseq = [\"LOOP 0\", \"a\", \"POOL\"]").contains("never run"));
+        assert!(
+            parse_err("[binds.F6]\nseq = [\"LOOP inf\", \"a\", \"POOL\"]").contains("not a count")
+        );
+        assert!(parse_err("[binds.F6]\nseq = [\"POOL now\"]").contains("takes nothing"));
+        let err = parse_err("[binds.F6]\nseq = [\"LOOP 2\", \"a\"]");
+        assert!(err.contains("LOOP without a matching POOL"), "{err}");
+        let err = parse_err("[binds.F6]\nseq = [\"a\", \"POOL\"]");
+        assert!(err.contains("POOL without a matching LOOP"), "{err}");
+    }
+
+    /// The two block kinds must nest inside each other, never across — the runtime
+    /// skip and wrap arithmetic relies on it.
+    #[test]
+    fn crossed_blocks_are_refused() {
+        let err = parse_err("[binds.F6]\nseq = [\"RNG 50%\", \"LOOP 2\", \"GNR\", \"POOL\"]");
+        assert!(err.contains("the open block is a LOOP"), "{err}");
+        let err = parse_err("[binds.F6]\nseq = [\"LOOP 2\", \"RNG 50%\", \"POOL\", \"GNR\"]");
+        assert!(err.contains("the open block is an RNG"), "{err}");
+    }
+
+    /// A hold that leaks across POOL would stack an extra press every iteration, and
+    /// a release of an outer hold would find nothing left after the first — both are
+    /// refused. A hold spanning the whole block from outside is fine.
+    #[test]
+    fn loop_blocks_must_balance_their_presses() {
+        let err =
+            parse_err("[binds.F6]\nseq = [\"LOOP 2\", \"PRESS ctrl\", \"POOL\", \"RELEASE ctrl\"]");
+        assert!(err.contains("before its POOL"), "{err}");
+        let err =
+            parse_err("[binds.F6]\nseq = [\"PRESS ctrl\", \"LOOP 2\", \"RELEASE ctrl\", \"POOL\"]");
+        assert!(err.contains("pressed before it"), "{err}");
+        parse_ok(
+            "[binds.F6]\nseq = [\"PRESS ctrl\", \"LOOP 2\", \"a\", \"POOL\", \"RELEASE ctrl\"]",
+        );
+        parse_ok(
+            "[binds.F6]\nseq = [\"LOOP 2\", \"PRESS ctrl\", \"a\", \"RELEASE ctrl\", \"POOL\"]",
+        );
     }
 
     /// The pre-rename keyword is gone on purpose: `hold` is no keyword, so it parses as

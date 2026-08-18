@@ -1,8 +1,16 @@
 
 # running-example
 # add `-v` for verbose-printing
-sequencer profile-apply practical_profile_examples/audio_control_for_kb_form_75+.toml        # (simple key-swap)          first run; creates hotkey-management files in "~/.config/sequencer" (and listens for key-input of-course)
-sequencer profile-apply practical_profile_examples/mpv_music_player_like_youtube.toml        # (program-specific profile) load another profile ; different terminal, still joins first's watchlist. Setting something like this up is easier with `detect-key` - it finds key names and the focused program's name (what `program = ...` matches on)
+
+# (simple key-swap) first run; creates hotkey-management files in "~/.config/sequencer" (and listens for key-input of-course)
+sequencer profile-apply practical_profile_examples/audio_control_for_kb_form_75+.toml
+# (program-specific profile) load another profile ; different terminal, still joins first's watchlist. You might also want to run `detect-key` - it finds key names and the focused program's name (what `program = ...` matches on) 
+sequencer profile-apply practical_profile_examples/mpv_music_player_like_youtube.toml
+# (multiple-profiles) you could run it on first run, or later (just like the previous). You can load multiple files at the same time without issues.
+sequencer profile-apply practical_profile_examples/browser_behavior_for_terminal.toml practical_profile_examples/chromium_extra_keys.toml
+
+# alternatively, to load all .toml files within a given dir (non-recursive), just pass the dir as an arg:
+pro_run profile-apply practical_profile_examples/
 
 
 # to quit: 

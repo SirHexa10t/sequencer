@@ -70,14 +70,29 @@ bind = "volume-down"
 # anywhere in a bind; the rule presses wherever a duration appears, `tap` included.
 
 # A combo, with per-bind timing overrides.
+[binds.F2]
+tap = "50ms"    # when game polls slowly, linger for the key to register
+gap = "100ms"
+seq = [
+    # CounterStrike 1.6 buy Kevlar+helmet  (comments like these are allowed)
+    "b",    # plain tap lasts the specified amount of time
+    "8",    # tapped after a pause 
+    "2",
+    # buy defuse-kit(CT)
+    "b",
+    "8",
+    "6",
+]
+
+
+# A combo, with chords and varying waiting time
 [binds.F6]
-tap = "25ms"    # when game polls slowly, linger for the key to register
 gap = "50ms"
 seq = [
     "shift",           # a plain tap
-    "PRESS ctrl",       # ctrl stays down across the next steps
+    "PRESS ctrl",      # ctrl stays down across the next steps
     "space d",         # a chord: space and d together
-    "WAIT 200ms",      # explicit pause — the 50ms gap does not also apply here
+    "WAIT 200ms",      # explicit pause - OVERWRITES the 50ms gap here
     "w p",
     "RELEASE ctrl",
 ]
@@ -85,14 +100,21 @@ seq = [
 # `loop` repeats the sequence per press: a count, or "inf" until stopped. Pressing the
 # trigger again stops it early, releasing anything the sequence still pressed.
 # RNG opens a chance block and GNR closes it (its `fi`): the block runs with the given
-# chance, spelled 0.25, 25% or 1/4 alike. Blocks nest.
+# chance, spelled 0.25, 25% or 1/4 alike. LOOP opens a repeat block and POOL closes it:
+# "LOOP 3" runs the enclosed steps three times. The two block kinds nest freely but
+# close inside each other, and what a LOOP iteration PRESSes it must RELEASE before
+# its POOL — a leaked hold would stack up an extra press every pass.
 [binds.F7]
 loop = "inf"
 seq = [
     "e",
-    "RNG 25%",         # a quarter of iterations do the following
-        "WAIT 300ms",  # your actions should be indented (non obligatory), for readability
-    "GNR",             # Shell-styled block; end of last "RNG" command
+    "RNG 25%",         # chance: a quarter of iterations do the following
+        "WAIT 300ms",
+    "GNR",             # Shell-styled block; end of last "RNG" command (you can nest)
+    "LOOP 2",          # repeat the enclosed steps twice
+        "q",
+        "WAIT 100ms",
+    "POOL",            # end of (last) LOOP
     "WAIT 1s",
 ]
 

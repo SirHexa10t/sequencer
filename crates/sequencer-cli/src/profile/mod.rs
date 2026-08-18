@@ -42,8 +42,9 @@ pub(crate) use format::{Action, Bind, Loops, Profile, Step, parse};
 /// If a file cannot be read, does not parse, or fails validation; or if there is no
 /// backend that can run the manager here.
 pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Result<u8> {
-    let mut parsed = Vec::with_capacity(args.files.len());
-    for file in &args.files {
+    let files = expand_profile_args(&args.files)?;
+    let mut parsed = Vec::with_capacity(files.len());
+    for file in &files {
         let path = file.display().to_string();
         let text = std::fs::read_to_string(file).map_err(|source| Error::ScriptRead {
             path: path.clone(),
@@ -63,7 +64,7 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
         let mut placed = Vec::with_capacity(parsed.len());
-        for (file, profile) in args.files.iter().zip(&parsed) {
+        for (file, profile) in files.iter().zip(&parsed) {
             placed.push((state::link_into_active(file)?, profile));
         }
         // Custody is decided before announcing because it decides the announcement:
@@ -181,6 +182,44 @@ pub(crate) fn unprofile_apply(args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) ->
 pub(crate) fn unprofile_apply(_args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) -> Result<u8> {
     writeln!(deps.out, "nothing is applied.")?;
     Ok(exit::OK)
+}
+
+/// Expands directory arguments into the `.toml` files directly inside them, in name
+/// order; plain files pass through untouched, so directories and files mix freely.
+/// Non-recursive on purpose: a nested directory is organization, not a request.
+fn expand_profile_args(given: &[std::path::PathBuf]) -> Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::with_capacity(given.len());
+    for path in given {
+        if !path.is_dir() {
+            files.push(path.clone());
+            continue;
+        }
+        let listing = |source| Error::ScriptRead {
+            path: path.display().to_string(),
+            source,
+        };
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(path).map_err(listing)? {
+            let candidate = entry.map_err(listing)?.path();
+            let is_toml = candidate
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"));
+            if is_toml && candidate.is_file() {
+                found.push(candidate);
+            }
+        }
+        // An empty expansion would silently apply nothing — refuse with the reason,
+        // like every other input that does not mean what it appears to.
+        if found.is_empty() {
+            return Err(Error::Profile {
+                path: path.display().to_string(),
+                detail: "this directory holds no .toml profiles".to_owned(),
+            });
+        }
+        found.sort();
+        files.append(&mut found);
+    }
+    Ok(files)
 }
 
 /// Turns picker input into set names: numbers, names, or `all`.

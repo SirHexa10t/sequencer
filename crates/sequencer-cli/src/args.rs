@@ -229,7 +229,8 @@ impl Default for DetectKeyArgs {
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ProfileApplyArgs {
     /// Binds files to apply. `example_profile.toml` in the repository documents the
-    /// format. Each is linked into the active set; the first invocation becomes the
+    /// format. A directory names every `.toml` directly inside it, in name order.
+    /// Each file is linked into the active set; the first invocation becomes the
     /// manager, later ones just add to it.
     #[arg(value_name = "FILE", num_args = 1.., required = true)]
     pub files: Vec<PathBuf>,

@@ -68,6 +68,11 @@ fn every_broken_profile_is_refused_with_its_reason() {
             "unknown key",
             "[binds.notakey]\nbind = \"pause\"\n",
         ),
+        (
+            "crossed RNG and LOOP blocks are refused",
+            "the open block",
+            "[binds.f9]\nseq = [\"RNG 50%\", \"LOOP 2\", \"GNR\", \"POOL\"]\n",
+        ),
     ];
     let config = TempConfig::new();
     for (what, fragment, text) in cases {
@@ -80,6 +85,40 @@ fn every_broken_profile_is_refused_with_its_reason() {
             "{what}: refusal must mention {fragment:?}, said: {out}"
         );
     }
+}
+
+#[test]
+fn a_directory_argument_loads_every_toml_inside() {
+    let config = TempConfig::new();
+    let dir = config.dir().join("profiles");
+    std::fs::create_dir(&dir).expect("profiles dir");
+    std::fs::write(dir.join("a.toml"), "[binds.F6]\nbind = \"pause\"\n").expect("a.toml");
+    // The broken second file proves the expansion reached it: apply validates every
+    // file before touching any state, so the refusal arrives with no X11 around.
+    std::fs::write(dir.join("b.toml"), "[binds.F7]\nbind = \"nosuchkey\"\n").expect("b.toml");
+    std::fs::write(dir.join("notes.txt"), "not a profile").expect("notes.txt");
+
+    let dir_arg = dir.to_str().expect("utf-8 temp path");
+    let (status, out) = run(&config, &["profile-apply", dir_arg]);
+    assert!(
+        !status.success(),
+        "the broken profile must refuse the apply"
+    );
+    assert!(
+        out.contains("b.toml") && out.contains("nosuchkey"),
+        "the directory's second profile was found and named: {out}"
+    );
+}
+
+#[test]
+fn an_empty_directory_argument_is_refused() {
+    let config = TempConfig::new();
+    let dir = config.dir().join("empty");
+    std::fs::create_dir(&dir).expect("empty dir");
+    let dir_arg = dir.to_str().expect("utf-8 temp path");
+    let (status, out) = run(&config, &["profile-apply", dir_arg]);
+    assert!(!status.success());
+    assert!(out.contains("no .toml profiles"), "{out}");
 }
 
 #[test]

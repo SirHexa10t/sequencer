@@ -139,21 +139,22 @@ fn tidy_steps(array: &mut toml_edit::Array) {
 
     for (index, value) in array.iter_mut().enumerate() {
         let (prefix, text) = &rewritten[index];
-        // Comments live in the element's own prefix decor. Carry them across onto the
-        // replacement value — the decor belongs to the value, so it has to be set
-        // *after* the swap or the new value arrives bare.
-        let carried: Vec<String> = value
+        // Comments live in the element's own prefix decor: one trailing the PREVIOUS
+        // step sits on the prefix's first line, own-line comments follow. Each is
+        // carried across where its author put it — and the decor belongs to the
+        // value, so it has to be set *after* the swap or the new value arrives bare.
+        let raw = value
             .decor()
             .prefix()
             .and_then(toml_edit::RawString::as_str)
-            .unwrap_or_default()
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('#'))
-            .map(str::to_owned)
-            .collect();
+            .unwrap_or_default();
+        let (trails_previous, own_lines) = split_comments(raw);
         let mut new_prefix = String::new();
-        for comment in carried {
+        if let Some(comment) = trails_previous {
+            new_prefix.push_str("  ");
+            new_prefix.push_str(&comment);
+        }
+        for comment in own_lines {
             new_prefix.push_str(prefix);
             new_prefix.push_str(&comment);
         }
@@ -163,22 +164,55 @@ fn tidy_steps(array: &mut toml_edit::Array) {
         replacement.decor_mut().set_prefix(new_prefix);
         *value = replacement;
     }
-    array.set_trailing("\n");
+    // The array's trailing decor is the same story after the last step: a comment on
+    // that step's line, own-line ones after, then the closing bracket. Rebuilding it
+    // blindly used to eat those comments.
+    let (trails_last, own_lines) = split_comments(array.trailing().as_str().unwrap_or_default());
+    let mut trailing = String::new();
+    if let Some(comment) = trails_last {
+        trailing.push_str("  ");
+        trailing.push_str(&comment);
+    }
+    for comment in own_lines {
+        trailing.push_str("\n    ");
+        trailing.push_str(&comment);
+    }
+    trailing.push('\n');
+    array.set_trailing(trailing);
     array.set_trailing_comma(true);
 }
 
-/// The step's leading keyword, if it has one (`PRESS`, `RELEASE`, `WAIT`, `RNG`).
+/// Splits a decor string into the comment sharing the previous line (its first line,
+/// when one is there) and the own-line comments after it. Spacing is normalized; the
+/// split is what keeps each comment on the side of the newline it was written on.
+fn split_comments(raw: &str) -> (Option<String>, Vec<String>) {
+    let mut lines = raw.lines();
+    let same_line = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| line.starts_with('#'))
+        .map(str::to_owned);
+    let own_lines = lines
+        .map(str::trim)
+        .filter(|line| line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    (same_line, own_lines)
+}
+
+/// The step's leading keyword, if it has one (`PRESS`, `RELEASE`, `WAIT`, `RNG`,
+/// `LOOP`).
 fn keyword_of(step: &str) -> Option<&str> {
     let word = step.split_whitespace().next()?;
-    matches!(word, "PRESS" | "RELEASE" | "WAIT" | "RNG").then_some(word)
+    matches!(word, "PRESS" | "RELEASE" | "WAIT" | "RNG" | "LOOP").then_some(word)
 }
 
 fn is_block_start(step: &str) -> bool {
-    keyword_of(step) == Some("RNG")
+    matches!(keyword_of(step), Some("RNG" | "LOOP"))
 }
 
 fn is_block_end(step: &str) -> bool {
-    step.eq_ignore_ascii_case("GNR")
+    step.eq_ignore_ascii_case("GNR") || step.eq_ignore_ascii_case("POOL")
 }
 
 /// Uppercases the keyword and puts a chord's modifiers first — `d ctrl` reads as
@@ -189,17 +223,22 @@ fn canonical_step(step: &str) -> String {
         return String::new();
     };
     let upper = first.to_ascii_uppercase();
-    let (keyword, rest): (Option<String>, Vec<&str>) =
-        if matches!(upper.as_str(), "PRESS" | "RELEASE" | "WAIT" | "RNG") {
-            (Some(upper), tokens.collect())
-        } else if first.eq_ignore_ascii_case("GNR") {
-            return "GNR".to_owned();
-        } else {
-            (None, std::iter::once(first).chain(tokens).collect())
-        };
+    let (keyword, rest): (Option<String>, Vec<&str>) = if matches!(
+        upper.as_str(),
+        "PRESS" | "RELEASE" | "WAIT" | "RNG" | "LOOP"
+    ) {
+        (Some(upper), tokens.collect())
+    } else if first.eq_ignore_ascii_case("GNR") {
+        return "GNR".to_owned();
+    } else if first.eq_ignore_ascii_case("POOL") {
+        return "POOL".to_owned();
+    } else {
+        (None, std::iter::once(first).chain(tokens).collect())
+    };
 
-    // WAIT's operand is a duration, not keys; leave it exactly as written.
-    let operands = if keyword.as_deref() == Some("WAIT") || keyword.as_deref() == Some("RNG") {
+    // WAIT's operand is a duration and LOOP's a count, not keys; RNG's is a chance.
+    // All three are left exactly as written.
+    let operands = if matches!(keyword.as_deref(), Some("WAIT" | "RNG" | "LOOP")) {
         rest.join(" ")
     } else {
         sort_modifiers_first(&rest)
@@ -286,6 +325,18 @@ mod tests {
         assert_eq!(closes, vec![8, 4], "in:\n{tidied}");
     }
 
+    /// LOOP/POOL blocks indent exactly like RNG/GNR ones, and the count operand is
+    /// left as written.
+    #[test]
+    fn loop_blocks_format_like_rng_blocks() {
+        let text = "[binds.F5]\nseq = [\"loop 3\", \"a\", \"pool\", \"b\"]\n";
+        let tidied = reformat(text).expect("parses");
+        assert!(tidied.contains("\n    \"LOOP 3\""), "{tidied}");
+        assert!(tidied.contains("\n        \"a\""), "indented: {tidied}");
+        assert!(tidied.contains("\n    \"POOL\""), "dedented: {tidied}");
+        assert!(tidied.contains("\n    \"b\""), "{tidied}");
+    }
+
     /// Comments are the whole reason this uses a format-preserving parser.
     #[test]
     fn formatting_keeps_comments() {
@@ -293,6 +344,20 @@ mod tests {
         let tidied = reformat(text).expect("parses");
         assert!(tidied.contains("# jump"), "{tidied}");
         assert!(tidied.contains("\"space\""), "{tidied}");
+    }
+
+    /// A comment also stays where its author put it: trailing a step keeps sharing
+    /// that step's line (the last step's included), own-line stays on its own — and
+    /// the positions survive any number of reformats.
+    #[test]
+    fn comments_keep_their_positions() {
+        let text = "[binds.F5]\nseq = [\n    \"loop 2\",   # twice\n        \"a\",\n    # standalone\n    \"pool\",\n    \"b\",  # done\n]\n";
+        let once = reformat(text).expect("parses");
+        assert!(once.contains("\"LOOP 2\",  # twice"), "{once}");
+        assert!(once.contains("\n    # standalone"), "{once}");
+        assert!(once.contains("\"b\",  # done"), "{once}");
+        let twice = reformat(&once).expect("still parses");
+        assert_eq!(once, twice, "positions must survive reformatting");
     }
 
     /// Formatting is idempotent — a tidy file is left byte-identical, which is what

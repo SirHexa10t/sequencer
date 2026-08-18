@@ -355,7 +355,7 @@ impl<'a> Executor<'a> {
 
     /// One pass over the steps. The seam rule from the template: a WAIT replaces the
     /// gap at its seam only, so a gap is inserted exactly between two non-WAIT
-    /// neighbours; RNG markers are transparent to seams.
+    /// neighbours; RNG and LOOP markers are transparent to seams.
     fn run_iteration(
         &mut self,
         steps: &[Step],
@@ -364,6 +364,8 @@ impl<'a> Executor<'a> {
     ) -> Result<Heard> {
         let mut wants_gap = false;
         let mut index = 0;
+        // Open LOOP blocks: where each body starts, and how many runs it still owes.
+        let mut loops: Vec<(usize, u32)> = Vec::new();
         while index < steps.len() {
             let step = &steps[index];
             index += 1;
@@ -385,6 +387,32 @@ impl<'a> Executor<'a> {
                     continue;
                 }
                 Step::RngEnd => continue,
+                Step::Loop(times) => {
+                    loops.push((index, times - 1));
+                    continue;
+                }
+                Step::LoopEnd => {
+                    match loops.last_mut() {
+                        Some((start, remaining)) if *remaining > 0 => {
+                            *remaining -= 1;
+                            index = *start;
+                            // A block whose steps all cost zero time would spin with
+                            // its stop keys unheard; every wrap consults the pump once,
+                            // exactly as the bind-level loop does.
+                            match self.poll_stop(bind, pumps)? {
+                                Heard::Nothing => {}
+                                heard => return Ok(heard),
+                            }
+                        }
+                        Some(_) => {
+                            loops.pop();
+                        }
+                        // Validation pairs every LOOP with a POOL; an unmatched one
+                        // cannot get here.
+                        None => {}
+                    }
+                    continue;
+                }
                 _ => {}
             }
             if wants_gap {
@@ -425,7 +453,9 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
-                Step::Wait(_) | Step::Rng(_) | Step::RngEnd => unreachable!("handled above"),
+                Step::Wait(_) | Step::Rng(_) | Step::RngEnd | Step::Loop(_) | Step::LoopEnd => {
+                    unreachable!("handled above")
+                }
             }
         }
         self.sink.flush().map_err(Error::from)?;
@@ -1152,6 +1182,93 @@ mod tests {
         )]);
         let outcome = run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
         assert_eq!(outcome, Outcome::EmergencyStop);
+    }
+
+    /// LOOP/POOL repeat their block, then life continues — the bookmark-cleanup
+    /// shape: five passes over the block, one `ctrl w` after.
+    #[test]
+    fn loop_blocks_repeat_their_steps() {
+        let actions = run_events(
+            "[binds.F6]\ntap = \"0\"\ngap = \"0\"\nseq = [\"LOOP 5\", \"a\", \"POOL\", \"b\"]",
+            vec![press(Key::F6)],
+        );
+        let downs_a = actions
+            .iter()
+            .filter(|action| matches!(action, EmitAction::KeyDown(Key::A)))
+            .count();
+        assert_eq!(downs_a, 5, "{actions:?}");
+        assert_eq!(
+            actions.last(),
+            Some(&EmitAction::KeyUp(Key::B)),
+            "the step after POOL runs once, after the block: {actions:?}"
+        );
+    }
+
+    /// Blocks nest: an inner LOOP multiplies the outer one, and an RNG inside rolls
+    /// once per pass — its exact endpoints stay exact.
+    #[test]
+    fn loop_blocks_nest_with_each_other_and_with_rng() {
+        let actions = run_events(
+            "[binds.F6]\ntap = \"0\"\ngap = \"0\"\nseq = [\"LOOP 2\", \"LOOP 3\", \"a\", \"POOL\", \"RNG 0%\", \"b\", \"GNR\", \"POOL\", \"c\"]",
+            vec![press(Key::F6)],
+        );
+        let count = |key: Key| {
+            actions
+                .iter()
+                .filter(|action| matches!(action, EmitAction::KeyDown(k) if *k == key))
+                .count()
+        };
+        assert_eq!(count(Key::A), 6, "2 outer x 3 inner: {actions:?}");
+        assert_eq!(
+            count(Key::B),
+            0,
+            "chance 0 skips in every pass: {actions:?}"
+        );
+        assert_eq!(count(Key::C), 1, "{actions:?}");
+    }
+
+    /// LOOP iterations are seams like any other: the gap sits between them, and the
+    /// markers themselves claim none.
+    #[test]
+    fn the_gap_sits_between_loop_iterations() {
+        let profile = super::super::parse(
+            "[binds.F6]\ntap = \"0\"\ngap = \"30ms\"\nseq = [\"LOOP 2\", \"a\", \"POOL\", \"b\"]",
+        )
+        .expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut pump = ScriptedPump::new(vec![press(Key::F6)]);
+        run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
+
+        let downs: Vec<_> = watcher
+            .recorded()
+            .iter()
+            .filter(|e| matches!(e.action, EmitAction::KeyDown(_)))
+            .map(|e| e.at)
+            .collect();
+        // a at 0; gap between iterations -> 30ms; gap before b -> 60ms.
+        assert_eq!(downs[0], Timestamp::ZERO);
+        assert_eq!(downs[1], Timestamp::from_millis(30));
+        assert_eq!(downs[2], Timestamp::from_millis(60));
+    }
+
+    /// A re-press stops the bind from inside a LOOP block like anywhere else,
+    /// releasing what the iteration still held.
+    #[test]
+    fn a_repress_stops_inside_a_loop_block_and_releases() {
+        let actions = run_events(
+            "[binds.F6]\nseq = [\"LOOP 3\", \"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\", \"POOL\"]",
+            vec![press(Key::F6), press(Key::F6)],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftCtrl),
+                EmitAction::KeyUp(Key::LeftCtrl)
+            ],
+            "stop mid-wait inside the block, then release: {actions:?}"
+        );
     }
 
     /// A parked tap still answers to the profile's emergency chord: the stop wins,

@@ -1,0 +1,24 @@
+[defaults]
+suppress = true
+emergency_stop = "ctrl shift e"
+program = ["*brave*", "*chrome*", "*chromium*"]
+
+
+# "Done with this bookmark" unbookmark tab and close it
+# bookmarks ->-> remove (3-4 times, to make sure; in case multiple bookmarks of the same page were made), quit
+[binds."ctrl shift x"]
+gap = "80ms"
+seq = [
+    "ctrl d",  # create if doesn't exist (precaution; otherwise, 2 rounds would be wasted going through menus and cancelling)
+    "enter",
+    "LOOP 4",
+        "ctrl d",   # open bookmark menu
+        "tab",
+        "tab",
+        "enter",
+        "wait 100ms",
+    "POOL",
+    "ctrl w",
+]
+
+
