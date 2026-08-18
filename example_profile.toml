@@ -39,6 +39,9 @@ suppress = true  # true (default): Bound keys are consumed, the application neve
                  # only <key> is bound) reaches the application untouched.
 program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
                  # several alternatives are a list, applied while ANY matches: program = ["*mpv*", "*celluloid*"]
+                 # precedence: while a program-gated profile is focused, its binds ECLIPSE colliding binds of
+                 # global profiles, bind by bind — the rest of the global profile stays live, and the eclipsed
+                 # binds resume the moment focus moves on.
                  # run `sequencer detect-key` to print the name of programs you enter focus on. `focus: <name>`.
 emergency_stop = "F8"  # optional: pressing this unapplies THIS profile gracefully — everything it still pressed is released.
                        # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord ("ctrl alt q")

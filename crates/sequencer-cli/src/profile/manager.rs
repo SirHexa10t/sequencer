@@ -73,6 +73,13 @@ struct Slot {
     profile: Profile,
     held: Vec<Holdable>,
     capture: Option<GrabCapture>,
+    /// The grab signatures this slot's capture holds right now — the routing truth:
+    /// an event belongs to whoever GRABBED it, never to whoever declares it, which
+    /// is what lets a yielded bind's events arrive at its claimant instead.
+    grabbed: BTreeSet<(Key, Mods)>,
+    /// Signatures this slot yielded to a higher-precedence claimant, with the
+    /// claimant's name — kept so only the transitions get printed.
+    yielded: BTreeMap<(Key, Mods), String>,
     /// The link's own timestamp when this slot loaded. A re-apply replaces the link,
     /// and the changed stamp is the cue to reload — editing the FILE alone changes
     /// nothing here, which is what keeps a running profile from mutating under the
@@ -85,32 +92,72 @@ struct Slot {
 }
 
 impl Slot {
-    /// Every bind's trigger for the grab layer — one representative per folded grab:
-    /// side-variant spellings share a combination, and X will not hold the same grab
-    /// twice. Routing between the spellings happens at event time, by probe.
-    fn triggers(&self) -> Vec<Vec<Key>> {
-        let mut seen = BTreeSet::new();
-        self.profile
-            .binds
-            .iter()
-            .filter(|bind| seen.insert((primary_key(&bind.trigger), chord_mods(&bind.trigger))))
-            .map(|bind| bind.trigger.clone())
-            .collect()
-    }
-
     /// This profile's emergency chords the way their events arrive: primary + held
     /// modifier classes, one per alternative spelling.
     fn stop_chords(&self) -> Vec<(Key, Mods)> {
         run::stop_chords(&self.profile)
     }
+}
 
-    /// Whether an arriving event (primary + held modifier classes) is exactly one
-    /// of this profile's triggers.
-    fn owns_trigger(&self, key: Key, mods: Mods) -> bool {
-        self.profile.binds.iter().any(|bind| {
-            primary_key(&bind.trigger) == Some(key) && chord_mods(&bind.trigger) == mods
-        })
+/// One slot's share of the grab space for this pass.
+#[derive(Debug, Default)]
+struct Claim {
+    /// The trigger chords to grab — one representative per folded signature.
+    chords: Vec<Vec<Key>>,
+    /// The signatures those chords cover.
+    sigs: BTreeSet<(Key, Mods)>,
+    /// Signatures someone earlier already claimed, and who.
+    yielded: BTreeMap<(Key, Mods), String>,
+}
+
+/// Claims every trigger of `profile` whose folded signature is still free, and
+/// records a yield for each one already spoken for. Callers invoke this in
+/// precedence order — stop chords seeded first (safety is nobody's to shadow), then
+/// program-gated slots, then global ones — which IS the precedence system: while a
+/// gated profile is focused, its colliding binds eclipse a global's bind by bind,
+/// and everything swaps back once the claimant goes dormant. Side-variant spellings
+/// within one profile still collapse to a single grab (routing by probe, as ever).
+fn claim_triggers(
+    profile: &Profile,
+    claimant: &str,
+    claimed: &mut BTreeMap<(Key, Mods), String>,
+) -> Claim {
+    let mut claim = Claim::default();
+    for bind in &profile.binds {
+        let Some(primary) = primary_key(&bind.trigger) else {
+            continue;
+        };
+        let signature = (primary, chord_mods(&bind.trigger));
+        if claim.sigs.contains(&signature) {
+            continue; // a side-variant spelling of one this slot already grabs
+        }
+        if let Some(owner) = claimed.get(&signature) {
+            claim
+                .yielded
+                .entry(signature)
+                .or_insert_with(|| owner.clone());
+        } else {
+            claimed.insert(signature, claimant.to_owned());
+            claim.sigs.insert(signature);
+            claim.chords.push(bind.trigger.clone());
+        }
     }
+    claim
+}
+
+/// The bracketed spelling of the bind owning `signature` in `profile` — the first
+/// spelling, when side-variants share it.
+fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
+    profile
+        .binds
+        .iter()
+        .find(|bind| {
+            primary_key(&bind.trigger) == Some(signature.0)
+                && chord_mods(&bind.trigger) == signature.1
+        })
+        .map_or_else(String::new, |bind| {
+            format!("[binds.\"{}\"]", bind.trigger_text)
+        })
 }
 
 /// Runs the active set until it empties out, Ctrl+C (or SIGTERM), or a fatal error.
@@ -271,7 +318,7 @@ fn dispatch(
     }
     let Some((name, slot)) = slots
         .iter_mut()
-        .find(|(_, slot)| slot.capture.is_some() && slot.owns_trigger(key, event.mods))
+        .find(|(_, slot)| slot.grabbed.contains(&(key, event.mods)))
     else {
         return Ok(());
     };
@@ -469,7 +516,11 @@ fn ensure_focus(
 }
 
 /// Grabs or releases each slot's triggers so its capture matches whether its program
-/// has focus. Grabs feed the shared `queue`; a deactivating slot drains its ledger.
+/// has focus — and who outranks it. The grab space is claimed in precedence order
+/// each pass: stop chords first, then program-gated slots, then global ones, names
+/// alphabetical within a tier. A colliding bind yields individually (its siblings
+/// stay live) and resumes the moment its claimant goes dormant. Grabs feed the
+/// shared `queue`; a deactivating slot drains its ledger.
 fn reconcile_activation(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
@@ -480,7 +531,7 @@ fn reconcile_activation(
     focus: Option<&FocusWatcher>,
 ) -> Result<()> {
     let class = focus.and_then(FocusWatcher::focused_class);
-    for (name, slot) in slots.iter_mut() {
+    for slot in slots.values_mut() {
         slot.want = match &slot.profile.program {
             None => true,
             // Unreadable focus keeps the last decision rather than flapping.
@@ -488,34 +539,101 @@ fn reconcile_activation(
                 .as_deref()
                 .map_or(slot.want, |class| program_applies(patterns, class)),
         };
-        match (slot.want, slot.capture.is_some()) {
-            (true, false) => {
-                match GrabCapture::start_into(epoch, &slot.triggers(), queue.clone()) {
-                    Ok(capture) => {
-                        slot.capture = Some(capture);
-                        slot.blocked = false;
-                        writeln!(out, "active: {name}")?;
-                    }
-                    Err(err) => {
-                        if !slot.blocked {
-                            writeln!(
-                                out,
-                                "blocked: {name}: {err} (another profile or program \
-                                 owns a trigger; retrying as things change)"
-                            )?;
-                            slot.blocked = true;
-                        }
-                    }
-                }
-            }
-            (false, true) => {
+    }
+
+    // The claim pass. Stops are seeded for every slot, dormant ones included — the
+    // emergency grab stays alive regardless of focus, and no bind may shadow it.
+    let mut claimed: BTreeMap<(Key, Mods), String> = slots
+        .values()
+        .flat_map(Slot::stop_chords)
+        .map(|stop| (stop, "the emergency grab".to_owned()))
+        .collect();
+    let in_order: Vec<String> = slots
+        .iter()
+        .filter(|(_, slot)| slot.want && slot.profile.program.is_some())
+        .map(|(name, _)| name.clone())
+        .chain(
+            slots
+                .iter()
+                .filter(|(_, slot)| slot.want && slot.profile.program.is_none())
+                .map(|(name, _)| name.clone()),
+        )
+        .collect();
+    let mut claims: BTreeMap<String, Claim> = BTreeMap::new();
+    for name in &in_order {
+        let claim = claim_triggers(&slots[name].profile, name, &mut claimed);
+        claims.insert(name.clone(), claim);
+    }
+
+    for (name, slot) in slots.iter_mut() {
+        if !slot.want {
+            if slot.capture.is_some() {
                 if let Some(mut capture) = slot.capture.take() {
                     capture.stop();
                 }
+                slot.grabbed.clear();
+                slot.yielded.clear();
                 run::drain_held(sink, clock, &mut slot.held);
                 writeln!(out, "dormant: {name}")?;
             }
-            _ => {}
+            continue;
+        }
+        let claim = claims.remove(name).unwrap_or_default();
+        // Only the transitions are worth a line, and each names its bind.
+        for (signature, owner) in &claim.yielded {
+            if !slot.yielded.contains_key(signature) {
+                writeln!(
+                    out,
+                    "bind yielded: {name} {} -> {owner}",
+                    label_of(&slot.profile, *signature)
+                )?;
+            }
+        }
+        for signature in slot.yielded.keys() {
+            if !claim.yielded.contains_key(signature) {
+                writeln!(
+                    out,
+                    "bind resumed: {name} {}",
+                    label_of(&slot.profile, *signature)
+                )?;
+            }
+        }
+        let was_live = slot.capture.is_some();
+        if was_live && slot.grabbed == claim.sigs {
+            slot.yielded = claim.yielded;
+            continue;
+        }
+        if let Some(mut capture) = slot.capture.take() {
+            capture.stop();
+        }
+        slot.grabbed.clear();
+        if claim.chords.is_empty() {
+            // Everything this slot binds is spoken for right now. Its stops stay
+            // live through the emergency grab, and the claims free up the moment
+            // their owners go dormant — the yield lines above told the story.
+            slot.yielded = claim.yielded;
+            continue;
+        }
+        match GrabCapture::start_into(epoch, &claim.chords, queue.clone()) {
+            Ok(capture) => {
+                slot.capture = Some(capture);
+                slot.grabbed = claim.sigs;
+                slot.yielded = claim.yielded;
+                slot.blocked = false;
+                if !was_live {
+                    writeln!(out, "active: {name}")?;
+                }
+            }
+            Err(err) => {
+                if !slot.blocked {
+                    writeln!(
+                        out,
+                        "blocked: {name}: {err} (another program owns a trigger; \
+                         retrying as things change)"
+                    )?;
+                    slot.blocked = true;
+                }
+            }
         }
     }
     Ok(())
@@ -606,6 +724,8 @@ fn reconcile_set(
                         profile,
                         held: Vec::new(),
                         capture: None,
+                        grabbed: BTreeSet::new(),
+                        yielded: BTreeMap::new(),
                         stamp,
                         want: false,
                         blocked: false,
@@ -636,4 +756,107 @@ fn wall_seed() -> u64 {
             u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
         });
     nanos ^ u64::from(std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(text: &str) -> Profile {
+        parse(text).expect("test profile parses")
+    }
+
+    /// The precedence system in one pass: stops are claimed first, then the
+    /// program-gated slot, then the global one — the shared trigger goes to the
+    /// gated profile, and the global slot yields it while keeping its own.
+    #[test]
+    fn the_grab_space_is_claimed_in_precedence_order() {
+        let gated = profile("[defaults]\nprogram = \"*term*\"\n[binds.\"ctrl w\"]\nbind = \"q\"");
+        let global =
+            profile("[binds.\"ctrl w\"]\nbind = \"p\"\n\n[binds.\"ctrl e\"]\nbind = \"p\"");
+        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+
+        let first = claim_triggers(&gated, "gated.toml", &mut claimed);
+        let second = claim_triggers(&global, "global.toml", &mut claimed);
+
+        let ctrl_w = (Key::W, Mods::CTRL);
+        assert!(first.sigs.contains(&ctrl_w), "the gated profile claims it");
+        assert!(first.yielded.is_empty());
+        assert!(!second.sigs.contains(&ctrl_w), "the global slot yields it");
+        assert_eq!(
+            second.yielded.get(&ctrl_w).map(String::as_str),
+            Some("gated.toml"),
+            "the yield names its claimant"
+        );
+        assert!(
+            second.sigs.contains(&(Key::E, Mods::CTRL)),
+            "the global slot's other bind stays live"
+        );
+        assert_eq!(second.chords.len(), 1, "one grab survives the yield");
+    }
+
+    /// A stop chord is claimed before any bind: a bind on another profile's stop
+    /// combination yields to the emergency grab instead of blocking its whole slot,
+    /// and the rest of the profile is untouched.
+    #[test]
+    fn stop_chords_outrank_every_bind() {
+        let global = profile("[binds.\"ctrl shift F10\"]\nbind = \"p\"\n\n[binds.q]\nbind = \"p\"");
+        let stop = (Key::F10, Mods::CTRL.and(Mods::SHIFT));
+        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+        claimed.insert(stop, "the emergency grab".to_owned());
+
+        let claim = claim_triggers(&global, "global.toml", &mut claimed);
+        assert!(
+            !claim.sigs.contains(&stop),
+            "the stop's combination is not grabbable"
+        );
+        assert_eq!(
+            claim.yielded.get(&stop).map(String::as_str),
+            Some("the emergency grab")
+        );
+        assert!(claim.sigs.contains(&(Key::Q, Mods::NONE)));
+    }
+
+    /// Side-variant spellings collapse to one grab within their own slot — the
+    /// second spelling shares the claim, it does not yield it.
+    #[test]
+    fn side_variants_share_their_slots_own_claim() {
+        let both = profile(
+            "[binds.\"shift >\"]\nbind = \"shift ]\"\n\n[binds.\"rshift >\"]\nbind = \"q\"",
+        );
+        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+        let claim = claim_triggers(&both, "p.toml", &mut claimed);
+        assert_eq!(claim.chords.len(), 1, "one grab for both spellings");
+        assert!(claim.yielded.is_empty(), "sharing is not yielding");
+    }
+
+    /// Two global profiles colliding: the alphabetically-first claims the shared
+    /// trigger and the second keeps everything else — nobody's whole profile is
+    /// blocked over one bind anymore.
+    #[test]
+    fn colliding_globals_lose_only_the_shared_bind() {
+        let first = profile("[binds.F5]\nbind = \"p\"");
+        let second = profile("[binds.F5]\nbind = \"q\"\n\n[binds.F6]\nbind = \"q\"");
+        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+
+        let a = claim_triggers(&first, "a.toml", &mut claimed);
+        let b = claim_triggers(&second, "b.toml", &mut claimed);
+        assert!(a.sigs.contains(&(Key::F5, Mods::NONE)));
+        assert_eq!(
+            b.yielded.get(&(Key::F5, Mods::NONE)).map(String::as_str),
+            Some("a.toml")
+        );
+        assert!(
+            b.sigs.contains(&(Key::F6, Mods::NONE)),
+            "the rest of b stays live"
+        );
+    }
+
+    /// The yield line names the bind by its written spelling.
+    #[test]
+    fn labels_name_the_written_spelling() {
+        let p = profile("[binds.\"ctrl w\"]\nbind = \"q\"");
+        assert_eq!(label_of(&p, (Key::W, Mods::CTRL)), "[binds.\"ctrl w\"]");
+        assert_eq!(label_of(&p, (Key::Q, Mods::NONE)), "");
+    }
 }
