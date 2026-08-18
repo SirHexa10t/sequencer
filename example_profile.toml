@@ -25,8 +25,10 @@
 
 
 [defaults]
-tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key-up (release)
-gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise
+tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key-up (release).
+                 # 8ms is also the BUILT-IN default: omit `tap` (here and per-bind) and this is the value used.
+gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise.
+                 # 30ms is also the BUILT-IN default: omit `gap` and sequences still pace themselves.
 suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to
 program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
                  # several alternatives are a list, applied while ANY matches: program = ["*mpv*", "*celluloid*"]

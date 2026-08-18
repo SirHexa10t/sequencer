@@ -34,8 +34,10 @@ pub(crate) use format::{Action, Bind, Loops, Profile, Step, parse};
 
 /// `sequencer profile-apply`.
 ///
-/// Validates every file, links each into the active set, then either becomes the
-/// manager (no live one holds the lock) or reports the one that will pick the links up.
+/// Validates every file, links each into the active set — re-linking an applied one,
+/// which is how an edited profile takes effect without an unapply: the manager reloads
+/// on the fresh link — then either becomes the manager (no live one holds the lock) or
+/// reports the one that will pick the links up.
 ///
 /// # Errors
 ///
@@ -77,12 +79,24 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
                 for (applied, profile) in &placed {
                     announce(deps.out, applied, profile, true)?;
                 }
-                writeln!(
-                    deps.out,
-                    "{} to an {} manager (PID {pid})",
-                    crate::style::key("adding"),
-                    crate::style::key("existing")
-                )?;
+                let reapplied = placed
+                    .iter()
+                    .any(|(applied, _)| matches!(applied, state::Applied::Reapplied(_)));
+                if reapplied {
+                    writeln!(
+                        deps.out,
+                        "{} (re-applying) onto an {} manager (PID {pid})",
+                        crate::style::key("updating"),
+                        crate::style::key("existing")
+                    )?;
+                } else {
+                    writeln!(
+                        deps.out,
+                        "{} to an {} manager (PID {pid})",
+                        crate::style::key("adding"),
+                        crate::style::key("existing")
+                    )?;
+                }
                 Ok(exit::OK)
             }
             state::Custody::Ours(lock) => {
@@ -275,8 +289,18 @@ fn announce(
                 write_stop_hint(out, profile)?;
             }
         }
-        state::Applied::AlreadyActive(link) => {
-            writeln!(out, "already applied: {}", link.display())?;
+        state::Applied::Reapplied(link) => {
+            // Red on purpose: the profile was already in the set, so this apply
+            // REPLACED it — worth a glance, not just a shrug.
+            writeln!(
+                out,
+                "{}: {}",
+                crate::style::alarm("already applied"),
+                link.display()
+            )?;
+            if with_hint {
+                write_stop_hint(out, profile)?;
+            }
         }
     }
     Ok(())

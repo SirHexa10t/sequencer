@@ -2,7 +2,9 @@
 //!
 //! The design is a lazy daemon. `~/.config/sequencer/active/` holds one symlink per
 //! applied profile — **the directory is the set**: apply adds a link, unapply removes
-//! one, `ls` is the status command, and nothing needs to remember what was applied
+//! one, re-apply replaces the link (the fresh link is the manager's cue to reload, so
+//! an edited profile takes effect without an unapply), `ls` is the status command, and
+//! nothing needs to remember what was applied
 //! earlier. Every `profile-apply` invocation links its file, then checks the lock: if
 //! no live manager holds it, this process takes it and manages everything in the
 //! directory; if one does, this process just reports and exits — the running manager
@@ -54,10 +56,11 @@ pub(super) fn link_into_active(source: &Path) -> Result<Applied> {
 
 /// [`link_into_active`] with the directory explicit, for tests.
 ///
-/// Idempotent by canonical path: applying the same file twice is a no-op with a report,
-/// not an error. A *different* file that would take the same name is refused — silently
-/// replacing someone's gaming profile with an unrelated file of the same name is how
-/// keys end up bound to surprises.
+/// Applying the same file again REPLACES its link: the fresh link carries a new
+/// timestamp, which is the running manager's cue to reload — edit and re-apply, no
+/// unapply needed. A *different* file that would take the same name is still refused —
+/// silently replacing someone's gaming profile with an unrelated file of the same name
+/// is how keys end up bound to surprises.
 fn link_into(dir: &Path, source: &Path) -> Result<Applied> {
     std::fs::create_dir_all(dir).map_err(|source_err| Error::ScriptRead {
         path: dir.display().to_string(),
@@ -72,8 +75,12 @@ fn link_into(dir: &Path, source: &Path) -> Result<Applied> {
         })?
         .to_owned();
     let link = dir.join(&name);
+    let mut reapplied = false;
     match canonicalize(&link) {
-        Ok(existing) if existing == canonical => return Ok(Applied::AlreadyActive(link)),
+        Ok(existing) if existing == canonical => {
+            let _ = std::fs::remove_file(&link);
+            reapplied = true;
+        }
         Ok(existing) => {
             return Err(Error::Profile {
                 path: link.display().to_string(),
@@ -94,7 +101,11 @@ fn link_into(dir: &Path, source: &Path) -> Result<Applied> {
         path: link.display().to_string(),
         source: source_err,
     })?;
-    Ok(Applied::Linked(link))
+    Ok(if reapplied {
+        Applied::Reapplied(link)
+    } else {
+        Applied::Linked(link)
+    })
 }
 
 /// What linking a profile did.
@@ -102,8 +113,27 @@ fn link_into(dir: &Path, source: &Path) -> Result<Applied> {
 pub(super) enum Applied {
     /// The link was created.
     Linked(PathBuf),
-    /// The same file was already in the set.
-    AlreadyActive(PathBuf),
+    /// The same file was already in the set; its link was replaced, so the manager
+    /// reloads it.
+    Reapplied(PathBuf),
+}
+
+/// When `name`'s entry in the active set was last (re)created or written — the
+/// manager's reload cue: re-applying replaces the symlink, so even a quick
+/// unlink-and-relink between two scans reads as a change.
+pub(super) fn link_stamp(name: &str) -> Option<std::time::SystemTime> {
+    stamp_in(&active_dir().ok()?, name)
+}
+
+/// [`link_stamp`] with the directory explicit, for tests. The link's OWN metadata,
+/// never the target's: editing a profile alone must not reload it mid-run — the
+/// re-apply is the user's say-so. (A real file copied into the set has only its own
+/// timestamp, so editing that one does reload it, which is the honest reading of
+/// "the directory is the set".)
+fn stamp_in(dir: &Path, name: &str) -> Option<std::time::SystemTime> {
+    std::fs::symlink_metadata(dir.join(name))
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 /// The active set right now: link name → resolved profile path.
@@ -307,8 +337,9 @@ mod tests {
         dir
     }
 
-    /// The directory is the set: linking adds, relinking the same file is a no-op,
-    /// a different file under the same name is refused, unlinking removes.
+    /// The directory is the set: linking adds, relinking the same file REPLACES the
+    /// link (the fresh stamp is the manager's reload cue), a different file under the
+    /// same name is refused, unlinking removes.
     #[test]
     fn the_active_directory_is_the_set() {
         let base = temp_dir("set");
@@ -320,10 +351,19 @@ mod tests {
             link_into(&active, &profile).unwrap(),
             Applied::Linked(_)
         ));
+        let first_stamp = stamp_in(&active, "gaming.toml");
+        assert!(first_stamp.is_some(), "a fresh link has a stamp");
+        // A pause so the replacement's timestamp cannot collide on coarse filesystems.
+        std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(matches!(
             link_into(&active, &profile).unwrap(),
-            Applied::AlreadyActive(_)
+            Applied::Reapplied(_)
         ));
+        assert_ne!(
+            stamp_in(&active, "gaming.toml"),
+            first_stamp,
+            "re-applying replaces the link; the new stamp is what the manager notices"
+        );
         let set = scan(&active).unwrap();
         assert_eq!(set.len(), 1);
         assert!(set.contains_key("gaming.toml"));

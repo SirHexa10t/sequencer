@@ -349,11 +349,26 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "re-pressing the trigger stops the loop"
     );
 
-    // Re-applying a live profile is a no-op with a report, not an error.
+    // Re-applying a live profile replaces its link and the manager reloads it —
+    // edit-and-reapply, no unapply needed. The attach window says what happened,
+    // repeats the stop hint, and the manager's own log shows the update.
     let p1_arg = p1.to_str().expect("utf-8 temp path");
     let (status, out) = harness::run(&config, &["profile-apply", p1_arg]);
     assert!(status.success(), "re-apply failed: {out}");
     assert!(out.contains("already applied:"), "{out}");
+    assert!(
+        out.contains("updating (re-applying) onto an existing manager (PID"),
+        "{out}"
+    );
+    assert!(
+        out.contains("to stop this script, press: ctrl shift F10"),
+        "the re-apply repeats the stop hint: {out}"
+    );
+    assert!(
+        harness::await_line(manager.log(), "profile updated: p1.toml (3 binds)", 3),
+        "the manager reloads the replaced link: {}",
+        harness::read(manager.log())
+    );
 
     // The target names MORE than the trigger holds: shift is synthesized, but the
     // held ctrl is the hand's own — re-injecting it would end with a synthetic

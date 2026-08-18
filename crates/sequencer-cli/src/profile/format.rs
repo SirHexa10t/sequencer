@@ -957,15 +957,23 @@ mod tests {
         assert_eq!(chord.trigger, vec![Key::LeftCtrl, Key::I]);
     }
 
+    /// Omitted `tap`/`gap` fall back to the built-ins — for mirrors and, pointedly,
+    /// for sequences: a `seq` without timing never runs untimed. The literal 8ms/30ms
+    /// are asserted because the template documents them as THE defaults; changing one
+    /// side means changing both.
     #[test]
-    fn a_minimal_mirror_gets_the_built_in_timing() {
-        let profile = parse_ok("[binds.PgUp]\nbind = \"volume-up\"");
-        assert_eq!(profile.binds[0].tap, DEFAULT_TAP);
-        assert_eq!(profile.binds[0].gap, DEFAULT_GAP);
+    fn omitted_timing_falls_back_to_the_built_in_defaults() {
+        let mirror = parse_ok("[binds.PgUp]\nbind = \"volume-up\"");
+        assert_eq!(mirror.binds[0].tap, DEFAULT_TAP);
+        assert_eq!(mirror.binds[0].gap, DEFAULT_GAP);
         assert_eq!(
-            profile.binds[0].action,
+            mirror.binds[0].action,
             Action::Mirror(vec![Holdable::Key(Key::VolumeUp)])
         );
+
+        let sequence = parse_ok("[binds.F6]\nseq = [\"a\", \"b\"]");
+        assert_eq!(sequence.binds[0].tap, Duration::from_millis(8));
+        assert_eq!(sequence.binds[0].gap, Duration::from_millis(30));
     }
 
     #[test]

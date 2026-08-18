@@ -73,6 +73,11 @@ struct Slot {
     profile: Profile,
     held: Vec<Holdable>,
     capture: Option<GrabCapture>,
+    /// The link's own timestamp when this slot loaded. A re-apply replaces the link,
+    /// and the changed stamp is the cue to reload — editing the FILE alone changes
+    /// nothing here, which is what keeps a running profile from mutating under the
+    /// user's hands without their say-so.
+    stamp: Option<std::time::SystemTime>,
     /// The profile wants to be active (its program matches, or it has none).
     want: bool,
     /// Activation failed on a grab conflict; warned once, retried on changes.
@@ -130,7 +135,9 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
     let (queue, stream) = sequencer_input::CaptureStream::channel(256);
     let mut pump = CapturePump::new(stream, &clock);
     let mut slots: BTreeMap<String, Slot> = BTreeMap::new();
-    let mut failed: BTreeSet<String> = BTreeSet::new();
+    // Refused links, with the stamp they were refused at: a re-apply replaces the
+    // link, and the changed stamp is what earns a retry.
+    let mut failed: BTreeMap<String, Option<std::time::SystemTime>> = BTreeMap::new();
     let mut emergency: Option<(BTreeSet<Vec<Key>>, GrabCapture)> = None;
     let mut focus: Option<FocusWatcher> = None;
     // One live connection for "is that key still down?" — the deferred-tap question.
@@ -392,7 +399,7 @@ fn rescan(
     sink: &mut dyn sequencer_core::emit::InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
-    failed: &mut BTreeSet<String>,
+    failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
     emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
     focus: &mut Option<FocusWatcher>,
     rescan_dir: bool,
@@ -519,36 +526,58 @@ fn reconcile_set(
     clock: &SystemClock,
     sink: &mut dyn sequencer_core::emit::InputSink,
     slots: &mut BTreeMap<String, Slot>,
-    failed: &mut BTreeSet<String>,
+    failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
 ) -> Result<()> {
     let set = scan_active()?;
-    let gone: Vec<String> = slots
-        .keys()
-        .filter(|name| !set.contains_key(*name))
-        .cloned()
+    // Gone, or re-applied: a replaced link carries a fresh stamp, and a reload is a
+    // removal the loop below immediately follows with a load. Held keys are drained
+    // either way — the new version must not inherit the old one's ledger.
+    let mut updated: BTreeSet<String> = BTreeSet::new();
+    let leaving: Vec<(String, bool)> = slots
+        .iter()
+        .filter_map(|(name, slot)| {
+            if !set.contains_key(name) {
+                Some((name.clone(), false))
+            } else if super::state::link_stamp(name) != slot.stamp {
+                Some((name.clone(), true))
+            } else {
+                None
+            }
+        })
         .collect();
-    for name in gone {
+    for (name, reapplied) in leaving {
         if let Some(mut slot) = slots.remove(&name) {
             if let Some(mut capture) = slot.capture.take() {
                 capture.stop();
             }
             run::drain_held(sink, clock, &mut slot.held);
-            writeln!(out, "profile removed: {name}")?;
+            if reapplied {
+                updated.insert(name);
+            } else {
+                writeln!(out, "profile removed: {name}")?;
+            }
         }
     }
-    failed.retain(|name| set.contains_key(name));
+    // A refused link earns a retry the same way a slot earns a reload: by being
+    // replaced. Same name, same stamp — still refused, still quiet.
+    failed.retain(|name, stamp| set.contains_key(name) && super::state::link_stamp(name) == *stamp);
 
     for (name, path) in &set {
-        if slots.contains_key(name) || failed.contains(name) {
+        if slots.contains_key(name) || failed.contains_key(name) {
             continue;
         }
+        // The stamp is read BEFORE the load: a re-apply racing this very pass makes
+        // the stored stamp stale, so the next pass reloads again rather than missing
+        // the newer version.
+        let stamp = super::state::link_stamp(name);
         match load(path) {
             Ok(profile) => {
-                writeln!(
-                    out,
-                    "profile applied: {name} ({} binds)",
-                    profile.binds.len()
-                )?;
+                let verb = if updated.contains(name) {
+                    "profile updated"
+                } else {
+                    "profile applied"
+                };
+                writeln!(out, "{verb}: {name} ({} binds)", profile.binds.len())?;
                 super::write_stop_hint(out, &profile)?;
                 slots.insert(
                     name.clone(),
@@ -556,6 +585,7 @@ fn reconcile_set(
                         profile,
                         held: Vec::new(),
                         capture: None,
+                        stamp,
                         want: false,
                         blocked: false,
                     },
@@ -563,7 +593,7 @@ fn reconcile_set(
             }
             Err(detail) => {
                 writeln!(out, "profile refused: {name}: {detail}")?;
-                failed.insert(name.clone());
+                failed.insert(name.clone(), stamp);
             }
         }
     }
