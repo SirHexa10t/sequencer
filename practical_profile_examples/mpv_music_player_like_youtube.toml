@@ -1,7 +1,7 @@
 [defaults]
 suppress = true
 emergency_stop = "ctrl shift e"
-program = "*celluloid*"
+program = ["*mpv*", "*celluloid*"]  # either front-end; Celluloid's window class has no "mpv" in it
 
 
 # k: pause

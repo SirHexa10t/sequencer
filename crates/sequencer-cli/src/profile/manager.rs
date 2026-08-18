@@ -14,7 +14,7 @@ use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
-use super::format::{chord_mods, primary_key, program_matches};
+use super::format::{chord_mods, primary_key, program_applies};
 use super::state::{LockGuard, scan_active};
 use super::{Profile, parse, run};
 use crate::runtime::{CapturePump, EventPump, Wake};
@@ -89,10 +89,10 @@ impl Slot {
             .collect()
     }
 
-    /// This profile's emergency chord the way its event arrives: primary + held
-    /// modifier classes.
-    fn stop_chord(&self) -> Option<(Key, Mods)> {
-        run::stop_chord(&self.profile)
+    /// This profile's emergency chords the way their events arrive: primary + held
+    /// modifier classes, one per alternative spelling.
+    fn stop_chords(&self) -> Vec<(Key, Mods)> {
+        run::stop_chords(&self.profile)
     }
 
     /// Whether an arriving event (primary + held modifier classes) is exactly one
@@ -243,7 +243,7 @@ fn dispatch(
     if matches!(event.kind, sequencer_core::input::EventKind::KeyDown(_)) {
         let stopping: Vec<String> = slots
             .iter()
-            .filter(|(_, slot)| slot.stop_chord() == Some((key, event.mods)))
+            .filter(|(_, slot)| slot.stop_chords().contains(&(key, event.mods)))
             .map(|(name, _)| name.clone())
             .collect();
         if !stopping.is_empty() {
@@ -266,25 +266,30 @@ fn dispatch(
     let program = slot.profile.program.clone();
     let gate_fn = move || match &program {
         None => true,
-        Some(pattern) => focus
+        Some(patterns) => focus
             .and_then(FocusWatcher::focused_class)
-            .is_none_or(|class| program_matches(pattern, &class)),
+            .is_none_or(|class| program_applies(patterns, &class)),
     };
     // A deferred tap asks the server whether the trigger's modifiers are still
     // physically down; with no probe the answer is "no" and taps fire immediately.
     let mods_down_fn =
         move |mods: Mods| probe.is_some_and(|probe| probe.any_down(&mods.watch_keys()));
+    // Same server, single key: the wait a tap owes when its target re-presses the
+    // trigger's own key.
+    let key_down_fn = move |key: Key| probe.is_some_and(|probe| probe.any_down(&[key]));
+    let stops = slot.stop_chords();
     let mut pumps = run::Pumps {
         triggers: pump,
-        // Only this slot's own stop chord may end its in-flight sequence; another
+        // Only this slot's own stop chords may end its in-flight sequence; another
         // profile's stop is not its business.
-        stop: slot.stop_chord(),
+        stop: &stops,
         gate: slot
             .profile
             .program
             .as_ref()
             .map(|_| &gate_fn as &dyn Fn() -> bool),
         mods_down: Some(&mods_down_fn as &dyn Fn(Mods) -> bool),
+        key_down: Some(&key_down_fn as &dyn Fn(Key) -> bool),
     };
     let mut executor = run::Executor::new(&slot.profile, sink, clock, rng, &mut slot.held);
     let outcome = executor.handle(event, &mut pumps)?;
@@ -396,7 +401,7 @@ fn reconcile_emergency(
 ) {
     let wanted: BTreeSet<Vec<Key>> = slots
         .values()
-        .filter_map(|slot| slot.profile.emergency_stop.clone())
+        .flat_map(|slot| slot.profile.emergency_stop.iter().cloned())
         .collect();
     let current = emergency
         .as_ref()
@@ -453,9 +458,9 @@ fn reconcile_activation(
         slot.want = match &slot.profile.program {
             None => true,
             // Unreadable focus keeps the last decision rather than flapping.
-            Some(pattern) => class
+            Some(patterns) => class
                 .as_deref()
-                .map_or(slot.want, |class| program_matches(pattern, class)),
+                .map_or(slot.want, |class| program_applies(patterns, class)),
         };
         match (slot.want, slot.capture.is_some()) {
             (true, false) => {
@@ -546,9 +551,7 @@ fn reconcile_set(
     Ok(())
 }
 
-/// Reads and validates one profile for the manager. Chord-trigger binds stay in
-/// the profile but never fire — no grab can hear them yet — and the applied-line
-/// says how many are waiting.
+/// Reads and validates one profile for the manager.
 fn load(path: &Path) -> std::result::Result<Profile, String> {
     let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
     parse(&text)

@@ -157,7 +157,7 @@ pub enum Key {
 }
 
 /// Canonical name first, then aliases. This table is the single place key names live:
-/// [`Key::FromStr`] scans it forwards, [`Key`]'s [`fmt::Display`] takes the first hit.
+/// the `FromStr` impl scans it forwards, [`Key`]'s [`fmt::Display`] takes the first hit.
 #[rustfmt::skip]
 pub(super) static KEY_NAMES: &[(&str, Key)] = &[
     ("a", Key::A), ("b", Key::B), ("c", Key::C), ("d", Key::D), ("e", Key::E),

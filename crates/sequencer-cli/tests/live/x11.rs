@@ -210,6 +210,8 @@ emergency_stop = \"ctrl shift f10\"
 bind = \"pause\"
 [binds.\"ctrl f10\"]
 bind = \"pause\"
+[binds.\"ctrl f8\"]
+bind = \"ctrl shift pause\"
 ";
 
 const LOOPER: &str = "\
@@ -260,7 +262,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     let mut manager = Manager::start(&config, &[&p1]);
     let text = harness::read(manager.log());
     assert!(
-        text.contains("applied: ") && text.contains("(2 binds)"),
+        text.contains("applied: ") && text.contains("(3 binds)"),
         "{text}"
     );
     assert!(
@@ -337,6 +339,33 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         harness::inject_count(manager.log()),
         settled,
         "re-pressing the trigger stops the loop"
+    );
+
+    // Re-applying a live profile is a no-op with a report, not an error.
+    let p1_arg = p1.to_str().expect("utf-8 temp path");
+    let (status, out) = harness::run(&config, &["profile-apply", p1_arg]);
+    assert!(status.success(), "re-apply failed: {out}");
+    assert!(out.contains("already applied:"), "{out}");
+
+    // The target names MORE than the trigger holds: shift is synthesized, but the
+    // held ctrl is the hand's own — re-injecting it would end with a synthetic
+    // release that strands the physical ctrl logically-up, and the SECOND press
+    // here would miss the grab (the field bug: worked once, then went dead).
+    let before = settled_injections(manager.log());
+    press_keys(&[Key::LeftCtrl]);
+    tap_chord(&[Key::F8]);
+    assert!(
+        injections_grow(manager.log(), before, 3),
+        "ctrl+F8 fires its extra-modifier target"
+    );
+    let after_first = settled_injections(manager.log());
+    tap_chord(&[Key::F8]);
+    let second_fired = injections_grow(manager.log(), after_first, 3);
+    release_keys(&[Key::LeftCtrl]);
+    assert!(
+        second_fired,
+        "the second press under the same held ctrl must still fire — a re-injected \
+         ctrl would have wiped the held state"
     );
 
     // ctrl+F10 shares the emergency's primary key but not its modifiers: it must run

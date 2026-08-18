@@ -305,7 +305,7 @@ fn mods_of(state: x11rb::protocol::xproto::KeyButMask) -> Mods {
 /// Reads the server's live key state, for the one question grabs cannot answer:
 /// is a key still physically down *right now*?
 ///
-/// A deferred tap needs it — after ungrabbing (see [`pump_events`]) the trigger's
+/// A deferred tap needs it — after ungrabbing (see `pump_events`) the trigger's
 /// releases are routed elsewhere, so release events never arrive here; polling the
 /// server's keymap is the honest way to see the hand leave the keys.
 #[derive(Debug)]

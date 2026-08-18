@@ -20,11 +20,12 @@ use sequencer_core::time::Duration;
 pub(crate) struct Profile {
     /// Every binding, in trigger-name order.
     pub(crate) binds: Vec<Bind>,
-    /// Apply only while the focused program matches this pattern (`*` wildcards,
-    /// case-insensitive). `None` means the profile always applies.
-    pub(crate) program: Option<String>,
-    /// A key or chord that stops the whole run gracefully, releasing everything held.
-    pub(crate) emergency_stop: Option<Vec<Key>>,
+    /// Apply only while the focused program matches one of these patterns (`*`
+    /// wildcards, case-insensitive). `None` means the profile always applies.
+    pub(crate) program: Option<Vec<String>>,
+    /// Chords that stop the whole run gracefully, releasing everything held — any
+    /// one of them fires it. Empty when the file names none.
+    pub(crate) emergency_stop: Vec<Vec<Key>>,
 }
 
 /// One `[binds.<trigger>]` section.
@@ -106,8 +107,26 @@ struct RawDefaults {
     tap: Option<String>,
     gap: Option<String>,
     suppress: Option<bool>,
-    program: Option<String>,
-    emergency_stop: Option<String>,
+    program: Option<OneOrMany>,
+    emergency_stop: Option<OneOrMany>,
+}
+
+/// A field spelled as one string or a list of alternatives — `program`'s patterns
+/// and `emergency_stop`'s chords both read this way.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(one) => vec![one],
+            Self::Many(many) => many,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -115,6 +134,8 @@ struct RawDefaults {
 struct RawBind {
     bind: Option<String>,
     seq: Option<Vec<String>>,
+    /// Extra trigger spellings for the same action; each becomes its own bind.
+    also: Option<Vec<String>>,
     tap: Option<String>,
     gap: Option<String>,
     /// `loop` in the file; TOML has no bare keys, so infinity is spelled `"inf"`.
@@ -156,7 +177,7 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
     let default_gap =
         optional_duration(defaults.gap.as_deref(), "defaults.gap")?.unwrap_or(DEFAULT_GAP);
     let program = parse_program(defaults.program)?;
-    let emergency_stop = parse_emergency(defaults.emergency_stop.as_deref())?;
+    let emergency_stop = parse_emergency(defaults.emergency_stop)?;
 
     let mut binds = Vec::with_capacity(raw.binds.len());
     let mut seen: BTreeMap<Vec<Key>, String> = BTreeMap::new();
@@ -164,24 +185,42 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
         let context = format!("[binds.\"{trigger_text}\"]");
         let bind = lower_bind(&trigger_text, &raw_bind, default_tap, default_gap)
             .map_err(|detail| format!("{context}: {detail}"))?;
+        // `also` spellings are full binds of their own, sharing the section's action
+        // and timing; every check below sees them individually.
+        let mut lowered = vec![bind];
+        if let Some(spellings) = &raw_bind.also {
+            if spellings.is_empty() {
+                return Err(format!("{context}: `also` is empty; drop the field"));
+            }
+            for spelling in spellings {
+                let trigger = parse_trigger(spelling)
+                    .map_err(|detail| format!("{context}: also \"{spelling}\": {detail}"))?;
+                let mut alias = lowered[0].clone();
+                alias.trigger_text.clone_from(spelling);
+                alias.trigger = trigger;
+                lowered.push(alias);
+            }
+        }
         // Two spellings of one trigger ({ and [, A and a) are one key twice, which TOML
         // itself cannot see. Later sections would silently shadow earlier ones.
-        if let Some(previous) = seen.insert(bind.trigger.clone(), trigger_text.clone()) {
+        for bind in lowered {
+            if let Some(previous) = seen.insert(bind.trigger.clone(), bind.trigger_text.clone()) {
+                return Err(format!(
+                    "{context}: this is the same trigger as \"{previous}\" — two \
+                     spellings of one key"
+                ));
+            }
+            binds.push(bind);
+        }
+    }
+    for stop in &emergency_stop {
+        if let Some(bind) = binds.iter().find(|bind| &bind.trigger == stop) {
             return Err(format!(
-                "{context}: this is the same trigger as [binds.\"{previous}\"] — two \
-                 spellings of one key"
+                "emergency_stop is also the trigger of [binds.\"{}\"] — one key cannot both \
+                 run a binding and stop the run",
+                bind.trigger_text
             ));
         }
-        binds.push(bind);
-    }
-    if let Some(stop) = &emergency_stop
-        && let Some(bind) = binds.iter().find(|bind| &bind.trigger == stop)
-    {
-        return Err(format!(
-            "emergency_stop is also the trigger of [binds.\"{}\"] — one key cannot both \
-             run a binding and stop the run",
-            bind.trigger_text
-        ));
     }
     // A grab fires on one keycode; binding both `i` and `ctrl i` would leave which one
     // the server delivers up to modifier luck. Refuse rather than roll dice.
@@ -192,15 +231,26 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
     // `shift >` are the SAME grab — the server cannot tell them apart, and the second
     // would fail (or worse, silently shadow). Alt is the exception: right alt is AltGr,
     // its own bit.
-    let mut grabs: BTreeMap<(Option<Key>, Mods), &str> = BTreeMap::new();
+    let mut grabs: BTreeMap<(Option<Key>, Mods), String> = BTreeMap::new();
     for bind in &binds {
         let signature = (primary_key(&bind.trigger), chord_mods(&bind.trigger));
-        if let Some(previous) = grabs.insert(signature, &bind.trigger_text) {
+        let label = format!("[binds.\"{}\"]", bind.trigger_text);
+        if let Some(previous) = grabs.insert(signature, label.clone()) {
             return Err(format!(
-                "[binds.\"{previous}\"] and [binds.\"{}\"] are the same grab: X cannot \
-                 tell left from right shift/ctrl/meta, so these triggers are one key \
-                 combination twice",
-                bind.trigger_text
+                "{previous} and {label} are the same grab: X cannot tell left from \
+                 right shift/ctrl/meta, so these triggers are one key combination twice"
+            ));
+        }
+    }
+    // The stop chords join the same grab space — the manager grabs them alongside
+    // the triggers, and X cannot hold two grabs on one combination.
+    for stop in &emergency_stop {
+        let signature = (primary_key(stop), chord_mods(stop));
+        let label = format!("emergency_stop \"{}\"", chord_text(stop));
+        if let Some(previous) = grabs.insert(signature, label.clone()) {
+            return Err(format!(
+                "{previous} and {label} are the same grab: X cannot tell left from \
+                 right shift/ctrl/meta, so these are one key combination twice"
             ));
         }
     }
@@ -255,26 +305,38 @@ pub(crate) fn target_mods(targets: &[Holdable]) -> Mods {
 /// keys (`]` under a held shift arrives as `}`) — so its tap is deferred until the
 /// trigger's modifiers are released.
 pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
-    profile
-        .binds
-        .iter()
-        .filter_map(|bind| {
-            let Action::Mirror(targets) = &bind.action else {
-                return None;
-            };
-            let held = chord_mods(&bind.trigger);
-            let wanted = target_mods(targets);
-            if wanted.covers(held) {
-                return None;
-            }
-            Some(format!(
+    let mut notes = Vec::new();
+    for bind in &profile.binds {
+        let Action::Mirror(targets) = &bind.action else {
+            continue;
+        };
+        let held = chord_mods(&bind.trigger);
+        let wanted = target_mods(targets);
+        if !wanted.covers(held) {
+            notes.push(format!(
                 "[binds.\"{}\"]: the held {held} would recolour the target, so this \
                  tap fires only once {held} is released; a trigger without modifiers \
                  is the straightforward alternative",
                 bind.trigger_text
-            ))
-        })
-        .collect()
+            ));
+        } else if wanted == held
+            && primary_key(&bind.trigger).is_some_and(|primary| {
+                targets
+                    .iter()
+                    .any(|target| matches!(target, Holdable::Key(key) if *key == primary))
+            })
+        {
+            // Grabs hear injections like physical input, so a target that lands as
+            // exactly this trigger fires the grab again — and again.
+            notes.push(format!(
+                "[binds.\"{}\"]: the target lands as exactly this trigger, so the \
+                 mirror re-triggers itself and loops until an emergency stop; \
+                 retarget it or change the trigger",
+                bind.trigger_text
+            ));
+        }
+    }
+    notes
 }
 
 /// Whether a key only decorates a chord rather than anchoring it.
@@ -317,24 +379,39 @@ fn overlapping_trigger(binds: &[Bind]) -> Option<String> {
     None
 }
 
-/// Checks the `program` pattern: optional, but never empty — an empty pattern matches
-/// nothing forever, which is a disabled profile pretending to be a working one.
-fn parse_program(program: Option<String>) -> Result<Option<String>, String> {
-    match program {
-        None => Ok(None),
-        Some(pattern) if pattern.trim().is_empty() => {
-            Err("defaults.program is empty; drop the field to always apply".to_owned())
-        }
-        Some(pattern) => Ok(Some(pattern)),
+/// Checks the `program` patterns: optional, but never empty — an empty pattern (or an
+/// empty list) matches nothing forever, which is a disabled profile pretending to be a
+/// working one. One pattern or several: the profile applies while ANY matches.
+fn parse_program(program: Option<OneOrMany>) -> Result<Option<Vec<String>>, String> {
+    let Some(patterns) = program.map(OneOrMany::into_vec) else {
+        return Ok(None);
+    };
+    if patterns.is_empty() {
+        return Err("defaults.program is an empty list; drop the field to always apply".to_owned());
     }
+    if patterns.iter().any(|pattern| pattern.trim().is_empty()) {
+        return Err("defaults.program has an empty pattern; drop it to always apply".to_owned());
+    }
+    Ok(Some(patterns))
 }
 
-/// Parses `emergency_stop`: one key, or a chord spelled like any trigger.
-fn parse_emergency(text: Option<&str>) -> Result<Option<Vec<Key>>, String> {
-    let Some(text) = text else { return Ok(None) };
-    parse_trigger(text)
-        .map(Some)
-        .map_err(|detail| format!("emergency_stop: {detail}"))
+/// Parses `emergency_stop`: one key or chord spelled like any trigger, or a list of
+/// alternatives — any one of them stops the run.
+fn parse_emergency(raw: Option<OneOrMany>) -> Result<Vec<Vec<Key>>, String> {
+    let Some(spellings) = raw.map(OneOrMany::into_vec) else {
+        return Ok(Vec::new());
+    };
+    if spellings.is_empty() {
+        return Err(
+            "emergency_stop is an empty list; drop the field to run without one".to_owned(),
+        );
+    }
+    spellings
+        .iter()
+        .map(|spelling| {
+            parse_trigger(spelling).map_err(|detail| format!("emergency_stop: {detail}"))
+        })
+        .collect()
 }
 
 /// Whether the focused program's name matches a `program` pattern.
@@ -342,11 +419,11 @@ fn parse_emergency(text: Option<&str>) -> Result<Option<Vec<Key>>, String> {
 /// Case-insensitive, `*` matches any run of characters (including none). That is the
 /// whole language: enough for launcher-decorated names like `steam_app_*`, small enough
 /// to hold no surprises.
-// Only the X11 platform loop consults focus today, but the matcher itself is pure and
+// Only the X11 manager loop consults focus today, but the matcher itself is pure and
 // tested unconditionally.
 #[cfg_attr(
     not(all(feature = "xtest", target_os = "linux")),
-    allow(dead_code, reason = "used by the X11 platform loop and by tests")
+    allow(dead_code, reason = "used by the X11 manager loop and by tests")
 )]
 pub(crate) fn program_matches(pattern: &str, class: &str) -> bool {
     fn glob(pattern: &[u8], text: &[u8]) -> bool {
@@ -374,6 +451,20 @@ pub(crate) fn program_matches(pattern: &str, class: &str) -> bool {
         pattern.to_ascii_lowercase().as_bytes(),
         class.to_ascii_lowercase().as_bytes(),
     )
+}
+
+/// Whether the focused program matches any of a profile's `program` patterns.
+///
+/// The list is alternatives, nothing more: `["*mpv*", "*celluloid*"]` covers both
+/// spellings of one player, and a single pattern behaves exactly as it did alone.
+#[cfg_attr(
+    not(all(feature = "xtest", target_os = "linux")),
+    allow(dead_code, reason = "used by the X11 manager loop and by tests")
+)]
+pub(crate) fn program_applies(patterns: &[String], class: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| program_matches(pattern, class))
 }
 
 /// Checks one binding and lowers it into its runnable form.
@@ -708,9 +799,26 @@ mod tests {
             "[binds.\"shift n\"]\nbind = \"shift >\"",
             "[binds.b]\nbind = \"p\"",
             "[binds.\"ctrl b\"]\nseq = [\"p\"]",
+            "[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"",
         ] {
             let profile = parse(quiet).expect("parses");
             assert_eq!(warnings(&profile), Vec::<String>::new(), "for {quiet}");
+        }
+    }
+
+    /// Injections pass through grabs like physical input, so a target that lands as
+    /// exactly its own trigger is an infinite loop — worth a red flag, in both the
+    /// bare spelling and the chord spelling.
+    #[test]
+    fn a_self_retriggering_mirror_is_warned_about() {
+        for looping in [
+            "[binds.a]\nbind = \"a\"",
+            "[binds.\"ctrl a\"]\nbind = \"ctrl a\"",
+        ] {
+            let profile = parse(looping).expect("parses");
+            let notes = warnings(&profile);
+            assert_eq!(notes.len(), 1, "for {looping}: {notes:?}");
+            assert!(notes[0].contains("re-triggers itself"), "{}", notes[0]);
         }
     }
     use sequencer_core::input::Button;
@@ -729,9 +837,13 @@ mod tests {
     fn the_shipped_template_parses_and_validates() {
         let text = include_str!("../../../../example_profile.toml");
         let profile = parse_ok(text);
-        assert_eq!(profile.binds.len(), 5, "PgUp, PgDn, F6, F7 and the chord");
-        assert_eq!(profile.program.as_deref(), Some("*"));
-        assert_eq!(profile.emergency_stop.as_deref(), Some(&[Key::F8][..]));
+        assert_eq!(
+            profile.binds.len(),
+            6,
+            "PgUp, PgDn, F6, F7, the chord and its `also` alias"
+        );
+        assert_eq!(profile.program, Some(vec!["*".to_owned()]));
+        assert_eq!(profile.emergency_stop, vec![vec![Key::F8]]);
         assert!(
             profile
                 .binds
@@ -861,8 +973,8 @@ mod tests {
         let profile =
             parse_ok("[defaults]\nemergency_stop = \"ctrl alt q\"\n[binds.F6]\nseq = [\"a\"]");
         assert_eq!(
-            profile.emergency_stop.as_deref(),
-            Some(&[Key::LeftCtrl, Key::LeftAlt, Key::Q][..])
+            profile.emergency_stop,
+            vec![vec![Key::LeftCtrl, Key::LeftAlt, Key::Q]]
         );
         let err =
             parse_err("[defaults]\nemergency_stop = \"ctrl q\"\n[binds.\"ctrl q\"]\nseq = [\"a\"]");
@@ -948,6 +1060,83 @@ mod tests {
         assert!(program_matches("*", "anything"));
         assert!(!program_matches("firefox", "chromium"));
         assert!(!program_matches("steam_app_*", "steam"));
+    }
+
+    /// `program` takes one pattern or a list of alternatives, applied while ANY
+    /// matches — one file can name every spelling a player hides behind.
+    #[test]
+    fn program_accepts_a_list_of_alternatives() {
+        let profile = parse_ok(
+            "[defaults]\nprogram = [\"*mpv*\", \"*celluloid*\"]\n[binds.F6]\nseq = [\"a\"]",
+        );
+        let patterns = profile.program.expect("patterns");
+        assert!(program_applies(&patterns, "Celluloid"));
+        assert!(program_applies(&patterns, "mpv"));
+        assert!(!program_applies(&patterns, "firefox"));
+
+        let single = parse_ok("[defaults]\nprogram = \"*terminal*\"\n[binds.F6]\nseq = [\"a\"]");
+        assert_eq!(single.program, Some(vec!["*terminal*".to_owned()]));
+    }
+
+    /// An empty list, like an empty pattern, is a profile that can never apply —
+    /// refused with the way out rather than silently disabled.
+    #[test]
+    fn empty_program_lists_and_patterns_are_refused() {
+        let err = parse_err("[defaults]\nprogram = []\n[binds.F6]\nseq = [\"a\"]");
+        assert!(err.contains("empty list"), "{err}");
+        let err = parse_err("[defaults]\nprogram = [\"*mpv*\", \" \"]\n[binds.F6]\nseq = [\"a\"]");
+        assert!(err.contains("empty pattern"), "{err}");
+    }
+
+    /// `emergency_stop` may list alternatives — any one of them is the stop — and an
+    /// empty list is refused like an empty pattern.
+    #[test]
+    fn emergency_stop_accepts_a_list() {
+        let profile = parse_ok(
+            "[defaults]\nemergency_stop = [\"F8\", \"ctrl shift e\"]\n[binds.F6]\nseq = [\"a\"]",
+        );
+        assert_eq!(
+            profile.emergency_stop,
+            vec![vec![Key::F8], vec![Key::LeftCtrl, Key::LeftShift, Key::E]]
+        );
+        let err = parse_err("[defaults]\nemergency_stop = []\n[binds.F6]\nseq = [\"a\"]");
+        assert!(err.contains("empty list"), "{err}");
+    }
+
+    /// A stop chord that lands on an existing grab — its own twin, or a bind's
+    /// side-blind fold — is refused: X cannot hold two grabs on one combination.
+    #[test]
+    fn a_stop_chord_clashing_with_a_grab_is_refused() {
+        let err =
+            parse_err("[defaults]\nemergency_stop = [\"F8\", \"F8\"]\n[binds.F6]\nseq = [\"a\"]");
+        assert!(err.contains("same grab"), "{err}");
+        let err = parse_err(
+            "[defaults]\nemergency_stop = \"rshift F9\"\n[binds.\"shift F9\"]\nseq = [\"a\"]",
+        );
+        assert!(err.contains("same grab"), "{err}");
+    }
+
+    /// `also` spellings expand into full binds sharing the action — and the usual
+    /// duplicate checks see each one individually.
+    #[test]
+    fn also_spellings_expand_into_their_own_binds() {
+        let profile = parse_ok("[binds.F6]\nalso = [\"F7\", \"ctrl i\"]\nbind = \"p\"");
+        assert_eq!(profile.binds.len(), 3);
+        assert!(
+            profile
+                .binds
+                .iter()
+                .all(|bind| bind.action == Action::Mirror(vec![Holdable::Key(Key::P)])),
+            "every spelling carries the section's action"
+        );
+        assert_eq!(profile.binds[0].trigger_text, "F6");
+        assert_eq!(profile.binds[1].trigger, vec![Key::F7]);
+        assert_eq!(profile.binds[2].trigger, vec![Key::LeftCtrl, Key::I]);
+
+        let err = parse_err("[binds.F6]\nalso = [\"F6\"]\nbind = \"p\"");
+        assert!(err.contains("same trigger"), "{err}");
+        let err = parse_err("[binds.F6]\nalso = []\nbind = \"p\"");
+        assert!(err.contains("empty"), "{err}");
     }
 
     /// The pre-rename keyword is gone on purpose: `hold` is no keyword, so it parses as

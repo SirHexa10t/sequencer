@@ -62,8 +62,10 @@ pub(crate) fn profile_check(args: &ProfileCheckArgs, deps: &mut Deps<'_>) -> Res
                         profile.binds.len(),
                         profile
                             .program
-                            .as_ref()
-                            .map_or(String::new(), |p| format!(", for program {p}"))
+                            .as_deref()
+                            .map_or(String::new(), |patterns| {
+                                format!(", for program {}", patterns.join(" | "))
+                            })
                     )?;
                 }
             }

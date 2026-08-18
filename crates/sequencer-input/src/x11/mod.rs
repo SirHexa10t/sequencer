@@ -8,8 +8,8 @@
 //! - [`capture`]: the hotkeys arrive by passive key grab, so nothing here reads
 //!   `/dev/input` — which means an X11 session needs **no group membership and no sudo at
 //!   all**: the whole run is an ordinary X client.
-//! - [`focus`]: which program is focused, for reporting today and per-program profiles
-//!   later.
+//! - [`focus`]: which program is focused — the manager's per-program gating asks it,
+//!   and `detect-key` reports it.
 //!
 //! Neither reaches a Wayland client or the console; the [`crate::linux`] backend remains the
 //! one that works everywhere, and callers pick per session at runtime.

@@ -1,9 +1,10 @@
 //! The apply/unapply commands: validate, link into the active set, manage or report.
 //!
-//! The pieces live beside this file, one concern each: [`format`] says what a binds
-//! file may mean, [`run`] executes one profile's events, and the manager module owns
-//! the on-disk set and the live multi-profile loop. This file is the command surface
-//! stitching them together — plus the picker that makes unapplying humane.
+//! The pieces live beside this file, one concern each: [`mod@format`] says what a binds
+//! file may mean, [`check`] reports on files without applying them, [`run`] executes one
+//! profile's events, [`state`] owns the on-disk active set, and the manager module runs
+//! the live multi-profile loop. This file is the command surface stitching them together
+//! — plus the picker that makes unapplying humane.
 
 pub(crate) mod run;
 
@@ -245,14 +246,20 @@ fn announce(
 /// The one line worth knowing after a profile lands: how to make it stop.
 #[cfg(all(feature = "xtest", target_os = "linux"))]
 fn write_stop_hint(out: &mut dyn std::io::Write, profile: &Profile) -> Result<()> {
-    if let Some(chord) = &profile.emergency_stop {
-        writeln!(
-            out,
-            "to {} this script, press: {}",
-            crate::style::stopper("stop"),
-            crate::style::stopper(&format::chord_text(chord))
-        )?;
+    if profile.emergency_stop.is_empty() {
+        return Ok(());
     }
+    let chords = profile
+        .emergency_stop
+        .iter()
+        .map(|chord| crate::style::stopper(&format::chord_text(chord)))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    writeln!(
+        out,
+        "to {} this script, press: {chords}",
+        crate::style::stopper("stop")
+    )?;
     Ok(())
 }
 

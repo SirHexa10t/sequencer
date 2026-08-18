@@ -4,8 +4,8 @@
 //! that window's `WM_CLASS` names the program — the *class* half is the stable
 //! identifier tools match on (`firefox` stays `firefox` across windows and titles), so
 //! it is what [`FocusWatcher::focused_class`] returns. This is the identifier a
-//! per-program binds profile will match on later; `detect-key` prints it so users can
-//! discover the spelling the same way they discover key names.
+//! per-program binds profile's `program` pattern matches on; `detect-key` prints it so
+//! users can discover the spelling the same way they discover key names.
 //!
 //! Polling, not events: the consumers here already wake on their own cadence (a quit
 //! poll, a read timeout), and two property reads over a local socket cost microseconds.

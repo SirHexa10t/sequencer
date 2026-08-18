@@ -2,9 +2,9 @@
 # running-example
 # add `-v` for verbose-printing
 sequencer profile-apply practical_profile_examples/audio_control_for_kb_form_75+.toml        # (simple key-swap)          first run; creates hotkey-management files in "~/.config/sequencer" (and listens for key-input of-course)
-sequencer profile-apply practical_profile_examples/celluloid_music_player_like_youtube.toml  # (program-specific profile) load another profile ; different terminal, still joins first's watchlist. Setting something like this up is easier with `detect-key` - it finds 
+sequencer profile-apply practical_profile_examples/mpv_music_player_like_youtube.toml        # (program-specific profile) load another profile ; different terminal, still joins first's watchlist. Setting something like this up is easier with `detect-key` - it finds key names and the focused program's name (what `program = ...` matches on)
 
 
 # to quit: 
 # * stop the manager through PID or in first run's terminal, with SIGTERM (CTRL+C)
-# * alternatively, press `ctrl+shift+q` to quit them (they all have the same quitting hotkey)
+# * alternatively, press `ctrl+shift+e` to quit them (these example profiles all declare the same `emergency_stop`)

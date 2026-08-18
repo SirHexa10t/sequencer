@@ -44,12 +44,10 @@ serde = { workspace = true, optional = true, features = ["derive"] }
 toml = { workspace = true, optional = true, features = ["parse"] }
 toml_edit = { workspace = true, optional = true, features = ["parse", "display"] }
 
-[target.'cfg(target_os = "linux")'.dependencies.signal-hook]
-workspace = true
-optional = true
-features = ["iterator"]
-
 [target.'cfg(target_os = "linux")'.dependencies]
+# Only the feature-free surface is used: `flag` for the interrupt latch, `low_level`
+# for dying by the caught signal.
+signal-hook = { workspace = true, optional = true }
 nix = { workspace = true, optional = true, features = ["user", "term", "poll", "signal", "process"] }
 
 [dev-dependencies]

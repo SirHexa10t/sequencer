@@ -10,6 +10,12 @@
 #                     stepping the volume.
 #   seq  = [ ... ]    A sequence, fired once each time the trigger is pressed.
 #
+# and optionally, next to either:
+#
+#   also = [ ... ]    Extra triggers for the same action, each spelled like any trigger.
+#                     Each spelling is its own bind — re-pressing the one that started a
+#                     loop is what stops that loop.
+#
 # Case never matters, anywhere: "a" == "A", "Ctrl" == "ctrl" == "CTRL"
 # PRESS / RELEASE / WAIT keywords are equally legal lowercase.
 # A capitalized letter is a name, not a shifted key — to send an actual capital A, write the chord "shift a".
@@ -23,12 +29,17 @@ tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key
 gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise
 suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to
 program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
+                 # several alternatives are a list, applied while ANY matches: program = ["*mpv*", "*celluloid*"]
                  # run `sequencer detect-key` to print the name of programs you enter focus on. `focus: <name>`.
 emergency_stop = "F8"  # optional: pressing this unapplies THIS profile gracefully — everything it still pressed is released.
-                       # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord too, e.g. "ctrl alt q".
+                       # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord ("ctrl alt q")
+                       # or a list of alternatives (["F8", "ctrl alt q"]) — any one of them stops this profile.
                        # chords fire on the EXACT combination: "ctrl alt q" does not fire on "ctrl q", nor the other way around.
                        # a bind whose trigger holds modifiers its target doesn't name taps only once you release them —
                        # injecting under a held shift would recolour the target ("]" would arrive as "}").
+                       # modifiers the trigger DOES hold are never re-injected: your own held ctrl supplies the
+                       # target's ctrl, so "ctrl w" -> "ctrl shift w" keeps firing on every press while ctrl stays down
+                       # (each tap lands as W lifts — a fresh W press cannot be synthesized while your W is still down).
 
 
 # ------------------------------------------------------------------- edge mirrors
@@ -90,6 +101,7 @@ seq = [
 # containing a space. Note a bare key and a chord over it cannot both be triggers — `i`
 # and `ctrl i` grab the same keycode — but `ctrl i` and `alt i` are fine.
 [binds."ctrl i"]
+also = ["alt i"]   # extra spellings of the trigger; fine here because their grabs differ
 seq = [
     "Ctrl d",
     "Enter",

@@ -4,8 +4,9 @@ emergency_stop = "ctrl shift e"
 program = "*terminal*"
 
 
+# for single tab (like other applications)
 [binds."ctrl w"]
-bind = "Ctrl Shift Q"
+bind = "Ctrl Shift W"
 
 
 

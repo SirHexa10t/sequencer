@@ -3,7 +3,7 @@
 //! Deliberately abstract: it sees a [`Bind`] list, an [`InputSink`], a [`Clock`] and
 //! [`EventPump`]s, which is what makes every behaviour here — mirror edges, chord order,
 //! gap-versus-WAIT, loops that stop on a re-press, RNG blocks, the release ledger —
-//! assertable in tests with no display server. The X11 wiring in [`super::platform`]
+//! assertable in tests with no display server. The X11 wiring in [`super::manager`]
 //! only decides *which* sink and pumps those are.
 //!
 //! Sleeps go through the pump, not past it: a WAIT parks on [`EventPump::wait_until`],
@@ -39,24 +39,27 @@ pub(crate) enum Outcome {
 ///
 /// One pump carries everything — every grab feeds the same queue, which is what lets
 /// waits *block* instead of taking turns polling. `stop` is this profile's own
-/// emergency chord as it arrives in an event: its primary key plus the modifier
+/// emergency chords as they arrive in events: each a primary key plus the modifier
 /// classes that must be held with it (another profile's stop is not its business).
 /// `gate` is the profile's licence to keep going: when it turns false mid-sequence —
 /// focus left the program — the sequence stops rather than keep typing into whatever
 /// is focused now. `mods_down` answers "are any of these modifier classes physically
 /// held right now?" — the question a deferred tap waits on; without one (tests,
-/// headless seams) taps fire immediately.
+/// headless seams) taps fire immediately. `key_down` is the same question for one
+/// concrete key — the trigger's own primary, whose release is equally unseeable after
+/// the ungrab — for the tap that must re-press the very key the hand is still on.
 pub(super) struct Pumps<'a> {
     pub(super) triggers: &'a mut dyn EventPump,
-    pub(super) stop: Option<(Key, Mods)>,
+    pub(super) stop: &'a [(Key, Mods)],
     pub(super) gate: Option<&'a dyn Fn() -> bool>,
     pub(super) mods_down: Option<&'a dyn Fn(Mods) -> bool>,
+    pub(super) key_down: Option<&'a dyn Fn(Key) -> bool>,
 }
 
 impl Pumps<'_> {
-    /// Whether this event is the profile's own emergency chord.
+    /// Whether this event is one of the profile's own emergency chords.
     fn is_stop(&self, key: Key, mods: Mods) -> bool {
-        self.stop == Some((key, mods))
+        self.stop.contains(&(key, mods))
     }
 }
 
@@ -71,12 +74,14 @@ pub(crate) fn run(
 ) -> Result<Outcome> {
     let mut rng = Rng::new(seed);
     let mut held = Vec::new();
+    let stops = stop_chords(profile);
     let mut executor = Executor::new(profile, sink, clock, &mut rng, &mut held);
     let mut pumps = Pumps {
         triggers: pump,
-        stop: stop_chord(profile),
+        stop: &stops,
         gate: None,
         mods_down: None,
+        key_down: None,
     };
     let outcome = executor.event_loop(&mut pumps);
     // The exit invariant, on the error path too: nothing stays down because the run
@@ -86,14 +91,19 @@ pub(crate) fn run(
     outcome
 }
 
-/// A profile's emergency chord the way its event will arrive: primary plus held
-/// modifier classes.
-pub(super) fn stop_chord(profile: &Profile) -> Option<(Key, Mods)> {
-    let chord = profile.emergency_stop.as_deref()?;
-    Some((
-        super::format::primary_key(chord)?,
-        super::format::chord_mods(chord),
-    ))
+/// A profile's emergency chords the way their events will arrive: primary plus held
+/// modifier classes, one entry per alternative spelling.
+pub(super) fn stop_chords(profile: &Profile) -> Vec<(Key, Mods)> {
+    profile
+        .emergency_stop
+        .iter()
+        .filter_map(|chord| {
+            Some((
+                super::format::primary_key(chord)?,
+                super::format::chord_mods(chord),
+            ))
+        })
+        .collect()
 }
 
 /// Releases a ledger in reverse — the exit invariant, callable by any loop owner. A
@@ -191,13 +201,45 @@ impl<'a> Executor<'a> {
             if let Some(bind) = bind_of(self.profile, key, event.mods) {
                 match &bind.action {
                     Action::Mirror(targets) => {
-                        let targets = targets.clone();
+                        let mut targets = targets.clone();
                         let tap = bind.tap;
                         // Modifiers the trigger holds but the target does not name
                         // would recolour the injected keys (a held shift turns `]`
-                        // into `}`), so such a tap waits for the hand to leave them.
+                        // into `}`), so such a tap waits for the hand to leave them
+                        // and then synthesizes the whole target itself.
                         let held = super::format::chord_mods(&bind.trigger);
-                        if !super::format::target_mods(&targets).covers(held) {
+                        if super::format::target_mods(&targets).covers(held) {
+                            // A target that re-presses the trigger's own key cannot
+                            // fire while the hand is still on it: the grab consumed a
+                            // *press*, so the key is physically down, and a synthetic
+                            // down for an already-down key makes no fresh edge for
+                            // anyone (field bug: `ctrl w -> ctrl shift w` closed no
+                            // terminal tab). Wait for the key to lift first.
+                            if targets.contains(&Holdable::Key(key)) {
+                                match self.await_key_release(key, pumps)? {
+                                    Heard::Nothing => {}
+                                    Heard::StopBind | Heard::GateLost => return Ok(None),
+                                    Heard::Emergency => {
+                                        return Ok(Some(Outcome::EmergencyStop));
+                                    }
+                                }
+                            }
+                            // Firing under the hand: classes the hand STILL supplies
+                            // are not injected — our own down+up would end with a
+                            // synthetic release that wipes the held state (logically
+                            // up, physically down), and every following press of the
+                            // chord would arrive modifier-less and miss the grab.
+                            // Classes let go of during the wait are ours to press
+                            // after all; without a probe the original hold is assumed.
+                            let hand_supplies = |class: Mods| {
+                                held.covers(class) && pumps.mods_down.is_none_or(|down| down(class))
+                            };
+                            targets.retain(|target| match target {
+                                Holdable::Key(target_key) => Mods::of_key(*target_key)
+                                    .is_none_or(|class| !hand_supplies(class)),
+                                Holdable::Button(_) => true,
+                            });
+                        } else {
                             match self.await_mods_release(held, pumps)? {
                                 Heard::Nothing => {}
                                 Heard::StopBind | Heard::GateLost => return Ok(None),
@@ -456,17 +498,33 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Parks until none of `held`'s modifier classes is physically down, pumping all
-    /// the while: the emergency chord still stops everything, a closed gate abandons
-    /// the tap, and re-presses of the still-held trigger (X auto-repeat) are
-    /// swallowed so one press queues one tap. Without a probe the wait is a no-op —
-    /// better to fire recoloured than to never fire.
+    /// Parks until none of `held`'s modifier classes is physically down. Without a
+    /// probe the wait is a no-op — better to fire recoloured than to never fire.
     fn await_mods_release(&mut self, held: Mods, pumps: &mut Pumps<'_>) -> Result<Heard> {
         let Some(mods_down) = pumps.mods_down else {
             return Ok(Heard::Nothing);
         };
+        self.await_lift(&|| !mods_down(held), pumps)
+    }
+
+    /// Parks until `key` is physically up — the wait a tap owes when its target
+    /// re-presses the trigger's own key. Without a probe it fires immediately:
+    /// better a swallowed edge than a tap that never comes.
+    fn await_key_release(&mut self, key: Key, pumps: &mut Pumps<'_>) -> Result<Heard> {
+        let Some(key_down) = pumps.key_down else {
+            return Ok(Heard::Nothing);
+        };
+        self.await_lift(&|| !key_down(key), pumps)
+    }
+
+    /// The parked-tap loop both waits share: polls `lifted`, pumping all the while —
+    /// the emergency chord still stops everything, a closed gate abandons the tap,
+    /// and re-presses of the still-held trigger (X auto-repeat) are swallowed so one
+    /// press queues one tap. (A poll, not a wait on events: after the ungrab the
+    /// hand's releases are routed elsewhere and can never arrive here.)
+    fn await_lift(&mut self, lifted: &dyn Fn() -> bool, pumps: &mut Pumps<'_>) -> Result<Heard> {
         loop {
-            if !mods_down(held) {
+            if lifted() {
                 return Ok(Heard::Nothing);
             }
             if let Some(gate) = pumps.gate
@@ -485,7 +543,7 @@ impl<'a> Executor<'a> {
                     {
                         return Ok(Heard::Emergency);
                     }
-                    tracing::debug!("input while waiting out held modifiers ignored");
+                    tracing::debug!("input while a tap waits for the hand ignored");
                 }
                 Wake::Deadline => {}
                 Wake::Interrupted => {
@@ -613,7 +671,7 @@ mod tests {
     use super::*;
     use crate::runtime::ScriptedPump;
     use sequencer_core::emit::EmitAction;
-    use sequencer_core::input::{InputEvent, Key};
+    use sequencer_core::input::{Button, InputEvent, Key};
     use sequencer_core::testutil::VirtualClock;
     use sequencer_core::time::Timestamp;
     use sequencer_input::MockInjector;
@@ -658,15 +716,15 @@ mod tests {
         let actions = run_events(
             "[binds.\"rshift >\"]\nbind = \"shift ]\"",
             // The grab delivers the chord as its primary key + the held classes.
+            // The user's own shift supplies the target's shift: re-injecting it
+            // would end with a synthetic release that wipes the held state.
             vec![press_with(Key::Period, Mods::of_chord(&[Key::RightShift]))],
         );
         assert_eq!(
             actions,
             vec![
-                EmitAction::KeyDown(Key::LeftShift),
                 EmitAction::KeyDown(Key::RightBracket),
                 EmitAction::KeyUp(Key::RightBracket),
-                EmitAction::KeyUp(Key::LeftShift),
             ]
         );
     }
@@ -804,6 +862,341 @@ mod tests {
         );
     }
 
+    /// The inverse of contamination: the target names MORE modifiers than the trigger
+    /// holds. The extra one (shift) is synthesized; the held one (ctrl) is the hand's
+    /// own and must NOT be — a synthetic ctrl-release would strand the user's held
+    /// ctrl logically-up, and the next press of the chord would miss the grab.
+    /// (Field bug: `ctrl w -> ctrl shift w` worked once, then went dead until ctrl
+    /// was re-pressed.)
+    #[test]
+    fn a_held_modifier_is_supplied_by_the_hand_not_reinjected() {
+        let actions = run_events(
+            "[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"",
+            vec![press_with(Key::W, Mods::of_chord(&[Key::LeftCtrl]))],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftShift),
+                EmitAction::KeyDown(Key::W),
+                EmitAction::KeyUp(Key::W),
+                EmitAction::KeyUp(Key::LeftShift),
+            ],
+            "shift is the delta and gets synthesized; ctrl is held and must not be: {actions:?}"
+        );
+    }
+
+    /// The template promises `ctrl w -> ctrl shift w` "keeps firing on every press" —
+    /// but the grab fires while the hand's W is still physically down, and a
+    /// synthesized down for an already-down key is swallowed by the server, so a tap
+    /// fired immediately delivers shift with no W edge inside it. The tap must wait
+    /// for the hand's W to lift, exactly as a contaminated mirror waits out held
+    /// modifiers. (Field bug: with `[binds."ctrl w"] bind = "Ctrl Shift W"` running,
+    /// ctrl+w closed no terminal tab while a physical ctrl+shift+w did.)
+    #[test]
+    fn a_mirror_that_represses_its_own_trigger_key_waits_for_the_key_to_lift() {
+        let profile =
+            super::super::parse("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"").expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut rng = Rng::new(0);
+        let mut held = Vec::new();
+        let ctrl = Mods::of_chord(&[Key::LeftCtrl]);
+
+        // The hand holds W for three polls, then lifts it; ctrl stays down throughout
+        // (covered by the target, so it is the hand's to supply either way).
+        let asks = std::cell::Cell::new(0_u32);
+        let key_down = |key: Key| {
+            assert_eq!(key, Key::W, "the wait watches the trigger's own primary");
+            asks.set(asks.get() + 1);
+            asks.get() <= 3
+        };
+        let mods_down = |_: Mods| true; // ctrl never lifts
+        // Inert releases keep the pump alive between polls — an exhausted pump reads
+        // as "no more input can come" and would rightly fire the tap at once.
+        let mut pump = ScriptedPump::new(vec![
+            release(Key::A),
+            release(Key::A),
+            release(Key::A),
+            release(Key::A),
+        ]);
+        let mut pumps = Pumps {
+            triggers: &mut pump,
+            stop: &[],
+            gate: None,
+            mods_down: Some(&mods_down),
+            key_down: Some(&key_down),
+        };
+        let mut executor = Executor::new(&profile, &mut sink, &clock, &mut rng, &mut held);
+        let event =
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::W)).with_mods(ctrl);
+        executor.handle(event, &mut pumps).expect("runs");
+
+        assert!(
+            asks.get() > 3,
+            "the tap must wait out the held W: fired while the key was still down, \
+             its W edge is swallowed and the bind does nothing"
+        );
+        let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftShift),
+                EmitAction::KeyDown(Key::W),
+                EmitAction::KeyUp(Key::W),
+                EmitAction::KeyUp(Key::LeftShift),
+            ],
+            "once W lifts: the delta (shift) plus a fresh W edge, ctrl still the hand's"
+        );
+    }
+
+    /// Under the hand, only the primary needs a fresh edge: when the target's
+    /// ordinary key differs from the trigger's, the delta fires immediately — shift
+    /// and t are both up, so their injected edges are real edges.
+    #[test]
+    fn a_delta_with_a_different_primary_fires_immediately() {
+        let actions = run_events(
+            "[binds.\"ctrl w\"]\nbind = \"ctrl shift t\"",
+            vec![press_with(Key::W, Mods::of_chord(&[Key::LeftCtrl]))],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftShift),
+                EmitAction::KeyDown(Key::T),
+                EmitAction::KeyUp(Key::T),
+                EmitAction::KeyUp(Key::LeftShift),
+            ]
+        );
+    }
+
+    /// A button target rides the held modifiers: the trigger's ctrl is the hand's and
+    /// is not re-injected, and a button has no modifier class to strip — ctrl+click.
+    #[test]
+    fn a_button_target_rides_the_held_modifiers() {
+        let actions = run_events(
+            "[binds.\"ctrl w\"]\nbind = \"ctrl mouse1\"",
+            vec![press_with(Key::W, Mods::of_chord(&[Key::LeftCtrl]))],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::ButtonDown(Button::Left),
+                EmitAction::ButtonUp(Button::Left)
+            ]
+        );
+    }
+
+    /// Without a probe (tests, headless seams) a contaminated mirror fires at once —
+    /// recoloured beats never. Pinned so the trade stays a decision, not an accident.
+    #[test]
+    fn without_a_probe_a_contaminated_mirror_fires_at_once() {
+        let actions = run_events(
+            "[binds.\"shift b\"]\nbind = \"p\"",
+            vec![press_with(Key::B, Mods::of_chord(&[Key::LeftShift]))],
+        );
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::P), EmitAction::KeyUp(Key::P)]
+        );
+    }
+
+    /// A press carrying a subset of the stop chord's classes is not the stop:
+    /// `ctrl e` must not end a run whose emergency is `ctrl shift e` — the stop's
+    /// twin of full-chord trigger matching, exact in both directions.
+    #[test]
+    fn a_subset_of_the_stop_chord_does_not_stop_the_run() {
+        let profile = super::super::parse(
+            "[defaults]\nemergency_stop = \"ctrl shift e\"\n[binds.F6]\nbind = \"p\"",
+        )
+        .expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut pump = ScriptedPump::new(vec![
+            press_with(Key::E, Mods::of_chord(&[Key::LeftCtrl])),
+            press(Key::F6),
+        ]);
+        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
+        assert_eq!(outcome, Outcome::SourceClosed, "ctrl e is not ctrl shift e");
+        let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::P), EmitAction::KeyUp(Key::P)],
+            "the run went on to serve the bind after the near-miss"
+        );
+    }
+
+    /// X auto-repeat re-presses the held trigger while a deferred tap is parked; the
+    /// repeats are swallowed, so one press still queues exactly one tap.
+    #[test]
+    fn auto_repeat_while_parked_queues_no_extra_tap() {
+        let profile = super::super::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut rng = Rng::new(0);
+        let mut held = Vec::new();
+        let shift = Mods::of_chord(&[Key::LeftShift]);
+
+        let asks = std::cell::Cell::new(0_u32);
+        let mods_down = |_: Mods| {
+            asks.set(asks.get() + 1);
+            asks.get() <= 3
+        };
+        // Every poll hears another auto-repeat of the trigger itself.
+        let mut pump = ScriptedPump::new(vec![
+            press_with(Key::B, shift),
+            press_with(Key::B, shift),
+            press_with(Key::B, shift),
+            press_with(Key::B, shift),
+        ]);
+        let mut pumps = Pumps {
+            triggers: &mut pump,
+            stop: &[],
+            gate: None,
+            mods_down: Some(&mods_down),
+            key_down: None,
+        };
+        let mut executor = Executor::new(&profile, &mut sink, &clock, &mut rng, &mut held);
+        let event =
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::B)).with_mods(shift);
+        executor.handle(event, &mut pumps).expect("runs");
+
+        let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::P), EmitAction::KeyUp(Key::P)],
+            "one press, one tap — the parked repeats must not queue more"
+        );
+    }
+
+    /// If the hand lets go of the whole chord during the wait, the tap synthesizes
+    /// what the hand no longer supplies — the full target, ctrl included.
+    #[test]
+    fn a_chord_released_during_the_wait_is_synthesized_whole() {
+        let profile =
+            super::super::parse("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"").expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut rng = Rng::new(0);
+        let mut held = Vec::new();
+
+        // One poll finds W still down; by the next, everything is up — ctrl included.
+        let asks = std::cell::Cell::new(0_u32);
+        let key_down = |_: Key| {
+            asks.set(asks.get() + 1);
+            asks.get() <= 1
+        };
+        let mods_down = |_: Mods| false;
+        let mut pump = ScriptedPump::new(vec![release(Key::A), release(Key::A)]);
+        let mut pumps = Pumps {
+            triggers: &mut pump,
+            stop: &[],
+            gate: None,
+            mods_down: Some(&mods_down),
+            key_down: Some(&key_down),
+        };
+        let mut executor = Executor::new(&profile, &mut sink, &clock, &mut rng, &mut held);
+        let event = InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::W))
+            .with_mods(Mods::of_chord(&[Key::LeftCtrl]));
+        executor.handle(event, &mut pumps).expect("runs");
+
+        let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftCtrl),
+                EmitAction::KeyDown(Key::LeftShift),
+                EmitAction::KeyDown(Key::W),
+                EmitAction::KeyUp(Key::W),
+                EmitAction::KeyUp(Key::LeftShift),
+                EmitAction::KeyUp(Key::LeftCtrl),
+            ],
+            "the hand supplies nothing anymore, so everything is injected"
+        );
+    }
+
+    /// `also` spellings are full binds: each trigger fires the same action.
+    #[test]
+    fn an_also_spelling_fires_the_same_action() {
+        let actions = run_events(
+            "[binds.F6]\nalso = [\"F7\"]\nbind = \"p\"",
+            vec![press(Key::F6), press(Key::F7)],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::P),
+                EmitAction::KeyUp(Key::P),
+                EmitAction::KeyDown(Key::P),
+                EmitAction::KeyUp(Key::P),
+            ]
+        );
+    }
+
+    /// Any spelling in an emergency_stop list ends the run.
+    #[test]
+    fn any_stop_alternative_ends_the_run() {
+        let profile = super::super::parse(
+            "[defaults]\nemergency_stop = [\"F8\", \"ctrl shift e\"]\n[binds.F6]\nbind = \"p\"",
+        )
+        .expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let mut pump = ScriptedPump::new(vec![press_with(
+            Key::E,
+            Mods::of_chord(&[Key::LeftCtrl, Key::LeftShift]),
+        )]);
+        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
+        assert_eq!(outcome, Outcome::EmergencyStop);
+    }
+
+    /// A parked tap still answers to the profile's emergency chord: the stop wins,
+    /// and the tap never fires.
+    #[test]
+    fn an_emergency_press_aborts_a_parked_tap() {
+        let profile = super::super::parse(
+            "[defaults]\nemergency_stop = \"ctrl shift e\"\n[binds.\"shift b\"]\nbind = \"p\"",
+        )
+        .expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut rng = Rng::new(0);
+        let mut held = Vec::new();
+        let shift = Mods::of_chord(&[Key::LeftShift]);
+
+        let mods_down = |_: Mods| true; // the hand never leaves the keys
+        let stops = stop_chords(&profile);
+        let mut pump = ScriptedPump::new(vec![press_with(
+            Key::E,
+            Mods::of_chord(&[Key::LeftCtrl, Key::LeftShift]),
+        )]);
+        let mut pumps = Pumps {
+            triggers: &mut pump,
+            stop: &stops,
+            gate: None,
+            mods_down: Some(&mods_down),
+            key_down: None,
+        };
+        let mut executor = Executor::new(&profile, &mut sink, &clock, &mut rng, &mut held);
+        let event =
+            InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::B)).with_mods(shift);
+        let outcome = executor.handle(event, &mut pumps).expect("runs");
+
+        assert!(
+            matches!(outcome, Some(Outcome::EmergencyStop)),
+            "the stop chord ends the run from inside the wait: {outcome:?}"
+        );
+        assert!(
+            watcher.recorded().is_empty(),
+            "the parked tap must never fire"
+        );
+    }
+
     /// The other half of full-chord matching: the primary alone, or with the wrong
     /// modifiers, is NOT the trigger — `ctrl w` must never pass for `ctrl shift w`.
     /// (Caught live: a `ctrl w` bind's press emergency-stopped a profile whose stop
@@ -852,9 +1245,10 @@ mod tests {
         ]);
         let mut pumps = Pumps {
             triggers: &mut pump,
-            stop: None,
+            stop: &[],
             gate: None,
             mods_down: Some(&mods_down),
+            key_down: None,
         };
         let mut executor = Executor::new(&profile, &mut sink, &clock, &mut rng, &mut held);
         let event =
@@ -927,9 +1321,10 @@ mod tests {
         let mut pump = ScriptedPump::new(vec![press(Key::F6)]);
         let mut pumps = Pumps {
             triggers: &mut pump,
-            stop: None,
+            stop: &[],
             gate: Some(&gate),
             mods_down: None,
+            key_down: None,
         };
         // First event starts the loop; it presses ctrl and parks on the 10s WAIT, where
         // the closed gate (set just before the wait re-checks) ends it.
