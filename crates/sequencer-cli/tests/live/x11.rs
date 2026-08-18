@@ -1,5 +1,5 @@
 //! The manager against a real X session: grabs, injection, full-chord routing,
-//! deferred taps, per-profile emergency stops, and signal handling. Keys are
+//! lifted taps, per-profile emergency stops, and signal handling. Keys are
 //! synthesized through our own XTEST sink — grabs intercept synthetic input exactly
 //! like physical input, so no external tool is needed. Every chord avoids `alt` (on
 //! some setups a synthesized alt never reaches the modifier state, seen in the
@@ -305,24 +305,32 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "the miss lists what IS applied: {out}"
     );
 
-    // The mirror's target (pause) does not name the trigger's ctrl+shift, so its tap
-    // must stay parked while the chord's modifiers are genuinely held — injecting
-    // early would recolour the target — and land once they lift. This is the live
-    // proof of the KeyProbe: misread state fires early (count grows while held) or
-    // never (count stays flat after release), and either fails here.
+    // The mirror's target (pause) does not name the trigger's ctrl+shift, so a plain
+    // injection would recolour it. The tap therefore fires IMMEDIATELY between a
+    // lift and a restore of the held modifiers — the live proof of the LiftedTap:
+    // a misread keymap lifts the wrong keys, a missing restore strands the chord
+    // (the second press would miss the grab), and a leftover park would fire again
+    // on release. Two presses under one hold, then a quiet release.
     let before = harness::inject_count(manager.log());
     press_keys(&CTRL_SHIFT);
     tap_chord(&[Key::F9]);
+    assert!(
+        injections_grow(manager.log(), before, 3),
+        "the tap fires at once, between lifted modifiers"
+    );
+    let after_first = settled_injections(manager.log());
+    tap_chord(&[Key::F9]);
+    assert!(
+        injections_grow(manager.log(), after_first, 3),
+        "a second press under the same hold fires too — the restore kept the grab alive"
+    );
+    let settled = settled_injections(manager.log());
+    release_keys(&CTRL_SHIFT);
     std::thread::sleep(Duration::from_millis(700));
     assert_eq!(
         harness::inject_count(manager.log()),
-        before,
-        "the tap stays parked while the trigger's modifiers are held"
-    );
-    release_keys(&CTRL_SHIFT);
-    assert!(
-        injections_grow(manager.log(), before, 3),
-        "the parked tap fires once the modifiers lift"
+        settled,
+        "releasing the modifiers fires nothing extra — no tap is parked anymore"
     );
 
     let before = settled_injections(manager.log());
@@ -369,7 +377,8 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     );
 
     // ctrl+F10 shares the emergency's primary key but not its modifiers: it must run
-    // its own bind — deferred until our injected ctrl lifts — and stop nothing.
+    // its own bind — fired between a lift and restore of our injected ctrl — and
+    // stop nothing.
     let before = settled_injections(manager.log());
     tap_chord(&[Key::LeftCtrl, Key::F10]);
     assert!(
@@ -381,26 +390,29 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "a trigger sharing the stop chord's primary key must not stop the profile"
     );
 
-    // A parked tap must still hear its profile's own stop chord: with ctrl+shift
-    // held, F9 parks a deferral, and F10 (completing the exact emergency chord,
-    // since ctrl+shift are already down) must stop p1 — and the parked tap must die
-    // with it rather than firing after.
+    // A lifted tap must not confuse the stop path: with ctrl+shift held, F9 fires
+    // its tap at once, and F10 — completing the exact emergency chord, since the
+    // restore left ctrl+shift down — must stop p1. Nothing may fire after the stop.
     let before = settled_injections(manager.log());
     press_keys(&CTRL_SHIFT);
     tap_chord(&[Key::F9]);
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        injections_grow(manager.log(), before, 3),
+        "the lifted tap fires under the held chord"
+    );
+    let settled = settled_injections(manager.log());
     tap_chord(&[Key::F10]);
     release_keys(&CTRL_SHIFT);
     assert!(
         harness::await_line(manager.log(), "emergency stop: p1.toml unapplied", 3),
-        "p1's chord stops p1 even while a tap is parked: {}",
+        "p1's chord stops p1 right after a lifted tap: {}",
         harness::read(manager.log())
     );
     std::thread::sleep(Duration::from_millis(800));
     assert_eq!(
         harness::inject_count(manager.log()),
-        before,
-        "the parked tap dies with its profile instead of firing after the stop"
+        settled,
+        "nothing fires after the stop"
     );
     assert!(
         !config.active().join("p1.toml").exists(),

@@ -38,6 +38,12 @@ fn format_is_idempotent_and_keeps_comments() {
         twice.contains("optional"),
         "the template's comments must survive formatting"
     );
+    // Position too, not just survival: a comment trailing a step keeps sharing that
+    // step's line through the real binary, exactly as the author placed it.
+    assert!(
+        twice.contains("\"b\",  # plain tap lasts"),
+        "a trailing comment must stay on its step's line: {twice}"
+    );
 }
 
 #[test]
@@ -49,9 +55,9 @@ fn every_broken_profile_is_refused_with_its_reason() {
             "[defaults]\nsuppress = false\n[binds.f9]\nbind = \"pause\"\n",
         ),
         (
-            "left/right-only trigger twins are one X grab",
+            "a stop chord may not blur into a bind's grab across sides",
             "are the same grab",
-            "[binds.\"shift f9\"]\nbind = \"pause\"\n[binds.\"rshift f9\"]\nbind = \"pause\"\n",
+            "[defaults]\nemergency_stop = \"rshift f9\"\n[binds.\"shift f9\"]\nbind = \"pause\"\n",
         ),
         (
             "a bare key and a chord over it cannot coexist",

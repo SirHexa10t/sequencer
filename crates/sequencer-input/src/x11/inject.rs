@@ -20,13 +20,16 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Window,
+    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _, KEY_PRESS_EVENT,
+    KEY_RELEASE_EVENT, Window,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-use sequencer_core::emit::{Emit, EmitAction, InputSink, SinkError};
-use sequencer_core::input::{Button, Key};
+use sequencer_core::emit::{Emit, EmitAction, Holdable, InputSink, SinkError};
+use sequencer_core::input::{Button, Key, Mods};
+use sequencer_core::time::Duration;
+use std::time::Duration as StdDuration;
 
 /// The offset from a Linux evdev code to the X keycode for the same physical key.
 pub(super) const EVDEV_TO_X_KEYCODE: u16 = 8;
@@ -194,6 +197,188 @@ impl InputSink for XTestSink {
         }
         let _ = self.conn.flush();
     }
+}
+
+/// A tap fired while the hand still holds modifiers the target does not name: the
+/// standing keys are lifted, the target tapped clean, and the hand's keys pressed
+/// back down — all real XTEST input on one connection, in one call.
+///
+/// This is the mechanism `xdotool key --clearmodifiers` has field-proven for years.
+/// An earlier version orchestrated the same steps from the executor, interleaved
+/// with other traffic, and recoloured intermittently; keeping the whole lift-tap-
+/// restore on one connection with a sync barrier after the lifts is the difference.
+///
+/// Two windows, each about one tap wide, are the price of firing immediately: a hand
+/// that releases inside one gets its modifier pressed back logically (one tap of the
+/// key clears it), and a trigger press landing inside arrives unmodified.
+#[derive(Debug)]
+pub struct LiftedTap {
+    conn: RustConnection,
+    root: Window,
+}
+
+/// Every modifier class, for walking a [`Mods`] set class by class.
+const CLASSES: [Mods; 5] = [Mods::SHIFT, Mods::CTRL, Mods::ALT, Mods::RALT, Mods::META];
+
+impl LiftedTap {
+    /// Connects and confirms XTEST, like [`XTestSink::open`]; `None` when there is
+    /// no server. Without one, contaminated taps fall back to recolourable injection.
+    #[must_use]
+    pub fn open() -> Option<Self> {
+        let (conn, screen) = x11rb::connect(None).ok()?;
+        conn.xtest_get_version(2, 2).ok()?.reply().ok()?;
+        let root = conn.setup().roots.get(screen)?.root;
+        Some(Self { conn, root })
+    }
+
+    /// Taps `targets` (down in order, up in reverse, `duration` between) with the
+    /// way cleared first: keys of `held` classes the target does not name are lifted,
+    /// and so is `lift_primary` when given — the trigger's own key, when the target
+    /// re-presses it, whose fresh edge is otherwise impossible. Lifted modifiers are
+    /// pressed back afterwards; a lifted ordinary key is not — its logical release
+    /// self-heals on the hand's real release, and pressing it back would fire a
+    /// second edge. Keys of classes the target names stay the hand's to supply.
+    ///
+    /// `false` when the server is unreachable or a key has no keycode — the caller
+    /// then falls back to plain injection.
+    #[must_use]
+    pub fn tap(
+        &self,
+        targets: &[Holdable],
+        held: Mods,
+        lift_primary: Option<Key>,
+        duration: Duration,
+    ) -> bool {
+        let wanted = targets
+            .iter()
+            .filter_map(|target| match target {
+                Holdable::Key(key) => Mods::of_key(*key),
+                Holdable::Button(_) => None,
+            })
+            .fold(Mods::NONE, Mods::and);
+        // One keymap read answers every "is it physically down" question at once.
+        let Some(keymap) = self.keymap() else {
+            return false;
+        };
+        let is_down = |key: Key| {
+            x_keycode(key)
+                .is_some_and(|code| keymap[usize::from(code / 8)] & (1 << (code % 8)) != 0)
+        };
+
+        let mut restored: Vec<u8> = Vec::new();
+        for class in CLASSES {
+            if held.covers(class) && !wanted.covers(class) {
+                for key in class.watch_keys() {
+                    if is_down(key)
+                        && let Some(code) = x_keycode(key)
+                    {
+                        restored.push(code);
+                    }
+                }
+            }
+        }
+        let mut lifts = restored.clone();
+        if let Some(primary) = lift_primary
+            && is_down(primary)
+        {
+            let Some(code) = x_keycode(primary) else {
+                return false;
+            };
+            lifts.push(code);
+        }
+
+        for &code in &lifts {
+            if !self.fake(KEY_RELEASE_EVENT, code) {
+                return false;
+            }
+        }
+        // The sync barrier: a round trip proves the server has processed every lift
+        // before a single tap event is generated behind it.
+        if !lifts.is_empty()
+            && self
+                .conn
+                .get_input_focus()
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_none()
+        {
+            return false;
+        }
+
+        // The tap itself, skipping keys of classes the hand supplies (held AND named
+        // by the target — those were not lifted).
+        let injected: Vec<(u8, bool)> = match collect_details(targets, held, wanted) {
+            Some(details) => details,
+            None => return false,
+        };
+        for &(detail, is_key) in &injected {
+            let event_type = if is_key {
+                KEY_PRESS_EVENT
+            } else {
+                BUTTON_PRESS_EVENT
+            };
+            if !self.fake(event_type, detail) {
+                return false;
+            }
+        }
+        spin_sleep::sleep(StdDuration::from_nanos(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        ));
+        for &(detail, is_key) in injected.iter().rev() {
+            let event_type = if is_key {
+                KEY_RELEASE_EVENT
+            } else {
+                BUTTON_RELEASE_EVENT
+            };
+            if !self.fake(event_type, detail) {
+                return false;
+            }
+        }
+
+        for &code in restored.iter().rev() {
+            if !self.fake(KEY_PRESS_EVENT, code) {
+                return false;
+            }
+        }
+        self.conn.flush().is_ok()
+    }
+
+    /// The server's 256-bit key-state bitmap, or `None` when it cannot be asked.
+    fn keymap(&self) -> Option<[u8; 32]> {
+        Some(self.conn.query_keymap().ok()?.reply().ok()?.keys)
+    }
+
+    /// One `XTestFakeInput`, flushed immediately — the same non-negotiable flush as
+    /// [`XTestSink::fake`], for the same stuck-key reason. Logged with the same
+    /// "XTEST inject" marker too, so `-v` (and the live suite's injection counter)
+    /// sees every synthetic event regardless of which path fired it.
+    fn fake(&self, event_type: u8, detail: u8) -> bool {
+        tracing::debug!(event_type, detail, "XTEST inject (lifted tap)");
+        self.conn
+            .xtest_fake_input(event_type, detail, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
+            .is_ok()
+            && self.conn.flush().is_ok()
+    }
+}
+
+/// The XTEST details for a tap's injected members: every target except keys of
+/// classes the hand supplies (`held` and `wanted` both cover them). `None` when a
+/// key has no keycode.
+fn collect_details(targets: &[Holdable], held: Mods, wanted: Mods) -> Option<Vec<(u8, bool)>> {
+    let mut details = Vec::with_capacity(targets.len());
+    for target in targets {
+        match target {
+            Holdable::Key(key) => {
+                let hand_supplies = Mods::of_key(*key)
+                    .is_some_and(|class| held.covers(class) && wanted.covers(class));
+                if !hand_supplies {
+                    details.push((x_keycode(*key)?, true));
+                }
+            }
+            Holdable::Button(button) => details.push((button_detail(*button), false)),
+        }
+    }
+    Some(details)
 }
 
 #[cfg(test)]

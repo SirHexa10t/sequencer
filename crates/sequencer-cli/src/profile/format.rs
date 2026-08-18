@@ -233,19 +233,17 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
         return Err(clash);
     }
     // Left and right shift/ctrl/meta share one X modifier bit, so `rshift >` and
-    // `shift >` are the SAME grab — the server cannot tell them apart, and the second
-    // would fail (or worse, silently shadow). Alt is the exception: right alt is AltGr,
-    // its own bit.
+    // `shift >` are the SAME grab. Side-variant spellings may coexist: the manager
+    // grabs the combination once and routes each press to the side physically held.
+    // (Identical spellings were already refused above as one trigger twice.) A stop
+    // chord, matched by folded classes alone, must stay unambiguous — it may not
+    // blur into any bind's grab. Alt is the exception to the folding: right alt is
+    // AltGr, its own bit.
     let mut grabs: BTreeMap<(Option<Key>, Mods), String> = BTreeMap::new();
     for bind in &binds {
         let signature = (primary_key(&bind.trigger), chord_mods(&bind.trigger));
         let label = format!("[binds.\"{}\"]", bind.trigger_text);
-        if let Some(previous) = grabs.insert(signature, label.clone()) {
-            return Err(format!(
-                "{previous} and {label} are the same grab: X cannot tell left from \
-                 right shift/ctrl/meta, so these triggers are one key combination twice"
-            ));
-        }
+        grabs.entry(signature).or_insert(label);
     }
     // The stop chords join the same grab space — the manager grabs them alongside
     // the triggers, and X cannot hold two grabs on one combination.
@@ -317,20 +315,20 @@ pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
         };
         let held = chord_mods(&bind.trigger);
         let wanted = target_mods(targets);
+        let target_represses_trigger = primary_key(&bind.trigger).is_some_and(|primary| {
+            targets
+                .iter()
+                .any(|target| matches!(target, Holdable::Key(key) if *key == primary))
+        });
         if !wanted.covers(held) {
             notes.push(format!(
-                "[binds.\"{}\"]: the held {held} would recolour the target, so this \
-                 tap fires only once {held} is released; a trigger without modifiers \
-                 is the straightforward alternative",
+                "[binds.\"{}\"]: the held {held} would recolour the tap, so it fires \
+                 with {held} lifted for an instant and pressed back — releasing or \
+                 pressing keys in that same instant can misfire once; a trigger \
+                 without modifiers is the straightforward alternative",
                 bind.trigger_text
             ));
-        } else if wanted == held
-            && primary_key(&bind.trigger).is_some_and(|primary| {
-                targets
-                    .iter()
-                    .any(|target| matches!(target, Holdable::Key(key) if *key == primary))
-            })
-        {
+        } else if wanted == held && target_represses_trigger {
             // Grabs hear injections like physical input, so a target that lands as
             // exactly this trigger fires the grab again — and again.
             notes.push(format!(
@@ -932,8 +930,8 @@ mod tests {
         let profile = parse_ok(text);
         assert_eq!(
             profile.binds.len(),
-            6,
-            "PgUp, PgDn, F6, F7, the chord and its `also` alias"
+            8,
+            "PgUp, PgDn, F2, F6, F7, the chord, its `also` alias and the parked mirror"
         );
         assert_eq!(profile.program, Some(vec!["*".to_owned()]));
         assert_eq!(profile.emergency_stop, vec![vec![Key::F8]]);
@@ -1091,13 +1089,18 @@ mod tests {
     }
 
     /// X folds left and right shift/ctrl/meta into one modifier bit, so two triggers
-    /// that differ only by side are one grab — refused with both names. Alt is the
-    /// exception: right alt is AltGr, its own bit.
+    /// that differ only by side are one grab — and they may COEXIST: each press is
+    /// routed to the side physically held. Spellings that fold to the same keys
+    /// (`shift` parses as the left key, like `lshift`) are still one trigger twice,
+    /// and alt stays the exception: right alt is AltGr, its own bit.
     #[test]
-    fn side_blind_duplicate_grabs_are_refused() {
+    fn side_variant_triggers_may_share_one_grab() {
+        let profile =
+            parse_ok("[binds.\"rshift >\"]\nbind = \"a\"\n\n[binds.\"shift >\"]\nbind = \"b\"");
+        assert_eq!(profile.binds.len(), 2, "both sides, two binds, one grab");
         let err =
-            parse_err("[binds.\"rshift >\"]\nbind = \"a\"\n\n[binds.\"shift >\"]\nbind = \"b\"");
-        assert!(err.contains("same grab"), "{err}");
+            parse_err("[binds.\"shift >\"]\nbind = \"a\"\n\n[binds.\"lshift >\"]\nbind = \"b\"");
+        assert!(err.contains("same trigger"), "{err}");
         parse_ok("[binds.\"alt i\"]\nbind = \"a\"\n\n[binds.\"ralt i\"]\nbind = \"b\"");
     }
 

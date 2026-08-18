@@ -18,11 +18,12 @@ bind = "["
 
 
 # playback halfing/doubling (no, youtube doesn't distinguish between SHIFTS, but I think it makes sense)
-# [binds."shift >"]
-# bind = "shift ]"
-# 
-# [binds."shift <"]
-# bind = "shift ["
+# Distinct from the above shift-bind pair. If you comment this out, both 'shift's would serve the above pair!
+[binds."shift >"]
+bind = "shift ]"
+
+[binds."shift <"]
+bind = "shift ["
 
 
 # fullscreen already uses 'f' for both

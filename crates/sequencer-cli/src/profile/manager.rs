@@ -80,11 +80,15 @@ struct Slot {
 }
 
 impl Slot {
-    /// Every bind's trigger, chords included — the grab layer takes them whole.
+    /// Every bind's trigger for the grab layer — one representative per folded grab:
+    /// side-variant spellings share a combination, and X will not hold the same grab
+    /// twice. Routing between the spellings happens at event time, by probe.
     fn triggers(&self) -> Vec<Vec<Key>> {
+        let mut seen = BTreeSet::new();
         self.profile
             .binds
             .iter()
+            .filter(|bind| seen.insert((primary_key(&bind.trigger), chord_mods(&bind.trigger))))
             .map(|bind| bind.trigger.clone())
             .collect()
     }
@@ -131,6 +135,9 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
     let mut focus: Option<FocusWatcher> = None;
     // One live connection for "is that key still down?" — the deferred-tap question.
     let probe = sequencer_input::KeyProbe::open();
+    // Contaminated mirrors tap between lifted modifiers — this owns that path;
+    // without it they fall back to plain (recolourable) injection.
+    let lifter = sequencer_input::LiftedTap::open();
     let mut passes: u32 = 0;
 
     writeln!(
@@ -184,6 +191,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
                     &mut pump,
                     &mut slots,
                     probe.as_ref(),
+                    lifter.as_ref(),
                     focus.as_ref(),
                 ) {
                     break Err(err);
@@ -233,6 +241,7 @@ fn dispatch(
     pump: &mut CapturePump<'_>,
     slots: &mut BTreeMap<String, Slot>,
     probe: Option<&sequencer_input::KeyProbe>,
+    lifter: Option<&sequencer_input::LiftedTap>,
     focus: Option<&FocusWatcher>,
 ) -> Result<()> {
     let (sequencer_core::input::EventKind::KeyDown(key)
@@ -277,6 +286,15 @@ fn dispatch(
     // Same server, single key: the wait a tap owes when its target re-presses the
     // trigger's own key.
     let key_down_fn = move |key: Key| probe.is_some_and(|probe| probe.any_down(&[key]));
+    // A tap whose trigger holds classes its target does not name fires between
+    // lifted modifiers: the standing keys come up, the tap lands clean, and the
+    // hand's keys go back down — one backend call on one connection.
+    let lift_fn = move |targets: &[Holdable],
+                        held: Mods,
+                        primary: Option<Key>,
+                        hold: sequencer_core::time::Duration| {
+        lifter.is_some_and(|lifter| lifter.tap(targets, held, primary, hold))
+    };
     let stops = slot.stop_chords();
     let mut pumps = run::Pumps {
         triggers: pump,
@@ -290,6 +308,7 @@ fn dispatch(
             .map(|_| &gate_fn as &dyn Fn() -> bool),
         mods_down: Some(&mods_down_fn as &dyn Fn(Mods) -> bool),
         key_down: Some(&key_down_fn as &dyn Fn(Key) -> bool),
+        lift: Some(&lift_fn as run::LiftTap<'_>),
     };
     let mut executor = run::Executor::new(&slot.profile, sink, clock, rng, &mut slot.held);
     let outcome = executor.handle(event, &mut pumps)?;

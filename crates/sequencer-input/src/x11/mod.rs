@@ -20,7 +20,7 @@ pub mod inject;
 
 pub use capture::{GrabCapture, GrabError, KeyProbe};
 pub use focus::FocusWatcher;
-pub use inject::XTestSink;
+pub use inject::{LiftedTap, XTestSink};
 
 /// Whether this really is an X11 session that both halves can use.
 ///
