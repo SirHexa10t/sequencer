@@ -65,6 +65,47 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
 
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
+        // Injections pass through grabs like real presses, and EVERY profile's grabs
+        // hear them — a feedback circle can span files. The whole future set is
+        // checked before anything links: this batch, plus what is already applied
+        // (minus the versions this batch replaces). The manager re-checks at load,
+        // for links made by hand.
+        let batch_names: Vec<String> = files.iter().map(|file| linked_name(file)).collect();
+        let mut already_applied: Vec<(String, Profile)> = Vec::new();
+        for (name, path) in state::scan_active()? {
+            if batch_names.contains(&name) {
+                continue;
+            }
+            // An unreadable or unparsable link is not running (the manager refused
+            // it too), so it is no part of the live graph.
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(profile) = parse(&text) else {
+                continue;
+            };
+            already_applied.push((name, profile));
+        }
+        let mut graph: Vec<(&str, &Profile)> = batch_names
+            .iter()
+            .map(String::as_str)
+            .zip(parsed.iter())
+            .collect();
+        graph.extend(
+            already_applied
+                .iter()
+                .map(|(name, profile)| (name.as_str(), profile)),
+        );
+        if let Some(circle) = format::trigger_cycle(&graph) {
+            return Err(Error::Profile {
+                path: "profile-apply".to_owned(),
+                detail: format!(
+                    "refused: these binds would trigger each other in a circle: {}",
+                    circle.join(" -> ")
+                ),
+            });
+        }
+
         let mut placed = Vec::with_capacity(parsed.len());
         for (file, profile) in files.iter().zip(&parsed) {
             placed.push((state::link_into_active(file)?, profile));
@@ -234,6 +275,20 @@ fn expand_profile_args(given: &[std::path::PathBuf]) -> Result<Vec<std::path::Pa
         files.append(&mut found);
     }
     Ok(files)
+}
+
+/// The name a file takes in the active set — the canonical file name, the same rule
+/// [`state`]'s linking uses, so batch entries can be matched against applied ones.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+fn linked_name(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .ok()
+        .and_then(|canonical| {
+            canonical
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Turns picker input into set names: numbers, names, or `all`.

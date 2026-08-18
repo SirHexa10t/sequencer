@@ -60,11 +60,6 @@ fn every_broken_profile_is_refused_with_its_reason() {
             "[defaults]\nemergency_stop = \"rshift f9\"\n[binds.\"shift f9\"]\nbind = \"pause\"\n",
         ),
         (
-            "a bare key and a chord over it cannot coexist",
-            "cannot both be triggers",
-            "[binds.f9]\nbind = \"pause\"\n[binds.\"ctrl f9\"]\nbind = \"pause\"\n",
-        ),
-        (
             "emergency_stop may not double as a trigger",
             "is also the trigger",
             "[defaults]\nemergency_stop = \"f9\"\n[binds.f9]\nbind = \"pause\"\n",
@@ -78,6 +73,11 @@ fn every_broken_profile_is_refused_with_its_reason() {
             "crossed RNG and LOOP blocks are refused",
             "the open block",
             "[binds.f9]\nseq = [\"RNG 50%\", \"LOOP 2\", \"GNR\", \"POOL\"]\n",
+        ),
+        (
+            "a circle of binds feeding each other is refused",
+            "circle",
+            "[binds.f1]\nbind = \"f2\"\n[binds.f2]\nbind = \"f1\"\n",
         ),
     ];
     let config = TempConfig::new();

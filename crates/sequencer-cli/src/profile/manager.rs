@@ -14,7 +14,7 @@ use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
-use super::format::{chord_mods, primary_key, program_applies};
+use super::format::{chord_mods, primary_key, program_applies, trigger_cycle};
 use super::state::{LockGuard, scan_active};
 use super::{Profile, parse, run};
 use crate::runtime::{CapturePump, EventPump, Wake};
@@ -572,6 +572,27 @@ fn reconcile_set(
         let stamp = super::state::link_stamp(name);
         match load(path) {
             Ok(profile) => {
+                // A newcomer that would close a trigger circle with the live set is
+                // refused like a parse failure. The apply command checks this too,
+                // but links made by hand never pass through it.
+                let circle = {
+                    let mut graph: Vec<(&str, &Profile)> = slots
+                        .iter()
+                        .map(|(slot_name, slot)| (slot_name.as_str(), &slot.profile))
+                        .collect();
+                    graph.push((name.as_str(), &profile));
+                    trigger_cycle(&graph)
+                };
+                if let Some(circle) = circle {
+                    writeln!(
+                        out,
+                        "profile refused: {name}: these binds would trigger each \
+                         other in a circle: {}",
+                        circle.join(" -> ")
+                    )?;
+                    failed.insert(name.clone(), stamp);
+                    continue;
+                }
                 let verb = if updated.contains(name) {
                     "profile updated"
                 } else {

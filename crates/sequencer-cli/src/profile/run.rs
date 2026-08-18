@@ -212,7 +212,10 @@ impl<'a> Executor<'a> {
                     Action::Mirror(targets) => {
                         let mut targets = targets.clone();
                         let tap = bind.tap;
-                        let held = super::format::chord_mods(&bind.trigger);
+                        // The event's own state IS the held truth — with exact
+                        // trigger matching it equals the spelling's classes, and the
+                        // event is the side that cannot lie.
+                        let held = event.mods;
                         let wanted = super::format::target_mods(&targets);
                         if wanted.covers(held) {
                             // A target that re-presses the trigger's own key cannot
@@ -1349,6 +1352,26 @@ mod tests {
             lifted.borrow().len(),
             1,
             "no twin, no side check: the lone spelling fires whichever shift is down"
+        );
+    }
+
+    /// A bare key and a chord over it are disjoint grabs, and the exact matcher
+    /// routes them: the bare press runs the bare bind, the decorated press runs the
+    /// chord's — nothing swallowed, nothing guessed.
+    #[test]
+    fn a_bare_key_and_its_chord_route_by_state() {
+        let actions = run_events(
+            "[binds.i]\nbind = \"a\"\n\n[binds.\"ctrl i\"]\nbind = \"b\"",
+            vec![press(Key::I), press_with(Key::I, Mods::CTRL)],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::A),
+                EmitAction::KeyUp(Key::A),
+                EmitAction::KeyDown(Key::B),
+                EmitAction::KeyUp(Key::B),
+            ]
         );
     }
 

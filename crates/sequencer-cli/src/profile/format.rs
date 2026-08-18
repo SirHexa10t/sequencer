@@ -227,11 +227,10 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
             ));
         }
     }
-    // A grab fires on one keycode; binding both `i` and `ctrl i` would leave which one
-    // the server delivers up to modifier luck. Refuse rather than roll dice.
-    if let Some(clash) = overlapping_trigger(&binds) {
-        return Err(clash);
-    }
+    // A bare key and a chord over it (`i` and `ctrl i`) are DISJOINT grabs: bindings
+    // name their modifier state exactly (lock permutations included), so the server
+    // arbitrates deterministically and both may coexist — the bare bind fires only
+    // on the bare press, and unbound variants pass through to the application.
     // Left and right shift/ctrl/meta share one X modifier bit, so `rshift >` and
     // `shift >` are the SAME grab. Side-variant spellings may coexist: the manager
     // grabs the combination once and routes each press to the side physically held.
@@ -257,11 +256,22 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
             ));
         }
     }
-    Ok(Profile {
+    let profile = Profile {
         binds,
         program,
         emergency_stop,
-    })
+    };
+    // Injections pass through grabs like real presses, so binds whose outputs
+    // trigger each other in a circle are a runaway machine with no hand on it —
+    // refused whole. (Circles can also span files; apply re-checks the whole set.)
+    if let Some(circle) = trigger_cycle(&[("", &profile)]) {
+        return Err(format!(
+            "these binds trigger each other in a circle: {} — a profile must not \
+             feed itself",
+            circle.join(" -> ")
+        ));
+    }
+    Ok(profile)
 }
 
 /// A chord the way a user would write it: the keys' display names, space-joined.
@@ -303,10 +313,9 @@ pub(crate) fn target_mods(targets: &[Holdable]) -> Mods {
 }
 
 /// Advisory notes for a profile that parses and validates fine but will surprise:
-/// a mirror whose trigger holds modifiers its target does not name cannot fire
-/// while the hand is still down — the held modifiers would recolour the injected
-/// keys (`]` under a held shift arrives as `}`) — so its tap is deferred until the
-/// trigger's modifiers are released.
+/// a mirror whose trigger holds modifiers its target does not name fires between a
+/// lift and restore of those modifiers, with the misfire windows that implies.
+/// (Self-triggering circles are not warnings — [`trigger_cycle`] refuses them.)
 pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
     let mut notes = Vec::new();
     for bind in &profile.binds {
@@ -315,11 +324,6 @@ pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
         };
         let held = chord_mods(&bind.trigger);
         let wanted = target_mods(targets);
-        let target_represses_trigger = primary_key(&bind.trigger).is_some_and(|primary| {
-            targets
-                .iter()
-                .any(|target| matches!(target, Holdable::Key(key) if *key == primary))
-        });
         if !wanted.covers(held) {
             notes.push(format!(
                 "[binds.\"{}\"]: the held {held} would recolour the tap, so it fires \
@@ -328,18 +332,182 @@ pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
                  without modifiers is the straightforward alternative",
                 bind.trigger_text
             ));
-        } else if wanted == held && target_represses_trigger {
-            // Grabs hear injections like physical input, so a target that lands as
-            // exactly this trigger fires the grab again — and again.
-            notes.push(format!(
-                "[binds.\"{}\"]: the target lands as exactly this trigger, so the \
-                 mirror re-triggers itself and loops until an emergency stop; \
-                 retarget it or change the trigger",
-                bind.trigger_text
-            ));
         }
     }
     notes
+}
+
+// ------------------------------------------------------------------ feedback loops
+
+/// A feedback circle among `profiles`' binds, if any exists — the labels walk the
+/// circle and close it on the repeated bind, `name::[binds."…"]` each (the bracketed
+/// bind alone when its profile has no name, as in the single-file parse).
+///
+/// Bind A points at bind B when an event A's execution is *guaranteed* to emit lands
+/// as B's exact trigger: grabs hear synthetic input like physical input, so an
+/// injected chord fires bindings like a pressed one. Guaranteed means the modifier
+/// state the bind itself creates ([`produced_events`]); the hand's transient hold is
+/// deliberately excluded — a loop that needs a finger on a key dies when the finger
+/// lifts, and only self-sustaining circles are worth refusing.
+///
+/// Three-colour depth-first search, iterative, `O(binds + edges)`.
+pub(crate) fn trigger_cycle(profiles: &[(&str, &Profile)]) -> Option<Vec<String>> {
+    let mut nodes: Vec<(&str, &Bind)> = Vec::new();
+    for (name, profile) in profiles {
+        for bind in &profile.binds {
+            nodes.push((name, bind));
+        }
+    }
+    // Trigger lookup: side-variant spellings share (primary, classes) and all of
+    // them count as hit — an injected chord reaches whichever the router picks.
+    let mut by_trigger: BTreeMap<(Key, Mods), Vec<usize>> = BTreeMap::new();
+    for (index, (_, bind)) in nodes.iter().enumerate() {
+        if let Some(primary) = primary_key(&bind.trigger) {
+            by_trigger
+                .entry((primary, chord_mods(&bind.trigger)))
+                .or_default()
+                .push(index);
+        }
+    }
+    let edges: Vec<Vec<usize>> = nodes
+        .iter()
+        .map(|(_, bind)| {
+            let mut out = Vec::new();
+            for event in produced_events(bind) {
+                if let Some(hits) = by_trigger.get(&event) {
+                    out.extend_from_slice(hits);
+                }
+            }
+            out
+        })
+        .collect();
+
+    let mut colour = vec![Colour::White; nodes.len()];
+    for start in 0..nodes.len() {
+        if colour[start] != Colour::White {
+            continue;
+        }
+        // (node, next out-edge to try); the stack IS the current path.
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        colour[start] = Colour::Grey;
+        while let Some(frame) = stack.last_mut() {
+            let node = frame.0;
+            let Some(&next) = edges[node].get(frame.1) else {
+                colour[node] = Colour::Black;
+                stack.pop();
+                continue;
+            };
+            frame.1 += 1;
+            match colour[next] {
+                Colour::White => {
+                    colour[next] = Colour::Grey;
+                    stack.push((next, 0));
+                }
+                // A grey node is on the current path: everything from its position
+                // to the top is the circle, closed by repeating it at the end.
+                Colour::Grey => {
+                    let from = stack
+                        .iter()
+                        .position(|&(on_path, _)| on_path == next)
+                        .unwrap_or(0);
+                    let mut labels: Vec<String> = stack[from..]
+                        .iter()
+                        .map(|&(index, _)| bind_label(nodes[index].0, nodes[index].1))
+                        .collect();
+                    labels.push(bind_label(nodes[next].0, nodes[next].1));
+                    return Some(labels);
+                }
+                Colour::Black => {}
+            }
+        }
+    }
+    None
+}
+
+/// Depth-first search bookkeeping: unvisited, on the current path, finished.
+#[derive(Clone, Copy, PartialEq)]
+enum Colour {
+    White,
+    Grey,
+    Black,
+}
+
+/// `p1.toml::[binds."ctrl w"]`, or the bracketed bind alone for a nameless profile.
+fn bind_label(profile: &str, bind: &Bind) -> String {
+    if profile.is_empty() {
+        format!("[binds.\"{}\"]", bind.trigger_text)
+    } else {
+        format!("{profile}::[binds.\"{}\"]", bind.trigger_text)
+    }
+}
+
+/// The trigger presses a bind's execution is guaranteed to land: every non-modifier
+/// key it puts down, with the modifier classes its OWN execution has down at that
+/// instant — hand-supplied covered classes and listed modifiers for a mirror,
+/// PRESS-tracked state for a sequence. Maybe-executed steps (RNG blocks) count as
+/// executed: for refusing circles, "could emit" is the honest reading.
+fn produced_events(bind: &Bind) -> Vec<(Key, Mods)> {
+    let held = chord_mods(&bind.trigger);
+    let mut events = Vec::new();
+    match &bind.action {
+        Action::Mirror(targets) => {
+            // Covered classes stay physically supplied; contaminating ones are
+            // lifted for the tap — either way, held ∩ wanted is what surrounds it.
+            let baseline = held.intersect(target_mods(targets));
+            chord_events(targets, baseline, &mut events);
+        }
+        Action::Seq(steps) => {
+            let mut pressed: Vec<Key> = Vec::new();
+            for step in steps {
+                match step {
+                    Step::Tap(targets) => {
+                        chord_events(targets, Mods::of_chord(&pressed), &mut events);
+                    }
+                    Step::Hold(targets) => {
+                        for target in targets {
+                            let Holdable::Key(key) = target else {
+                                continue;
+                            };
+                            if Mods::of_key(*key).is_some() {
+                                pressed.push(*key);
+                            } else {
+                                events.push((*key, Mods::of_chord(&pressed)));
+                            }
+                        }
+                    }
+                    Step::Release(targets) => {
+                        for target in targets {
+                            if let Holdable::Key(key) = target
+                                && Mods::of_key(*key).is_some()
+                                && let Some(at) = pressed.iter().rposition(|down| down == key)
+                            {
+                                pressed.remove(at);
+                            }
+                        }
+                    }
+                    Step::Wait(_) | Step::Rng(_) | Step::RngEnd | Step::Loop(_) | Step::LoopEnd => {
+                    }
+                }
+            }
+        }
+    }
+    events
+}
+
+/// One chord going down in listed order: modifiers accumulate as they pass, and
+/// every ordinary key lands as an event under whatever is accumulated so far.
+/// Buttons are skipped — no key grab can name one.
+fn chord_events(targets: &[Holdable], baseline: Mods, events: &mut Vec<(Key, Mods)>) {
+    let mut running = baseline;
+    for target in targets {
+        let Holdable::Key(key) = target else {
+            continue;
+        };
+        match Mods::of_key(*key) {
+            Some(class) => running = running.and(class),
+            None => events.push((*key, running)),
+        }
+    }
 }
 
 /// Whether a key only decorates a chord rather than anchoring it.
@@ -355,31 +523,6 @@ pub(super) fn is_modifier(key: Key) -> bool {
             | Key::LeftMeta
             | Key::RightMeta
     )
-}
-
-/// The first pair of triggers where one is a bare key another chord decorates.
-///
-/// `i` and `ctrl i` grab the same keycode, so the X server's choice between them would
-/// depend on modifier state it does not promise to arbitrate. One profile may hold both
-/// `ctrl i` and `alt i` (distinct masks) — only the *bare* key clashes.
-fn overlapping_trigger(binds: &[Bind]) -> Option<String> {
-    let bare: Vec<&Bind> = binds
-        .iter()
-        .filter(|bind| bind.trigger.len() == 1)
-        .collect();
-    for chord in binds.iter().filter(|bind| bind.trigger.len() > 1) {
-        for plain in &bare {
-            let key = plain.trigger[0];
-            if chord.trigger.contains(&key) {
-                return Some(format!(
-                    "[binds.\"{}\"] and [binds.\"{}\"] both grab the same key; a chord and \
-                     the bare key it contains cannot both be triggers",
-                    plain.trigger_text, chord.trigger_text
-                ));
-            }
-        }
-    }
-    None
 }
 
 /// Checks the `program` patterns: optional, but never empty — an empty pattern (or an
@@ -898,20 +1041,117 @@ mod tests {
     }
 
     /// Injections pass through grabs like physical input, so a target that lands as
-    /// exactly its own trigger is an infinite loop — worth a red flag, in both the
-    /// bare spelling and the chord spelling.
+    /// exactly its own trigger is a circle of one — refused, in the bare spelling
+    /// and the chord spelling alike. (This used to be a warning; a machine that
+    /// loops until an emergency stop is not something to merely mention.)
     #[test]
-    fn a_self_retriggering_mirror_is_warned_about() {
+    fn a_self_retriggering_mirror_is_refused() {
         for looping in [
             "[binds.a]\nbind = \"a\"",
             "[binds.\"ctrl a\"]\nbind = \"ctrl a\"",
         ] {
-            let profile = parse(looping).expect("parses");
-            let notes = warnings(&profile);
-            assert_eq!(notes.len(), 1, "for {looping}: {notes:?}");
-            assert!(notes[0].contains("re-triggers itself"), "{}", notes[0]);
+            let err = parse(looping).expect_err("a circle of one must refuse");
+            assert!(err.contains("circle"), "for {looping}: {err}");
         }
     }
+
+    /// Two binds feeding each other are refused with the whole circle spelled out,
+    /// in order and closed; three-long circles resolve the same way, and a chain
+    /// WITHOUT a loop stays legal.
+    #[test]
+    fn circular_binds_are_refused_with_the_path_named() {
+        let err = parse_err("[binds.f1]\nbind = \"f2\"\n\n[binds.f2]\nbind = \"f1\"");
+        assert!(err.contains("circle"), "{err}");
+        assert!(
+            err.contains("[binds.\"f1\"]") && err.contains("[binds.\"f2\"]"),
+            "both binds are named: {err}"
+        );
+        assert!(err.contains(" -> "), "the path is a walk: {err}");
+
+        let err = parse_err(
+            "[binds.f1]\nbind = \"f2\"\n\n[binds.f2]\nbind = \"f3\"\n\n[binds.f3]\nbind = \"f1\"",
+        );
+        for name in ["f1", "f2", "f3"] {
+            assert!(err.contains(&format!("[binds.\"{name}\"]")), "{err}");
+        }
+
+        // The same chain minus the closing edge is a legal cascade.
+        parse_ok("[binds.f1]\nbind = \"f2\"\n\n[binds.f2]\nbind = \"f3\"");
+    }
+
+    /// The modifier model is exact, both ways: a target whose classes differ from a
+    /// trigger's is no edge (the browser profile's `ctrl w -> ctrl shift w` must
+    /// stay legal), while a chord target that lands as another bind's exact chord
+    /// closes a circle even across the lifted path.
+    #[test]
+    fn circle_detection_matches_modifier_classes_exactly() {
+        // (W, ctrl|shift) is not the (W, ctrl) trigger: no self-edge.
+        parse_ok("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"");
+        // ...but a second bind ON (W, ctrl|shift) whose target lands back on
+        // (W, ctrl) closes the loop.
+        let err = parse_err(
+            "[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"\n\n\
+             [binds.\"ctrl shift w\"]\nbind = \"ctrl w\"",
+        );
+        assert!(err.contains("circle"), "{err}");
+
+        // A lifted mirror emits under the target's own classes: `rshift >` lands a
+        // bare `]`, the `]` bind lands `rshift .` — a two-step circle through both
+        // mechanisms.
+        let err =
+            parse_err("[binds.\"rshift >\"]\nbind = \"]\"\n\n[binds.\"]\"]\nbind = \"rshift .\"");
+        assert!(err.contains("circle"), "{err}");
+    }
+
+    /// A sequence's PRESS-tracked modifiers colour its taps — that state is the
+    /// bind's own doing and counts — while the hand's transient chord does not: a
+    /// loop that needs a finger dies when the finger lifts.
+    #[test]
+    fn sequence_state_counts_but_the_hands_hold_does_not() {
+        // PRESS ctrl makes the `w` land as ctrl+w, feeding the ctrl-w bind, whose
+        // target is this very trigger: refused.
+        let err = parse_err(
+            "[binds.f1]\nseq = [\"PRESS ctrl\", \"w\", \"RELEASE ctrl\"]\n\n\
+             [binds.\"ctrl w\"]\nbind = \"f1\"",
+        );
+        assert!(err.contains("circle"), "{err}");
+        assert!(err.contains("[binds.\"f1\"]"), "{err}");
+
+        // Without the PRESS the `w` lands bare — no edge, no circle.
+        parse_ok("[binds.f1]\nseq = [\"w\"]\n\n[binds.\"ctrl w\"]\nbind = \"f1\"");
+
+        // The trigger's own held ctrl is the hand's, not the sequence's: excluded.
+        parse_ok("[binds.\"ctrl i\"]\nseq = [\"w\"]\n\n[binds.\"ctrl w\"]\nbind = \"q\"");
+    }
+
+    /// Circles reach through `also` aliases too — every spelling is a full bind.
+    #[test]
+    fn circles_through_also_spellings_are_refused() {
+        let err =
+            parse_err("[binds.f1]\nalso = [\"f3\"]\nbind = \"f2\"\n\n[binds.f2]\nbind = \"f3\"");
+        assert!(err.contains("circle"), "{err}");
+        assert!(
+            err.contains("[binds.\"f3\"]"),
+            "the alias is on the path: {err}"
+        );
+    }
+
+    /// Across profiles the labels carry the file names — the manager and the apply
+    /// command check the union, since every profile's grabs hear every injection.
+    #[test]
+    fn cross_profile_circles_name_their_profiles() {
+        let opener = parse_ok("[binds.f1]\nbind = \"f2\"");
+        let closer = parse_ok("[binds.f2]\nbind = \"f1\"");
+        let circle = trigger_cycle(&[("ping.toml", &opener), ("pong.toml", &closer)])
+            .expect("the union closes a circle");
+        let text = circle.join(" -> ");
+        assert!(text.contains("ping.toml::[binds.\"f1\"]"), "{text}");
+        assert!(text.contains("pong.toml::[binds.\"f2\"]"), "{text}");
+        // Each alone is legal — the circle only exists in the union.
+        assert!(trigger_cycle(&[("ping.toml", &opener)]).is_none());
+        assert!(trigger_cycle(&[("pong.toml", &closer)]).is_none());
+    }
+
     use sequencer_core::input::Button;
 
     fn parse_ok(text: &str) -> Profile {
@@ -1057,13 +1297,20 @@ mod tests {
         assert!(err.contains("not modifiers alone"), "{err}");
     }
 
-    /// `i` and `ctrl i` grab the same keycode, so one profile may not hold both — but
-    /// two different chords over that key are fine, since their masks differ.
+    /// `i` and `ctrl i` are DISJOINT grabs — bindings name their modifier state
+    /// exactly — so a bare key and chords over it all coexist; the server routes
+    /// each press by its exact state.
     #[test]
-    fn a_bare_key_and_a_chord_over_it_cannot_coexist() {
-        let err = parse_err("[binds.i]\nseq = [\"a\"]\n\n[binds.\"ctrl i\"]\nseq = [\"b\"]");
-        assert!(err.contains("same key"), "{err}");
-        parse_ok("[binds.\"ctrl i\"]\nseq = [\"a\"]\n\n[binds.\"alt i\"]\nseq = [\"b\"]");
+    fn a_bare_key_and_chords_over_it_coexist() {
+        let profile = parse_ok(
+            "[binds.i]\nseq = [\"a\"]\n\n[binds.\"ctrl i\"]\nseq = [\"b\"]\n\n\
+             [binds.\"alt i\"]\nseq = [\"c\"]",
+        );
+        assert_eq!(
+            profile.binds.len(),
+            3,
+            "bare, ctrl and alt: three grabs, one key"
+        );
     }
 
     /// An emergency stop may be a chord now; it still cannot double as a trigger.

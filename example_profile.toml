@@ -16,6 +16,11 @@
 #                     Each spelling is its own bind — re-pressing the one that started a
 #                     loop is what stops that loop.
 #
+# Injected keys pass through grabs like real presses, so one bind's output may trigger
+# another (a deliberate cascade) — but a closed CIRCLE of binds feeding each other is a
+# runaway machine, and is refused at load with the whole circle named. This holds across
+# files too: profiles applied together must not feed each other in a loop.
+#
 # Case never matters, anywhere: "a" == "A", "Ctrl" == "ctrl" == "CTRL"
 # PRESS / RELEASE / WAIT keywords are equally legal lowercase.
 # A capitalized letter is a name, not a shifted key — to send an actual capital A, write the chord "shift a".
@@ -29,7 +34,9 @@ tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key
                  # 8ms is also the BUILT-IN default: omit `tap` (here and per-bind) and this is the value used.
 gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise.
                  # 30ms is also the BUILT-IN default: omit `gap` and sequences still pace themselves.
-suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to
+suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to.
+                 # consumption is exact: only the combination you bound — an unbound variant (shift+<key> when
+                 # only <key> is bound) reaches the application untouched.
 program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
                  # several alternatives are a list, applied while ANY matches: program = ["*mpv*", "*celluloid*"]
                  # run `sequencer detect-key` to print the name of programs you enter focus on. `focus: <name>`.
@@ -124,8 +131,9 @@ seq = [
 
 # A trigger can be a chord too, spelled exactly like a step: modifiers plus ONE ordinary
 # key, which is the shape a key grab can express. TOML wants quotes around a section key
-# containing a space. Note a bare key and a chord over it cannot both be triggers — `i`
-# and `ctrl i` grab the same keycode — but `ctrl i` and `alt i` are fine.
+# containing a space. A bare key and chords over it may all be triggers — `i`, `ctrl i`
+# and `alt i` are three distinct grabs; each press routes by its exact modifier state,
+# and a variant nothing binds passes through to the application.
 # Left/right spellings of one combo may coexist ("shift >" and "rshift >"): they share one
 # grab, and each press routes to the side you are physically holding. A lone spelling
 # catches both sides.

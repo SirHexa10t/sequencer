@@ -88,6 +88,12 @@ impl Mods {
         Self(self.0 | other.0)
     }
 
+    /// The classes in both sets.
+    #[must_use]
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     /// Whether every class in `other` is also in `self`.
     #[must_use]
     pub const fn covers(self, other: Self) -> bool {
@@ -243,6 +249,8 @@ mod tests {
         assert!(chord.covers(Mods::of_chord(&[Key::RightCtrl])));
         assert!(!Mods::of_chord(&[Key::RightCtrl]).covers(chord));
         assert!(Mods::of_chord(&[Key::W]).is_none());
+        assert_eq!(chord.intersect(Mods::CTRL), Mods::CTRL);
+        assert!(Mods::SHIFT.intersect(Mods::CTRL).is_none());
     }
 
     /// Display speaks the same canonical names a chord is written in.

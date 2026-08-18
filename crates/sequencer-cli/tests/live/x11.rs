@@ -201,11 +201,14 @@ impl Drop for Manager {
 
 // The second bind shares its primary key with the profile's own emergency chord on
 // purpose: pressing ctrl+F10 must run the bind, and only ctrl+shift+F10 may stop the
-// profile — the field bug where any grab on a stop chord's primary stopped it.
+// profile — the field bug where any grab on a stop chord's primary stopped it. The
+// bare F9 bind coexists with the ctrl+shift+F9 chord: exact masks, disjoint grabs.
 const MIRROR: &str = "\
 [defaults]
 suppress = true
 emergency_stop = \"ctrl shift f10\"
+[binds.f9]
+bind = \"pause\"
 [binds.\"ctrl shift f9\"]
 bind = \"pause\"
 [binds.\"ctrl f10\"]
@@ -221,6 +224,15 @@ emergency_stop = \"ctrl shift f11\"
 [binds.\"ctrl shift f6\"]
 seq = [\"PRESS pause\", \"WAIT 50ms\", \"RELEASE pause\", \"WAIT 200ms\"]
 loop = \"inf\"
+";
+
+// Forms a circle with LOOPER across FILES: the looper PRESSes pause (this trigger),
+// and this target is the looper's own trigger chord. Legal alone; refused together.
+const CYCLER: &str = "\
+[defaults]
+suppress = true
+[binds.pause]
+bind = \"ctrl shift f6\"
 ";
 
 // The gated profile's trigger is deliberately never grabbed (its program never has
@@ -262,7 +274,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     let mut manager = Manager::start(&config, &[&p1]);
     let text = harness::read(manager.log());
     assert!(
-        text.contains("applied: ") && text.contains("(3 binds)"),
+        text.contains("applied: ") && text.contains("(4 binds)"),
         "{text}"
     );
     assert!(
@@ -284,6 +296,15 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "an X11 run never mentions sudo"
     );
 
+    // A bare key and a chord over it are disjoint exact grabs now: bare F9 fires its
+    // own bind here, while ctrl+shift+F9 (exercised below) routes to the chord's.
+    let before = harness::inject_count(manager.log());
+    tap_chord(&[Key::F9]);
+    assert!(
+        injections_grow(manager.log(), before, 3),
+        "the bare F9 bind fires on a bare press"
+    );
+
     let p2_arg = p2.to_str().expect("utf-8 temp path");
     let (status, out) = harness::run(&config, &["profile-apply", p2_arg]);
     assert!(status.success(), "second apply failed: {out}");
@@ -296,6 +317,26 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         harness::await_line(manager.log(), "profile applied: p2.toml", 3),
         "the manager picks the new link up: {}",
         harness::read(manager.log())
+    );
+
+    // Injections pass through grabs, so a feedback circle can span PROFILES: p4's
+    // pause bind would be fed by p2's looper and would feed it back. Refused by the
+    // apply command before anything links — the live set stays untouched.
+    let p4 = config.profile("p4.toml", CYCLER);
+    let p4_arg = p4.to_str().expect("utf-8 temp path");
+    let (status, out) = harness::run(&config, &["profile-apply", p4_arg]);
+    assert!(
+        !status.success(),
+        "a cross-profile circle must refuse: {out}"
+    );
+    assert!(out.contains("circle"), "{out}");
+    assert!(
+        out.contains("p2.toml::") && out.contains("p4.toml::"),
+        "the message names both profiles: {out}"
+    );
+    assert!(
+        !config.active().join("p4.toml").exists(),
+        "nothing was linked"
     );
 
     let (status, out) = harness::run(&config, &["profile-unapply", "zzz-not-there"]);
@@ -365,7 +406,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "the re-apply repeats the stop hint: {out}"
     );
     assert!(
-        harness::await_line(manager.log(), "profile updated: p1.toml (3 binds)", 3),
+        harness::await_line(manager.log(), "profile updated: p1.toml (4 binds)", 3),
         "the manager reloads the replaced link: {}",
         harness::read(manager.log())
     );
