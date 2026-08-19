@@ -1,65 +1,74 @@
-# sequencer binds profile — the format reference, as a working example.
-# Every feature appears here at least once, with the reasoning next to it.
-#
-#
-# binding is one [binds.<trigger>] section pressing exactly ONE of:
-#
-#   bind = "<key>"    A remap: each press of the trigger taps the target once — a key, or
-#                     a chord spelled like any step (bind = "shift ]"). Holding the trigger
-#                     repeats it (the keyboard's own auto-repeat), so PgUp held keeps
-#                     stepping the volume.
-#   seq  = [ ... ]    A sequence, fired once each time the trigger is pressed.
-#
-# and optionally, next to either:
-#
-#   also = [ ... ]    Extra triggers for the same action, each spelled like any trigger.
-#                     Each spelling is its own bind — re-pressing the one that started a
-#                     loop is what stops that loop.
-#
-# Injected keys pass through grabs like real presses, so one bind's output may trigger
-# another (a deliberate cascade) — but a closed CIRCLE of binds feeding each other is a
-# runaway machine, and is refused at load with the whole circle named. This holds across
-# files too: profiles applied together must not feed each other in a loop.
-#
-# Case never matters, anywhere: "a" == "A", "Ctrl" == "ctrl" == "CTRL"
-# PRESS / RELEASE / WAIT keywords are equally legal lowercase.
-# A capitalized letter is a name, not a shifted key — to send an actual capital A, write the chord "shift a".
-# The same rule for every shifted char: `{` names the `[` key and `!` names the `1` key — it's the
-# same physical key, and writing it never implies shift. To send the symbol itself, chord it: "shift [".
-# Within a multi-character name, `-` and `_` are interchangeable and optional: "volume-up" == "volume_up" == "volumeup".
+# sequencer binds profile — the format reference; every feature appears once.
 
+#### SYNTAX / SAFEGUARDS ####
+# * Cascades (one bind's output triggering another) are ALLOWED
+#   * a closed CIRCLE of binds feeding each other is REFUSED at load, across files too.
+# * Char-case doesn't matter; "a" == "A", "Ctrl" == "CTRL" == "ctrl"
+#   * Spacers ('-', '_', '') are interchangeable; "volume-up" == "volume_up" == "volumeup"
+# * Inputs are considered by keys; "{" == "[", "!" == "1"
+#   * To output a literal "!", the syntax is "shift 1" (same as "shift !")
+# * Command-names (below) are LEGAL in lower-case
+
+
+#### HELPERS ####
+
+# `sequencer detect-key`            # names every key, detects key-input and prints its name, detects and prints focused-program's name.
+# `sequencer profile-check <FILE>`  # Validity-check for your `.toml` profile-file.
+#   `sequencer profile-check --format <FILE>`  # Checks AND tidies-up your file
+
+
+#### FIELDS ####
 
 [defaults]
-tap = "8ms"      # global: duration of a 'tap', between key-down (press) and key-up (release).
-                 # 8ms is also the BUILT-IN default: omit `tap` (here and per-bind) and this is the value used.
-gap = "30ms"     # global: pause between consecutive steps, where no explicit WAIT says otherwise.
-                 # 30ms is also the BUILT-IN default: omit `gap` and sequences still pace themselves.
-suppress = true  # true (default): Bound keys are consumed, the application never sees the trigger itself, only what it was bound to.
-                 # consumption is exact: only the combination you bound — an unbound variant (shift+<key> when
-                 # only <key> is bound) reaches the application untouched.
-program = "*"    # optional: apply only while the focused program matches (case-insensitive, `*` wildcards). "*" or absent = always apply.
-                 # several alternatives are a list, applied while ANY matches: program = ["*mpv*", "*celluloid*"]
-                 # precedence: while a program-gated profile is focused, its binds ECLIPSE colliding binds of
-                 # global profiles, bind by bind — the rest of the global profile stays live, and the eclipsed
-                 # binds resume the moment focus moves on.
-                 # run `sequencer detect-key` to print the name of programs you enter focus on. `focus: <name>`.
-emergency_stop = "F8"  # optional: pressing this unapplies THIS profile gracefully — everything it still pressed is released.
-                       # per-profile, not global (Ctrl+C on the manager stops every profile); may be a chord ("ctrl alt q")
-                       # or a list of alternatives (["F8", "ctrl alt q"]) — any one of them stops this profile.
-                       # chords fire on the EXACT combination: "ctrl alt q" does not fire on "ctrl q", nor the other way around.
-                       # a bind whose trigger holds modifiers its target doesn't name fires with those modifiers
-                       # LIFTED for an instant and pressed back (a held shift would otherwise recolour the target:
-                       # "]" would arrive as "}"). Immediate and repeatable; the only cost is a tap-wide window in
-                       # which releasing or pressing keys can misfire once.
-                       # modifiers the trigger DOES hold are never re-injected: your own held ctrl supplies the
-                       # target's ctrl, so "ctrl w" -> "ctrl shift w" keeps firing on every press while ctrl stays down
-                       # (each tap lands as W lifts — a fresh W press cannot be synthesized while your W is still down).
+tap = "8ms"      # (default) optional overwrite: how long a tap holds the key down
+gap = "30ms"     # (default) optional overwrite: the pause between steps, unless an explicit WAIT is specified;
+suppress = true  # (default) optional overwrite: bind-activation consumes input-keys 
+                 #   (on exact modifier-keys ; binding "<key>" means "shift <key>" presses pass through)
+program = "*"    # optional: profile applies only while the focused program matches (otherwise: global/whole-system)
+                 #   `*`: program-name wildcard  ;  `["*mpv*", "*celluloid*"]`: a list of program-names to apply-on
+                 #   A profile that activates on a focused program ECLIPSES global profiles' binds, when the binds (inputs) are the same
+                 #   Run `sequencer detect-key` and focus (click on) your targeted program(s), to discover their name.
+emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile, releasing all of its own binds.
+                       #   To stop all profiles: SIGTERM (Ctrl+C) on the manager's process.
+                       #   Supports alternatives' list, like `program` field. Chords fire on the EXACT combination.
 
 
-# ------------------------------------------------------------------- edge mirrors
+#### BIND-FIELDS ####
 
-# The classic remap. Press PgUp and the volume keeps rising, exactly as if the keyboard
-# had a volume key in that position.
+#   bind = "<key or chord>"   remap: register alternative tap/press in your system
+#                               limited to 'tap' only, in some problematic use-case ("edge-cases" below)
+#   also = [ ... ]            (optional) extra bind-alias, making more than 1 bind act the same
+#   seq  = [ ... ]            sequence of steps (commands below), runs when bind is triggered
+#                               (re-pressing the spelling that started a sequence stops it).
+#   loop = <n> / "inf"        (optional, seq only) repeats the whole sequence
+#                               re-triggering the bind stops it early and releases its held-down keys
+#   tap  = "<duration>"       (optional) per-bind override of the [defaults] timings
+#   gap  = "<duration>"       (optional) per-bind override of the [defaults] timings
+
+
+#### SEQUENCE-COMMANDS ####
+
+#   "<key> [key ...]"         tap key/chord: key is pressed, held for `tap`-long wait, released. 
+#                             (pressed in listed order, released in reverse)
+#   PRESS <key> [key ...]     hold key/chord down across the following steps, until `RELEASE` (or bind termination)
+#   RELEASE <key> [key ...]   let go of `PRESS`'d key
+#   WAIT <duration>           pause, replacing the `gap` waiting period between prior and next commands
+#                               <duration>s are: <num><unit>, units: ms/s/m/h, decimals fine ("WAIT 1.5s")
+#                               only zero may drop the unit: "WAIT 0" = no pause (practically `gap`-erasure)
+#   RNG <chance>              the enclosed steps run by chance: 0.25 == 25% == 1/4
+#   GNR                       close the script-block of last `RNG`
+#   LOOP <n>                  the enclosed steps repeat n times
+#   POOL                      close the script-block of last `LOOP`
+#
+# * Blocks (of `RNG`/`LOOP`) may nest
+#   * ILLEGAL colsures (ending external block before nested block) are checked, and prevented from running
+
+
+#### EXAMPLES ####
+
+# ================================= edge mirrors =================================
+
+# The classic remap: PgUp becomes a volume key, auto-repeat included.
 [binds.PgUp]
 bind = "volume-up"
 
@@ -67,30 +76,16 @@ bind = "volume-up"
 bind = "volume-down"
 
 
-# --------------------------------------------------------------------- sequences
-
-# Steps come in four shapes:
-#
-#   "<key> [key ...]"        Tap: down, wait `tap`, up. Several names in one string are
-#                            a chord — down in listed order, up in reverse.
-#   "PRESS <key> [key ...]"   Press and keep down until a later RELEASE.
-#   "RELEASE <key> [key ...]"
-#   "WAIT <duration>"        Pause here, REPLACING the default gap at this seam only.
-#
-# A WAIT duration is <num><unit>, unit one of ms / s / m / h, decimals allowed:
-# "WAIT 200ms", "WAIT 1.5s", "WAIT 2m", "WAIT 1h".
-# Zero alone may drop the unit ("0ms" == "0h"), and only zero — "WAIT 5" is an error.
-# That makes "WAIT 0" the idiom for NO pause at one seam, and `gap = "0"` for none
-# anywhere in a bind; the rule presses wherever a duration appears, `tap` included.
+# ================================= plain sequence =================================
 
 # A combo, with per-bind timing overrides.
 [binds.F2]
-tap = "50ms"    # when game polls slowly, linger for the key to register
+tap = "50ms"    # when a game polls slowly, linger for the key to register
 gap = "100ms"
 seq = [
-    # CounterStrike 1.6 buy Kevlar+helmet  (comments like these are allowed)
-    "b",    # plain tap lasts the specified amount of time
-    "8",    # tapped after a pause 
+    # CounterStrike 1.6 buy Kevlar+helmet  (comments like these are allowed in-script)
+    "b",    # plain tap, that lasts `tap` time
+    "8",
     "2",
     # buy defuse-kit(CT)
     "b",
@@ -99,69 +94,64 @@ seq = [
 ]
 
 
-# A combo, with chords and varying waiting time
+# ================================= tricky sequence =================================
+
+# A combo with chords, a held modifier and a custom pause.
 [binds.F6]
 gap = "50ms"
 seq = [
     "shift",           # a plain tap
     "PRESS ctrl",      # ctrl stays down across the next steps
     "space d",         # a chord: space and d together
-    "WAIT 200ms",      # explicit pause - OVERWRITES the 50ms gap here
+    "WAIT 200ms",      # explicit pause - REPLACES this spot's specific 50ms gap
     "w p",
     "RELEASE ctrl",
 ]
 
-# `loop` repeats the sequence per press: a count, or "inf" until stopped. Pressing the
-# trigger again stops it early, releasing anything the sequence still pressed.
-# RNG opens a chance block and GNR closes it (its `fi`): the block runs with the given
-# chance, spelled 0.25, 25% or 1/4 alike. LOOP opens a repeat block and POOL closes it:
-# "LOOP 3" runs the enclosed steps three times. The two block kinds nest freely but
-# close inside each other, and what a LOOP iteration PRESSes it must RELEASE before
-# its POOL — a leaked hold would stack up an extra press every pass.
+
+# ================================= perpetual sequence =================================
+
+# An endless farm: chance and repeat blocks inside an "inf" sequence.
 [binds.F7]
 loop = "inf"
 seq = [
     "e",
-    "RNG 25%",         # chance: a quarter of iterations do the following
+    "RNG 25%",         # a quarter of iterations do this
         "WAIT 300ms",
-    "GNR",             # Shell-styled block; end of last "RNG" command (you can nest)
+    "GNR",
     "LOOP 2",          # repeat the enclosed steps twice
         "q",
         "WAIT 100ms",
-    "POOL",            # end of (last) LOOP
+    "POOL",
     "WAIT 1s",
 ]
 
-# A trigger can be a chord too, spelled exactly like a step: modifiers plus ONE ordinary
-# key, which is the shape a key grab can express. TOML wants quotes around a section key
-# containing a space. A bare key and chords over it may all be triggers — `i`, `ctrl i`
-# and `alt i` are three distinct grabs; each press routes by its exact modifier state,
-# and a variant nothing binds passes through to the application.
-# Left/right spellings of one combo may coexist ("shift >" and "rshift >"): they share one
-# grab, and each press routes to the side you are physically holding. A lone spelling
-# catches both sides.
+
+# ================================= chord/multi-input =================================
+
+# Chord trigger: modifiers + ONE ordinary key.
+# Modifiers matter: `i`, `ctrl i` and `alt i` all coexist as different binds, not triggering together
 [binds."ctrl i"]
-also = ["alt i"]   # extra spellings of the trigger; fine here because their grabs differ
+also = ["alt i"]   # an extra alias of this bind-trigger (either this or the main trigger needed to fire)
 seq = [
     "Ctrl d",
     "Enter",
     "Ctrl w",
 ]
 
-# Problematic use-case; user presses a modifier-key (shift), and asks for an emit without it
-# In this example, the "]" would transform into "shift ]" (i.e.: '}') due to the user pressing shift
-# The solution: your shift is lifted for the tap's instant and pressed straight back (the
-#  xdotool --clearmodifiers mechanism). Immediate and repeatable; the tradeoff is that such a
-#  bind can only be a 'tap' — no accurate "holding" of output is possible.
-[binds."rshift >"]
-bind = "]"          # taps (only; no holding) as a plain "]" even while your shift stays down (lifted around the tap)
 
-# --------------------------------------------------------------------- key names
-#
-# For the full list of valid key names — the keyboard plus the media, mouse, wheel and
-# controller sets — run: `sequencer detect-key`. It draws the layout, lists every set,
-# and prints the name of any key you press.
-#
-# To check a file without applying it (and optionally tidy it in place, comments kept):
-#   sequencer profile-check my-binds.toml
-#   sequencer profile-check --format my-binds.toml
+# ================================= edge-cases =================================
+
+# The shift you hold would recolour "]" into "}", so:
+# Shift is released when bind is triggered, then pressed again after bind fires.
+# Instant and repeatable, but locks this kind of bind into `tap`s (no held-output).
+[binds."rshift >"]
+bind = "]"
+
+
+# Left/right spellings ("shift >" vs "rshift >") coexist - program uses ONE grab for both
+# REMOVING (or commenting this out) would make the previous bind the owner of both `shift`s, triggering it on either
+[binds."shift >"]
+bind = "shift }"
+
+
