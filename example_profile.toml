@@ -61,7 +61,7 @@ emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile
 #   POOL                      close the script-block of last `LOOP`
 #
 # * Blocks (of `RNG`/`LOOP`) may nest
-#   * ILLEGAL colsures (ending external block before nested block) are checked, and prevented from running
+#   * ILLEGAL closures (ending external block before nested block) are checked, and prevented from running
 
 
 #### EXAMPLES ####

@@ -6,7 +6,9 @@ members = ["crates/*"]
 default-members = ["crates/sequencer-cli"]
 
 [workspace.package]
-version = "0.1.0"
+# 0.x: the X11 half is done properly; other display stacks (Wayland, and the reserved
+# windows/macos feature names) are the road to 1.0.
+version = "0.5.0"
 edition = "2024"
 # Let-chains (`if ... && let ...`) are used, and those need 1.88.
 rust-version = "1.88"
@@ -17,8 +19,8 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/SirHexa10t/sequencer"
 
 [workspace.dependencies]
-sequencer-core = { version = "0.1.0", path = "crates/sequencer-core" }
-sequencer-input = { version = "0.1.0", path = "crates/sequencer-input", default-features = false }
+sequencer-core = { version = "0.5.0", path = "crates/sequencer-core" }
+sequencer-input = { version = "0.5.0", path = "crates/sequencer-input", default-features = false }
 
 thiserror = { version = "2", default-features = false }
 clap = { version = "4", default-features = false }

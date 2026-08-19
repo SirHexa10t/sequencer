@@ -1170,8 +1170,8 @@ mod tests {
         let profile = parse_ok(text);
         assert_eq!(
             profile.binds.len(),
-            8,
-            "PgUp, PgDn, F2, F6, F7, the chord, its `also` alias and the parked mirror"
+            9,
+            "PgUp, PgDn, F2, F6, F7, the chord, its `also` alias and the shift pair"
         );
         assert_eq!(profile.program, Some(vec!["*".to_owned()]));
         assert_eq!(profile.emergency_stop, vec![vec![Key::F8]]);

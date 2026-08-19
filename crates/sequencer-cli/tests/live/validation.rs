@@ -41,7 +41,7 @@ fn format_is_idempotent_and_keeps_comments() {
     // Position too, not just survival: a comment trailing a step keeps sharing that
     // step's line through the real binary, exactly as the author placed it.
     assert!(
-        twice.contains("\"b\",  # plain tap lasts"),
+        twice.contains("\"b\",  # plain tap"),
         "a trailing comment must stay on its step's line: {twice}"
     );
 }

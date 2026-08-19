@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "sequencer-cli"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "sequencer-core"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "sequencer-input"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "evdev",
  "sequencer-core",
