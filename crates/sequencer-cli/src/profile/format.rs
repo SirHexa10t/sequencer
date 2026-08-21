@@ -314,11 +314,36 @@ pub(crate) fn target_mods(targets: &[Holdable]) -> Mods {
 
 /// Advisory notes for a profile that parses and validates fine but will surprise:
 /// a mirror whose trigger holds modifiers its target does not name fires between a
-/// lift and restore of those modifiers, with the misfire windows that implies.
-/// (Self-triggering circles are not warnings — [`trigger_cycle`] refuses them.)
+/// lift and restore of those modifiers, with the misfire windows that implies; and
+/// lock keys anywhere in a bind toggle server-wide state that no grab intercepts
+/// and no teardown restores. (Self-triggering circles are not warnings —
+/// [`trigger_cycle`] refuses them.)
 pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
+    const LOCKS: [Key; 3] = [Key::CapsLock, Key::NumLock, Key::ScrollLock];
+
     let mut notes = Vec::new();
     for bind in &profile.binds {
+        let pressed: Vec<Key> = bind
+            .trigger
+            .iter()
+            .copied()
+            .chain(action_keys(bind))
+            .collect();
+        let locks: Vec<String> = LOCKS
+            .iter()
+            .filter(|lock| pressed.contains(lock))
+            .map(ToString::to_string)
+            .collect();
+        if !locks.is_empty() {
+            notes.push(format!(
+                "[binds.\"{}\"]: {} toggles a system-wide lock on every press — a grab \
+                 does not intercept the toggle and unapplying does not undo it, so the \
+                 layout or shift state it leaves behind outlives the run; a non-lock \
+                 key is the safe trigger",
+                bind.trigger_text,
+                locks.join(" and ")
+            ));
+        }
         let Action::Mirror(targets) = &bind.action else {
             continue;
         };
@@ -335,6 +360,33 @@ pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
         }
     }
     notes
+}
+
+/// Every key a bind's action can press, kind-blind — for advisory scans.
+fn action_keys(bind: &Bind) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut take = |targets: &[Holdable]| {
+        for target in targets {
+            if let Holdable::Key(key) = target {
+                keys.push(*key);
+            }
+        }
+    };
+    match &bind.action {
+        Action::Mirror(targets) => take(targets),
+        Action::Seq(steps) => {
+            for step in steps {
+                match step {
+                    Step::Tap(targets) | Step::Hold(targets) | Step::Release(targets) => {
+                        take(targets);
+                    }
+                    Step::Wait(_) | Step::Rng(_) | Step::RngEnd | Step::Loop(_) | Step::LoopEnd => {
+                    }
+                }
+            }
+        }
+    }
+    keys
 }
 
 // ------------------------------------------------------------------ feedback loops
@@ -1034,6 +1086,46 @@ mod tests {
             "[binds.b]\nbind = \"p\"",
             "[binds.\"ctrl b\"]\nseq = [\"p\"]",
             "[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"",
+        ] {
+            let profile = parse(quiet).expect("parses");
+            assert_eq!(warnings(&profile), Vec::<String>::new(), "for {quiet}");
+        }
+    }
+
+    /// Locks draw an advisory wherever they appear in a bind — as a trigger, as a
+    /// mirror target, or buried in a sequence step — because the state they flip is
+    /// the server's, not this program's: the grab does not intercept the toggle and
+    /// unapplying cannot undo it. Ordinary keys of every kind stay quiet.
+    #[test]
+    fn a_lock_key_anywhere_in_a_bind_draws_a_warning() {
+        for locked in [
+            "[binds.capslock]\nseq = [\"a\"]",
+            "[binds.\"shift capslock\"]\nseq = [\"a\"]",
+            "[binds.F9]\nbind = \"numlock\"",
+            "[binds.F9]\nseq = [\"a\", \"PRESS scrolllock\", \"RELEASE scrolllock\"]",
+        ] {
+            let profile = parse(locked).expect("parses");
+            let notes = warnings(&profile);
+            assert_eq!(notes.len(), 1, "for {locked}: {notes:?}");
+            assert!(
+                notes[0].contains("system-wide lock") && notes[0].contains("outlives the run"),
+                "the note names the reach and the persistence: {}",
+                notes[0]
+            );
+        }
+
+        let both = parse("[binds.capslock]\nbind = \"numlock\"").expect("parses");
+        let notes = warnings(&both);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("capslock and numlock"),
+            "one note per bind, naming every lock it presses: {}",
+            notes[0]
+        );
+
+        for quiet in [
+            "[binds.F9]\nbind = \"pause\"",
+            "[binds.\"ctrl b\"]\nseq = [\"PRESS shift\", \"a\", \"RELEASE shift\"]",
         ] {
             let profile = parse(quiet).expect("parses");
             assert_eq!(warnings(&profile), Vec::<String>::new(), "for {quiet}");

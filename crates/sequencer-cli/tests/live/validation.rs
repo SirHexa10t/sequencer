@@ -93,6 +93,26 @@ fn every_broken_profile_is_refused_with_its_reason() {
     }
 }
 
+/// Advisories are said out loud and still succeed: a lock key in a bind leaves state
+/// behind that no teardown can undo, which is worth a warning — but the profile is
+/// legal, and `profile-check` runs in editor hooks, so the exit code must stay clean.
+#[test]
+fn a_lock_key_is_warned_about_and_still_accepted() {
+    let config = TempConfig::new();
+    let file = config.profile("locky.toml", "[binds.\"shift capslock\"]\nseq = [\"a\"]\n");
+    let file_arg = file.to_str().expect("utf-8 temp path");
+
+    let (status, out) = run(&config, &["profile-check", file_arg]);
+    assert!(
+        status.success(),
+        "a lock key is legal, not a refusal: {out}"
+    );
+    assert!(
+        out.contains("warning") && out.contains("capslock") && out.contains("outlives the run"),
+        "the warning must name the key and why it matters: {out}"
+    );
+}
+
 #[test]
 fn a_directory_argument_loads_every_toml_inside() {
     let config = TempConfig::new();

@@ -48,13 +48,23 @@ toml_edit = { workspace = true, optional = true, features = ["parse", "display"]
 # Only the feature-free surface is used: `flag` for the interrupt latch, `low_level`
 # for dying by the caught signal.
 signal-hook = { workspace = true, optional = true }
-nix = { workspace = true, optional = true, features = ["user", "term", "poll", "signal", "process"] }
+# `fs` is for `flock`: the manager lock is an advisory lock the kernel releases when
+# the process dies, however it dies — the only liveness test a PID cannot fake.
+nix = { workspace = true, optional = true, features = [
+    "user",
+    "term",
+    "poll",
+    "signal",
+    "process",
+    "fs",
+] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
-# The live suite sends real SIGINT to the manager it spawns.
-nix = { workspace = true, features = ["signal"] }
+# The live suite sends real SIGINT to the manager it spawns, and checks that a quit
+# manager's advisory lock is free (`fs`).
+nix = { workspace = true, features = ["signal", "fs"] }
 
 [[bin]]
 name = "sequencer"

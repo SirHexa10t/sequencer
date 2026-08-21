@@ -5,8 +5,13 @@
 #   * a closed CIRCLE of binds feeding each other is REFUSED at load, across files too.
 # * Char-case doesn't matter; "a" == "A", "Ctrl" == "CTRL" == "ctrl"
 #   * Spacers ('-', '_', '') are interchangeable; "volume-up" == "volume_up" == "volumeup"
-# * Inputs are considered by keys; "{" == "[", "!" == "1"
+# * Keys are PHYSICAL positions, not characters; "{" == "[", "!" == "1"
 #   * To output a literal "!", the syntax is "shift 1" (same as "shift !")
+#   * Ignoring language in input; "t" and "א" are the same, and your "ctrl s" would trigger even if you press ctrl+ы on RU keyboard
+#     * NOT supporting spcification of non-EN chars in binds! Define them through English-only.
+# * LOCK keys (capslock/numlock/scrolllock) are legal, but discouraged - `profile-check` warns on them
+#   * their toggle is system-wide, no grab intercepts it, and it OUTLIVES the profile
+#   * capslock is a common keyboard-language switch; a bind on it can leave you on another language
 # * Command-names (below) are LEGAL in lower-case
 
 

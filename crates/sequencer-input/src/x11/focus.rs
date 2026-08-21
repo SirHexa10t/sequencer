@@ -44,13 +44,12 @@ impl FocusWatcher {
         })
     }
 
-    /// The class of the focused program, or `None` when nothing readable has focus.
+    /// Which window has focus, or `None` when nothing readable does.
     ///
-    /// `None` covers every failure alike — no active window, a window that vanished
-    /// between the two reads, a window with no `WM_CLASS` — because the caller's answer
-    /// is the same for all of them: report nothing, keep the last known name.
+    /// The *identity* rather than the name, for the question a name cannot answer: is
+    /// this still the same window it was? Two windows of one program share a class.
     #[must_use]
-    pub fn focused_class(&self) -> Option<String> {
+    pub fn focused_window(&self) -> Option<Window> {
         let active = self
             .conn
             .get_property(false, self.root, self.active_window, AtomEnum::WINDOW, 0, 1)
@@ -58,9 +57,17 @@ impl FocusWatcher {
             .reply()
             .ok()?;
         let window = active.value32()?.next()?;
-        if window == 0 {
-            return None;
-        }
+        (window != 0).then_some(window)
+    }
+
+    /// The class of the focused program, or `None` when nothing readable has focus.
+    ///
+    /// `None` covers every failure alike — no active window, a window that vanished
+    /// between the two reads, a window with no `WM_CLASS` — because the caller's answer
+    /// is the same for all of them: report nothing, keep the last known name.
+    #[must_use]
+    pub fn focused_class(&self) -> Option<String> {
+        let window = self.focused_window()?;
         let class = self
             .conn
             .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)

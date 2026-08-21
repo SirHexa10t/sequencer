@@ -67,6 +67,14 @@ const MAINTENANCE_NANOS: u64 = 50_000_000;
 /// The directory is rescanned every this many maintenance passes (~200ms) —
 /// apply/unapply is a human-speed act.
 const SCAN_EVERY: u32 = 4;
+/// How many consecutive scans must find nothing before the manager stops.
+///
+/// Two, not one. Re-applying a profile replaces its link, and although that
+/// replacement is atomic (`state::place_link` renames rather than unlink-and-relink),
+/// any other momentary gap — a profile moved by hand, an editor's save dance over a
+/// real file in the set — would otherwise read as "everything was unapplied" and stop
+/// the manager for good. One extra scan costs 200ms on a genuine last unapply.
+const EMPTY_SCANS_TO_STOP: u32 = 2;
 
 /// One applied profile and its runtime state.
 struct Slot {
@@ -165,7 +173,7 @@ fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
 /// Everything user-visible goes through `out`, line per event: profiles appearing,
 /// leaving, activating, going dormant, being refused. The lock lives exactly as
 /// long as this frame.
-pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u8> {
+pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8> {
     if !sequencer_input::x11::is_usable() {
         return Err(Error::NotImplemented(
             "the profile manager needs an X11 session for now: it hears triggers by \
@@ -193,6 +201,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
     // without it they fall back to plain (recolourable) injection.
     let lifter = sequencer_input::LiftedTap::open();
     let mut passes: u32 = 0;
+    let mut empty_scans: u32 = 0;
 
     writeln!(
         out,
@@ -227,8 +236,17 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
             // lock — so an empty set here is a set that emptied: everything was
             // unapplied or emergency-stopped, and a manager with nothing to enforce
             // (refused links included: they never reload) has no reason to linger.
-            if scanned_dir && slots.is_empty() {
-                break Ok("no profiles left");
+            // Confirmed over two scans, so no momentary gap in the directory can pass
+            // for that.
+            if scanned_dir {
+                if slots.is_empty() {
+                    empty_scans += 1;
+                    if empty_scans >= EMPTY_SCANS_TO_STOP {
+                        break Ok("no profiles left");
+                    }
+                } else {
+                    empty_scans = 0;
+                }
             }
             passes = passes.wrapping_add(1);
             next_maintenance = clock.now().saturating_add_nanos(MAINTENANCE_NANOS);
@@ -256,11 +274,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
         }
     };
 
-    teardown(&mut sink, &clock, &mut slots, &mut emergency);
-    // Everything this manager was enforcing stops being enforced, so the directory that
-    // *says* what is enforced is emptied with it. Otherwise `ls active/` would keep
-    // claiming profiles are live with nothing running them.
-    let cleared = super::state::clear_active().unwrap_or(0);
+    let cleared = stop_enforcing(&mut sink, &clock, &mut slots, &failed, &mut emergency, lock);
     let reason = outcome?;
     if !lost_terminal() {
         // A caught Ctrl+C already echoed `^C` and left the cursor mid-line; start clean.
@@ -269,6 +283,9 @@ pub(super) fn manage(out: &mut dyn std::io::Write, _lock: LockGuard) -> Result<u
             out,
             "{lead}stopped ({reason}); {cleared} profile(s) unapplied — nothing is enforced now"
         )?;
+        if let Some(note) = stuck_modifier_note(probe.as_ref()) {
+            writeln!(out, "{note}")?;
+        }
         out.flush()?;
     }
     Ok(exit::OK)
@@ -329,9 +346,10 @@ fn dispatch(
     let program = slot.profile.program.clone();
     let gate_fn = move || match &program {
         None => true,
-        Some(patterns) => focus
-            .and_then(FocusWatcher::focused_class)
-            .is_none_or(|class| program_applies(patterns, &class)),
+        Some(patterns) => {
+            let class = focus.and_then(FocusWatcher::focused_class);
+            licensed(patterns, class.as_deref())
+        }
     };
     // A deferred tap asks the server whether the trigger's modifiers are still
     // physically down; with no probe the answer is "no" and taps fire immediately.
@@ -370,6 +388,40 @@ fn dispatch(
         None | Some(run::Outcome::SourceClosed) => Ok(()),
         Some(run::Outcome::EmergencyStop) => stop_slot(out, sink, clock, slots, &name),
     }
+}
+
+/// Whether a program-gated profile is licensed to act right now.
+///
+/// Unreadable focus is NOT a licence. The class reads as `None` for exactly the states
+/// a closing program produces — `_NET_ACTIVE_WINDOW` cleared, or still naming a window
+/// that has already been destroyed — and acting then is how a sequence ends up typing
+/// into whatever inherited the focus. Grab bookkeeping makes the opposite call on
+/// purpose ([`reconcile_activation`] keeps the last decision rather than flapping):
+/// holding a grab through a blink costs a swallowed key, acting on one costs the wrong
+/// window.
+fn licensed(patterns: &[String], class: Option<&str>) -> bool {
+    class.is_some_and(|class| program_applies(patterns, class))
+}
+
+/// A one-line warning if the server still has a modifier active that no key is holding
+/// down, once this manager has released everything of its own.
+///
+/// Worth saying precisely because the ledger already ran: whatever is left is not ours
+/// to release, and the user's next chord would silently carry it.
+fn stuck_modifier_note(probe: Option<&sequencer_input::KeyProbe>) -> Option<String> {
+    let stuck = probe?.snapshot()?.stuck();
+    if stuck.is_empty() {
+        return None;
+    }
+    let named = stuck
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "warning: the server still has {named} active with no key holding it — every \
+         chord you press will carry it; `sequencer doctor` says how to clear it"
+    ))
 }
 
 /// Ends one slot the way its emergency chord promises: capture stopped, held keys
@@ -412,6 +464,37 @@ fn lost_terminal() -> bool {
     }
     let fd = std::os::fd::AsFd::as_fd(&stdout);
     nix::unistd::tcgetpgrp(fd).is_ok_and(|owner| owner != nix::unistd::getpgrp())
+}
+
+/// The stop sequence, in the order the rest of the world needs it, returning how many
+/// links were removed.
+///
+/// The order is the whole point. Announcing first means an apply that lands mid-stop
+/// waits instead of having its fresh link swept up by cleanup that already decided what
+/// to remove. Clearing only what this manager enforced leaves such a link alone even
+/// so. And the lock is released *before* the marker, because an apply the marker
+/// releases must find the lock free — otherwise it reports onto a manager that no
+/// longer exists and nothing enforces its profiles.
+fn stop_enforcing(
+    sink: &mut XTestSink,
+    clock: &SystemClock,
+    slots: &mut BTreeMap<String, Slot>,
+    failed: &BTreeMap<String, Option<std::time::SystemTime>>,
+    emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
+    lock: LockGuard,
+) -> usize {
+    // Named before teardown empties the slots.
+    let enforced: BTreeSet<String> = slots
+        .keys()
+        .cloned()
+        .chain(failed.keys().cloned())
+        .collect();
+    let stopping = super::state::mark_stopping();
+    teardown(sink, clock, slots, emergency);
+    let cleared = super::state::clear_active_named(&enforced).unwrap_or(0);
+    drop(lock);
+    drop(stopping);
+    cleared
 }
 
 /// Lets every slot go of what it held, whatever ended the run.
@@ -650,13 +733,20 @@ fn reconcile_set(
     // Gone, or re-applied: a replaced link carries a fresh stamp, and a reload is a
     // removal the loop below immediately follows with a load. Held keys are drained
     // either way — the new version must not inherit the old one's ledger.
+    //
+    // Removal is decided BY NAME, not by the listing. Re-applying replaces a link with
+    // one atomic rename, so looking the name up always finds the old link or the new
+    // one — but a directory *listing* taken during that rename may legitimately miss
+    // the entry, and believing it would drop a live profile (or empty the set and stop
+    // the manager) over a profile that never went anywhere.
     let mut updated: BTreeSet<String> = BTreeSet::new();
     let leaving: Vec<(String, bool)> = slots
         .iter()
         .filter_map(|(name, slot)| {
-            if !set.contains_key(name) {
+            let stamp = super::state::link_stamp(name);
+            if !set.contains_key(name) && stamp.is_none() {
                 Some((name.clone(), false))
-            } else if super::state::link_stamp(name) != slot.stamp {
+            } else if stamp != slot.stamp {
                 Some((name.clone(), true))
             } else {
                 None
@@ -764,6 +854,29 @@ mod tests {
 
     fn profile(text: &str) -> Profile {
         parse(text).expect("test profile parses")
+    }
+
+    /// A gated profile acts only on a focus reading that matches. Unreadable focus is
+    /// not a licence: it is what a program *exiting* looks like — the active-window
+    /// property cleared, or naming a window already destroyed — and firing then types
+    /// into whatever inherited the focus.
+    #[test]
+    fn an_unreadable_focus_is_not_a_licence_to_act() {
+        let patterns = vec!["*mpv*".to_owned()];
+        assert!(licensed(&patterns, Some("mpv")));
+        assert!(
+            licensed(&patterns, Some("Celluloid-mpv")),
+            "glob, folded case"
+        );
+        assert!(!licensed(&patterns, Some("firefox")));
+        assert!(
+            !licensed(&patterns, None),
+            "no readable class means no licence"
+        );
+        assert!(
+            !licensed(&patterns, Some("")),
+            "and neither does a blank one"
+        );
     }
 
     /// The precedence system in one pass: stops are claimed first, then the

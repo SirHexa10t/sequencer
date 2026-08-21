@@ -502,7 +502,16 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         std::fs::read_dir(config.active()).map_or(true, |mut dir| dir.next().is_none()),
         "active/ is empty afterwards"
     );
-    assert!(!config.lock_file().exists(), "the PID lock is gone");
+    // The lock file itself stays: the lock is an advisory `flock`, and keeping one
+    // stable inode is what makes taking it race-free. What must be true is that nobody
+    // holds it any more — which the kernel guarantees for us, however the manager died.
+    if config.lock_file().exists() {
+        let file = std::fs::File::open(config.lock_file()).expect("open the lock file");
+        assert!(
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok(),
+            "the manager quit but something still holds its lock"
+        );
+    }
 }
 
 /// Ctrl+C semantics plus focus gating: a program-gated profile stays dormant and

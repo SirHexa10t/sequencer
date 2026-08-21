@@ -1,12 +1,21 @@
 # sequencer
 
-Synthetic input for Linux. Today that means one product — `clicker`: hold or toggle a key
-to click at a rate you choose, wherever the mouse already is.
+## TL;DR
+
+Read `example_profile.toml`. It specifies and demonstrates everything.
+
+## Clicker
+
+Hold or toggle a key to click at a rate you choose, wherever the mouse already is.
 
 It works on X11, on Wayland and on a bare console. On X11 it needs no setup and no
 password at all; elsewhere it goes below the display server, which is what needs
 permission. There is no rate ceiling picked in advance: ask for what you want, and the tool
 reports what it actually managed to send.
+
+## autokey macro profiling
+
+Yet to write
 
 ## Features
 
@@ -277,8 +286,9 @@ state location.
 
 The format — mirrors like
 `PgUp -> volume-up` (each press taps the target; holding repeats it — and a chord
-trigger fires on its exact combination, deferring the tap until modifiers the target
-does not name are released, so a held shift never recolours what gets typed),
+trigger fires on its exact combination, lifting any modifier the target does not name
+for the instant of the tap and pressing it straight back, so a held shift never
+recolours what gets typed),
 sequences with
 `PRESS`/`RELEASE`/`WAIT` steps, chords, per-bind
 timing, `loop` counts (`4`, or `"inf"` until the trigger is pressed again), `RNG`/`GNR`
@@ -300,8 +310,11 @@ nothing can honour are refused with the reason, not reinterpreted.
 
 Chord triggers work: `[binds."ctrl i"]` grabs the key with its modifier mask (and the
 NumLock/CapsLock variants, so locks don't break it). A chord is modifiers plus one
-ordinary key — the shape an X grab can express — and a bare key cannot coexist with a
-chord over it, since both would grab the same keycode.
+ordinary key — the shape an X grab can express. A bare key and chords over it coexist:
+each spelling grabs its own exact mask, so `i`, `ctrl i` and `alt i` are three
+independent binds, and a combination none of them claims reaches the application
+untouched. `shift` distinguishes sides — `rshift >` and `shift >` can be separate
+binds, routed by which side is physically down.
 
 `profile-check` runs the same validator without applying anything: no symlink, no lock,
 no grabs, so it is safe in an editor hook. `--format` rewrites sound files in place —
@@ -463,6 +476,55 @@ command that needs a device says so — but no backend for either is written.
 - **What is sent is not necessarily received.** See [Rate ceiling](#rate-ceiling); the
   clicker's own report says "sent" for exactly this reason.
 - **Linux only.**
+
+## Troubleshoot
+
+**If only one keyboard misbehaves, the keyboard is the cause.** Keycodes are assigned by
+the device itself, below the kernel and below X. The layout, the modifier state and every
+shortcut binding on the machine are *shared* between your keyboards — so a board that
+sends the wrong codes misbehaves alone, and nothing you change in software will move it.
+Signs: `Ctrl`+`Alt`+`T` (or any `Alt` shortcut) doing nothing while ordinary typing is
+perfect, a layout toggle that will not fire, the top row acting like media keys.
+
+The usual cause is a **mode latch in the keyboard's own firmware** — commonly a Mac/Windows
+toggle, which swaps `Alt` with `Super` so every `Alt` shortcut silently becomes a `Super`
+one; also an Fn-lock making the F-row media-first, or an onboard "gaming" profile with
+remapped keys. These live in the board's memory, so they survive unplugging, rebooting and
+every software remedy there is.
+
+**Hold `Fn`+`Esc` for a few seconds.** That resets many external keyboards to their default
+mode, and it is what cured a real case of `Alt` and `Super` being swapped. Other boards use
+`Fn`+a letter, a dedicated profile key, or a reset done by holding `Esc` while plugging in —
+worth a look at the model's manual. `Fn` itself is resolved inside the keyboard: it has no
+evdev code and no X keycode, so no software can read it, press it, or undo what it latched.
+
+**Confirm it in one press**, before changing anything else:
+
+```sh
+sequencer detect-key      # reads the devices, below X: it names what the keyboard really sends
+```
+
+Press the key labelled `Alt`. If it reports `meta`, the swap is in the hardware — and if
+you have a second keyboard, pressing the same key there is the comparison that settles it.
+
+**The other half: state the X server holds.** Two kinds outlive a run, and `sequencer
+doctor` reports both on its `keyboard:` line.
+
+- A **stuck modifier** — one the server believes is held with no key holding it — makes
+  every chord arrive with an extra modifier, so shortcuts match nothing while typing looks
+  fine. `doctor` names it and says how to clear it: tap that modifier on *both* sides (only
+  the stuck side clears it), or re-run your `setxkbmap` command, which resets locks,
+  latches and the active layout group in one go.
+- **Locks** (`CapsLock`, `NumLock`) toggle server-wide state that no grab intercepts and no
+  teardown undoes. On a multi-language setup `CapsLock` is often the layout switch, so a
+  bind on it can leave the keyboard on another language. `sequencer profile-check` warns
+  when a bind presses a lock key, as trigger or as target; take the hint and pick another.
+
+**Prevention.** Quit the manager with `Ctrl`+`C` or an `emergency_stop` key rather than
+`kill -9`: both release every key the run is holding, and `SIGKILL` skips exactly that (the
+manager also warns on the way out if the server still has a modifier stuck). Don't bind lock
+keys. Run `sequencer profile-check` on a new profile first — it catches unbalanced
+`PRESS`es, feedback circles and lock keys before anything is grabbed.
 
 ## Licence
 

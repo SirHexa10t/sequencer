@@ -8,7 +8,10 @@
 //! This matters more than it looks. A keysym-based identity cannot survive a layout
 //! change and does not correspond to any position on evdev's keyboard, so building on one
 //! would mean rewriting every backend's mapping table the first time a second platform
-//! lands.
+//! lands. It is also the user-facing promise: a bind fires whatever keyboard language is
+//! active — Hebrew `א` and `t` are one key — because a "save" hotkey that fails when the
+//! system is on the wrong language is worse than useless. This program binds keys, not
+//! the characters they happen to type; per-language name aliases are a non-goal.
 
 use crate::time::Timestamp;
 
@@ -59,6 +62,10 @@ impl Mods {
     pub const RALT: Self = Self(1 << 3);
     /// Either meta/super.
     pub const META: Self = Self(1 << 4);
+
+    /// Every class, in the order a chord spells them — for walking a set class by
+    /// class, which is what any "which of these is held?" question needs.
+    pub const CLASSES: [Self; 5] = [Self::SHIFT, Self::CTRL, Self::ALT, Self::RALT, Self::META];
 
     /// The class `key` contributes, or `None` if it is not a modifier.
     #[must_use]
@@ -251,6 +258,19 @@ mod tests {
         assert!(Mods::of_chord(&[Key::W]).is_none());
         assert_eq!(chord.intersect(Mods::CTRL), Mods::CTRL);
         assert!(Mods::SHIFT.intersect(Mods::CTRL).is_none());
+    }
+
+    /// [`Mods::CLASSES`] and [`Display`](core::fmt::Display) must agree, in content and
+    /// in order: a class missing from the list would be invisible to every "which of
+    /// these is held?" walk built on it, and silently so.
+    #[test]
+    fn the_class_list_names_every_class_display_knows() {
+        let all = Mods::CLASSES.into_iter().fold(Mods::NONE, Mods::and);
+        assert_eq!(all.to_string(), "shift ctrl alt ralt meta");
+        for class in Mods::CLASSES {
+            assert!(!class.is_none(), "a class must name at least one modifier");
+            assert!(all.covers(class));
+        }
     }
 
     /// Display speaks the same canonical names a chord is written in.

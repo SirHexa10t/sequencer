@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
-use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, ModMask};
+use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, ModMask, Window};
 use x11rb::rust_connection::RustConnection;
 
 use sequencer_core::input::{InputEvent, Key, Mods};
@@ -332,23 +332,66 @@ fn mods_of(state: x11rb::protocol::xproto::KeyButMask) -> Mods {
     .fold(Mods::NONE, |mods, (_, class)| mods.and(class))
 }
 
-/// Reads the server's live key state, for the one question grabs cannot answer:
-/// is a key still physically down *right now*?
+/// What the server believes about the keyboard at one instant.
 ///
-/// A deferred tap needs it — after ungrabbing (see `pump_events`) the trigger's
+/// The pair is the point. [`Self::state`] is what the server will stamp on the next
+/// event and match against every grab; [`Self::down`] is which keys it thinks are
+/// physically held. A class in `state` that nothing in `down` supplies is a **stuck
+/// modifier** — the state in which every chord arrives with one modifier too many and
+/// desktop shortcuts quietly match nothing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct KeyboardState {
+    /// The modifier classes the next event will carry.
+    pub state: Mods,
+    /// Every key the server believes is down, in keycode order.
+    pub down: Vec<Key>,
+    /// Whether CapsLock is on (the `Lock` bit — a lock, never a [`Mods`] class).
+    pub caps_lock: bool,
+    /// Whether NumLock is on (`Mod2`, by the same convention the grab masks use).
+    pub num_lock: bool,
+}
+
+impl KeyboardState {
+    /// The modifier classes the server has active with no key of theirs down — the
+    /// stuck ones, in the order [`Mods::CLASSES`] names them.
+    ///
+    /// This is the one interpretation of the two halves, and it lives with them so
+    /// that everything asking "is a modifier stuck?" agrees on the answer.
+    #[must_use]
+    pub fn stuck(&self) -> Vec<Mods> {
+        let supplied = self
+            .down
+            .iter()
+            .copied()
+            .filter_map(Mods::of_key)
+            .fold(Mods::NONE, Mods::and);
+        Mods::CLASSES
+            .into_iter()
+            .filter(|class| self.state.covers(*class) && !supplied.covers(*class))
+            .collect()
+    }
+}
+
+/// Reads the server's live key state, for the questions grabs cannot answer: is a key
+/// still physically down *right now*, and does the modifier state make sense at all?
+///
+/// A deferred tap needs the first — after ungrabbing (see `pump_events`) the trigger's
 /// releases are routed elsewhere, so release events never arrive here; polling the
-/// server's keymap is the honest way to see the hand leave the keys.
+/// server's keymap is the honest way to see the hand leave the keys. `doctor` needs the
+/// second, to tell a stuck modifier from a keyboard misbehaving on its own.
 #[derive(Debug)]
 pub struct KeyProbe {
     conn: RustConnection,
+    root: Window,
 }
 
 impl KeyProbe {
     /// Connects; `None` when there is no server to ask.
     #[must_use]
     pub fn open() -> Option<Self> {
-        let (conn, _) = RustConnection::connect(None).ok()?;
-        Some(Self { conn })
+        let (conn, screen) = RustConnection::connect(None).ok()?;
+        let root = conn.setup().roots.get(screen)?.root;
+        Some(Self { conn, root })
     }
 
     /// Whether any of `keys` is down right now. Unaskable states read as "none down"
@@ -365,6 +408,43 @@ impl KeyProbe {
             .filter_map(|&key| super::inject::x_keycode(key))
             .any(|code| reply.keys[usize::from(code / 8)] & (1 << (code % 8)) != 0)
     }
+
+    /// The whole picture at once — both halves read back to back, so a modifier
+    /// pressed between them cannot make the state and the keymap disagree by more
+    /// than the instant it takes to ask.
+    ///
+    /// `None` when the server cannot be asked. That is deliberately not "nothing is
+    /// stuck": inventing a clean bill of health is the one answer a diagnostic must
+    /// never give.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<KeyboardState> {
+        use x11rb::protocol::xproto::KeyButMask;
+
+        let pointer = self.conn.query_pointer(self.root).ok()?.reply().ok()?;
+        let keymap = self.conn.query_keymap().ok()?.reply().ok()?;
+        Some(KeyboardState {
+            state: mods_of(pointer.mask),
+            down: keys_in(&keymap.keys),
+            caps_lock: pointer.mask.contains(KeyButMask::LOCK),
+            num_lock: pointer.mask.contains(KeyButMask::MOD2),
+        })
+    }
+}
+
+/// Every key set in a `QueryKeymap` bitmap: bit `n` of byte `b` is keycode `8b + n`.
+fn keys_in(bitmap: &[u8; 32]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    for (byte, bits) in bitmap.iter().enumerate() {
+        for bit in 0..8 {
+            if bits & (1 << bit) != 0
+                && let Ok(code) = u8::try_from(byte * 8 + bit)
+                && let Some(key) = key_from_x(code)
+            {
+                keys.push(key);
+            }
+        }
+    }
+    keys
 }
 
 /// The inverse of [`super::inject::x_keycode`]: X keycode back to the engine's key.
@@ -399,6 +479,33 @@ mod tests {
             mask_variants(ModMask::SHIFT, BareMask::CatchAll),
             mask_variants(ModMask::SHIFT, BareMask::Exact),
             "a chord names its state exactly, whoever asks"
+        );
+    }
+
+    /// A class is stuck when the state claims it and no key down supplies it. A finger
+    /// on the key is not stuck; either side of a folded class supplies it; and a lock
+    /// being on is never a stuck modifier (locks are no class at all).
+    #[test]
+    fn a_class_is_stuck_when_no_key_down_supplies_it() {
+        let state = |state, down: &[Key]| KeyboardState {
+            state,
+            down: down.to_vec(),
+            caps_lock: true,
+            num_lock: true,
+        };
+        assert_eq!(state(Mods::SHIFT, &[]).stuck(), vec![Mods::SHIFT]);
+        assert!(state(Mods::SHIFT, &[Key::RightShift]).stuck().is_empty());
+        assert!(state(Mods::SHIFT, &[Key::LeftShift]).stuck().is_empty());
+        assert!(state(Mods::NONE, &[Key::A]).stuck().is_empty());
+        assert_eq!(
+            state(Mods::CTRL.and(Mods::META), &[Key::LeftCtrl]).stuck(),
+            vec![Mods::META],
+            "only the unsupplied class"
+        );
+        assert_eq!(
+            state(Mods::META.and(Mods::SHIFT), &[]).stuck(),
+            vec![Mods::SHIFT, Mods::META],
+            "reported in the canonical class order, not the order asked"
         );
     }
 

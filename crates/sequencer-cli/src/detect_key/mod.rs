@@ -7,8 +7,9 @@
 //!   included, and kpmultiply is never mistaken for the `*` it types. Needs read access,
 //!   so it may borrow sudo for the run the same way the clicker does (and sheds it once
 //!   the devices are open — this mode never writes anything). The terminal is silenced
-//!   while it runs, so presses do not also type into the shell; Ctrl+C still quits,
-//!   read as a byte off the silenced terminal.
+//!   while it runs, so presses do not also type into the shell; Ctrl+C quits, recognised
+//!   as a chord off the devices themselves, which is the one path nothing between this
+//!   process and the keyboard can swallow.
 //! - **Terminal** (`--no-sudo`): raw mode on standard input. No permission on X11,
 //!   Wayland, SSH and the console alike, and the press is naturally consumed — but a
 //!   terminal only receives characters, so it reports the key *behind* the char (`{`
@@ -16,9 +17,10 @@
 //!   nothing.
 //!
 //! In both modes raw terminal state is restored by a guard on every exit, panic
-//! included, and Ctrl+C is handled as the byte `0x03` rather than as a signal — a signal
-//! would kill the process without running the guard, leaving the shell eating its own
-//! keystrokes.
+//! included, and Ctrl+C is never allowed to arrive as a signal — a signal would kill the
+//! process without running the guard, leaving the shell eating its own keystrokes. The
+//! terminal mode reads it as the byte `0x03`; the device mode reads it as a chord off the
+//! devices (see [`report_until_quit`] for why the byte alone was not enough).
 
 use crate::args::DetectKeyArgs;
 use crate::runtime::{EventPump, Wake};
@@ -149,9 +151,16 @@ pub(crate) fn detect_key(args: &DetectKeyArgs, deps: &mut Deps<'_>) -> Result<u8
         deps.out.flush()?;
     }
     // The injected pump is the test seam: the printing contract stays checkable without
-    // a terminal or devices. A real run picks its source by the flag.
+    // a terminal or devices, and through the SAME loop a real run uses. There is no
+    // terminal to drain and no session to report, so both of those are inert here.
     if let Some(pump) = deps.pump.as_deref_mut() {
-        return pump_loop(pump, deps.out);
+        return report_until_quit(
+            pump,
+            deps.clock,
+            &|| false,
+            &mut FocusPoll::silent(),
+            deps.out,
+        );
     }
     if args.no_sudo {
         tty::run(deps.out)
@@ -160,15 +169,66 @@ pub(crate) fn detect_key(args: &DetectKeyArgs, deps: &mut Deps<'_>) -> Result<u8
     }
 }
 
-/// The printing contract, fed from an injected pump: presses print once, by bindable
-/// name; releases print nothing.
-fn pump_loop(pump: &mut dyn EventPump, out: &mut dyn std::io::Write) -> Result<u8> {
+/// How often the loop surfaces: to drain the silenced terminal, and to re-read focus.
+const QUIT_POLL_NANOS: u64 = 50_000_000;
+
+/// Prints presses until Ctrl+C, or until the devices close.
+///
+/// **Ctrl+C is recognised from the DEVICES, not from the terminal.** This loop
+/// already reads every keyboard, so the quit chord is plain input here — and that is
+/// the only path nothing in the way can swallow. The terminal byte is a second
+/// opinion, and a fragile one: `detect-key` re-execs itself under `sudo`, modern
+/// sudo defaults to running its command on a *pty* and relaying the real terminal
+/// into it, and somewhere in that relay the interrupt byte never reached our read —
+/// the run could only be killed from another shell (field bug, twice: the byte check
+/// was also starved by any device with a steady trickle, since it lived in the
+/// timed-out arm of the wait and motion events print nothing).
+///
+/// So: the chord ends the run, the byte still ends the run if it arrives, and the
+/// byte check keeps running regardless because *draining* the silenced terminal is
+/// its other job — anything typed during the run must not land in the shell after.
+/// Both checks are driven by the clock, never by the event stream going quiet.
+fn report_until_quit(
+    pump: &mut dyn EventPump,
+    clock: &dyn sequencer_core::time::Clock,
+    quit_requested: &dyn Fn() -> bool,
+    focus: &mut FocusPoll,
+    out: &mut dyn std::io::Write,
+) -> Result<u8> {
+    let mut checks: u32 = 0;
+    let mut next_check = clock.now();
+    let mut ctrl_down = false;
     loop {
-        match pump.wait_until(None) {
+        if clock.now() >= next_check {
+            if quit_requested() {
+                return Ok(exit::OK);
+            }
+            checks = checks.wrapping_add(1);
+            // Focus is re-read every fourth check (~200ms): a human notices no lag
+            // at that cadence, and the X round trips stay off the key path.
+            if checks.is_multiple_of(4) {
+                focus.report(out)?;
+            }
+            next_check = clock.now().saturating_add_nanos(QUIT_POLL_NANOS);
+        }
+        match pump.wait_until(Some(next_check)) {
             Wake::Event(event) => {
+                match event.kind {
+                    EventKind::KeyDown(Key::LeftCtrl | Key::RightCtrl) => ctrl_down = true,
+                    EventKind::KeyUp(Key::LeftCtrl | Key::RightCtrl) => ctrl_down = false,
+                    _ => {}
+                }
+                // The press is reported before the run ends: naming what was pressed
+                // is this command's whole job, and the quit chord is no exception.
                 if let Some(name) = pressed_name(event.kind) {
                     writeln!(out, "{name}")?;
                     out.flush()?;
+                }
+                // Off the devices, so it fires wherever it is pressed — hence the focus
+                // question: a Ctrl+C aimed at another window is not aimed at this run.
+                if ctrl_down && matches!(event.kind, EventKind::KeyDown(Key::C)) && focus.at_home()
+                {
+                    return Ok(exit::OK);
                 }
             }
             Wake::Deadline => {}
@@ -206,15 +266,68 @@ struct FocusPoll {
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     watcher: Option<sequencer_input::FocusWatcher>,
     last: Option<String>,
+    /// The window that had focus when the run began — the terminal it was started
+    /// from, since starting it is the last thing that happened there.
+    home: Option<u32>,
 }
 
 impl FocusPoll {
     fn new() -> Self {
+        #[cfg(all(feature = "xtest", target_os = "linux"))]
+        let watcher = sequencer_input::FocusWatcher::open();
         Self {
+            home: {
+                #[cfg(all(feature = "xtest", target_os = "linux"))]
+                {
+                    watcher
+                        .as_ref()
+                        .and_then(sequencer_input::FocusWatcher::focused_window)
+                }
+                #[cfg(not(all(feature = "xtest", target_os = "linux")))]
+                {
+                    None
+                }
+            },
             #[cfg(all(feature = "xtest", target_os = "linux"))]
-            watcher: sequencer_input::FocusWatcher::open(),
+            watcher,
             last: None,
         }
+    }
+
+    /// A poll that never asks. For injected runs: no session to report on, and no
+    /// reason for a unit test to open an X connection.
+    fn silent() -> Self {
+        Self {
+            #[cfg(all(feature = "xtest", target_os = "linux"))]
+            watcher: None,
+            last: None,
+            home: None,
+        }
+    }
+
+    /// Whether the window with focus right now is the one this run started in.
+    ///
+    /// The quit chord is read off the *devices*, which know nothing about focus — so
+    /// without this, a Ctrl+C meant for another window would end the run too. See
+    /// [`still_home`] for why an unreadable answer counts as yes.
+    fn at_home(&self) -> bool {
+        still_home(self.home, self.focused_window())
+    }
+
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    fn focused_window(&self) -> Option<u32> {
+        self.watcher
+            .as_ref()
+            .and_then(sequencer_input::FocusWatcher::focused_window)
+    }
+
+    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the stub keeps both builds on one call shape"
+    )]
+    fn focused_window(&self) -> Option<u32> {
+        None
     }
 
     /// Asks for the current focus and prints it if it changed.
@@ -247,18 +360,30 @@ impl FocusPoll {
     }
 }
 
+/// Whether focus is still where the run began, given the window it began in and the one
+/// focused now.
+///
+/// Unknown counts as yes, in both directions: with no window to compare against (no
+/// EWMH, no X, a launcher rather than a terminal) or no readable answer now, the quit
+/// chord must still work. A quit that cannot be reached is a worse bug than one that can
+/// be reached from the wrong window — which is how this started.
+const fn still_home(home: Option<u32>, now: Option<u32>) -> bool {
+    match (home, now) {
+        (Some(home), Some(now)) => home == now,
+        _ => true,
+    }
+}
+
 /// The device side: exact keys off `/dev/input`, with the terminal silenced meanwhile.
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 mod platform {
-    use super::{exit, pressed_name, tty};
+    use super::tty;
     use crate::Result;
-    use crate::runtime::{EventPump as _, Wake};
     use sequencer_input::{Epoch, EvdevCapture, SystemClock};
 
-    /// How often the loop surfaces to check the silenced terminal for Ctrl+C.
-    const QUIT_POLL_NANOS: u64 = 50_000_000;
-
-    /// Reads every input device until Ctrl+C, printing each press by its exact name.
+    /// Opens every input device, silences the terminal, and hands the pair to the
+    /// printer. The loop itself is [`super::report_until_quit`] — policy lives in the
+    /// parent module, and this function is only the OS wiring around it.
     pub(super) fn detect_devices(out: &mut dyn std::io::Write) -> Result<u8> {
         let epoch = Epoch::start();
         let clock = SystemClock::from_epoch(epoch.instant());
@@ -268,42 +393,24 @@ mod platform {
         crate::elevate::drop_root_after_open()?;
         // Silence the terminal: the devices are read *alongside* it, not instead of it,
         // so without this every press would also type into the shell. Absent a terminal
-        // (piped stdin) there is nothing to silence and Ctrl+C falls back to the signal.
+        // (piped stdin) there is nothing to silence, and the quit chord off the devices
+        // is the way out either way.
         let silencer = tty::Silencer::enable();
+        tracing::debug!(
+            silenced = silencer.is_some(),
+            "detect-key: terminal state before reading devices"
+        );
         let mut focus = super::FocusPoll::new();
-        if let Err(err) = focus.report(out) {
-            return Err(err.into());
-        }
+        focus.report(out)?;
 
         let mut pump = crate::runtime::CapturePump::new(stream, &clock);
-        // Focus is re-read every fourth quit-poll wake (~200ms): a human notices no lag
-        // at that cadence, and the X round trips stay off the key-reporting path.
-        let mut wakes: u32 = 0;
-        let outcome = loop {
-            use sequencer_core::time::Clock as _;
-            let deadline = clock.now().saturating_add_nanos(QUIT_POLL_NANOS);
-            match pump.wait_until(Some(deadline)) {
-                Wake::Event(event) => {
-                    if let Some(name) = pressed_name(event.kind)
-                        && let Err(err) = writeln!(out, "{name}").and_then(|()| out.flush())
-                    {
-                        break Err(err.into());
-                    }
-                }
-                Wake::Deadline => {
-                    if silencer.as_ref().is_some_and(tty::Silencer::quit_requested) {
-                        break Ok(exit::OK);
-                    }
-                    wakes = wakes.wrapping_add(1);
-                    if wakes.is_multiple_of(4)
-                        && let Err(err) = focus.report(out)
-                    {
-                        break Err(err.into());
-                    }
-                }
-                Wake::Interrupted => break Ok(exit::OK),
-            }
-        };
+        let outcome = super::report_until_quit(
+            &mut pump,
+            &clock,
+            &|| silencer.as_ref().is_some_and(tty::Silencer::quit_requested),
+            &mut focus,
+            out,
+        );
         drop(silencer);
         capture.stop();
         outcome
@@ -327,6 +434,186 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::runtime::EventPump;
+    use sequencer_core::input::{EventKind, InputEvent, Key};
+    use sequencer_core::testutil::VirtualClock;
+    use sequencer_core::time::{Clock as _, Timestamp};
+
+    /// A device that always has an event ready, counting how often it was asked.
+    /// `budget` bounds it so a starved loop fails an assertion instead of hanging.
+    struct BusyPump {
+        clock: VirtualClock,
+        asked: std::cell::Cell<u32>,
+        budget: u32,
+        kind: EventKind,
+    }
+
+    impl BusyPump {
+        fn new(kind: EventKind, budget: u32) -> Self {
+            Self {
+                clock: VirtualClock::new(),
+                asked: std::cell::Cell::new(0),
+                budget,
+                kind,
+            }
+        }
+    }
+
+    impl EventPump for BusyPump {
+        fn wait_until(&mut self, _deadline: Option<Timestamp>) -> Wake {
+            let asked = self.asked.get() + 1;
+            self.asked.set(asked);
+            if asked > self.budget {
+                return Wake::Interrupted;
+            }
+            Wake::Event(InputEvent::physical(self.clock.now(), self.kind))
+        }
+    }
+
+    /// The regression: Ctrl+C must be noticed while the devices are busy. A pump
+    /// with an event always ready used to keep the loop out of the arm that looked
+    /// for the quit byte, so nothing could stop the run — and a moved mouse is
+    /// exactly that pump, silently, because motion prints nothing.
+    #[test]
+    fn a_busy_device_cannot_starve_the_quit_check() {
+        let clock = VirtualClock::new();
+        let mut pump = BusyPump::new(EventKind::Motion { x: 4, y: 9 }, 1_000);
+        let mut out = Vec::new();
+
+        let code = report_until_quit(&mut pump, &clock, &|| true, &mut FocusPoll::new(), &mut out)
+            .expect("the loop reports its own exit");
+
+        assert_eq!(code, exit::OK);
+        assert!(
+            pump.asked.get() <= 1,
+            "the quit check waited for the event stream to go quiet: pumped {} times",
+            pump.asked.get()
+        );
+        assert!(out.is_empty(), "motion prints nothing");
+    }
+
+    /// A pump that plays a script of presses, then closes.
+    struct ScriptPump {
+        clock: VirtualClock,
+        script: std::collections::VecDeque<EventKind>,
+    }
+
+    impl EventPump for ScriptPump {
+        fn wait_until(&mut self, _deadline: Option<Timestamp>) -> Wake {
+            match self.script.pop_front() {
+                Some(kind) => Wake::Event(InputEvent::physical(self.clock.now(), kind)),
+                None => Wake::Interrupted,
+            }
+        }
+    }
+
+    /// The chord ends the run only while focus is where it started. Unknown counts as
+    /// home, in either direction: a quit nobody can reach is the worse bug.
+    #[test]
+    fn the_quit_chord_belongs_to_the_window_the_run_started_in() {
+        assert!(
+            still_home(Some(7), Some(7)),
+            "same window: this run's Ctrl+C"
+        );
+        assert!(
+            !still_home(Some(7), Some(9)),
+            "another window has focus: not this run's Ctrl+C"
+        );
+        assert!(still_home(None, Some(9)), "nothing to compare against");
+        assert!(still_home(Some(7), None), "no readable answer now");
+        assert!(still_home(None, None));
+    }
+
+    /// Ctrl+C off the DEVICES ends the run — the path the terminal cannot swallow.
+    /// Both keys are still named on the way out, and nothing after the chord runs.
+    #[test]
+    fn ctrl_c_from_the_devices_quits() {
+        let clock = VirtualClock::new();
+        let mut pump = ScriptPump {
+            clock: VirtualClock::new(),
+            script: [
+                EventKind::KeyDown(Key::LeftCtrl),
+                EventKind::KeyDown(Key::C),
+                EventKind::KeyDown(Key::F9),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut out = Vec::new();
+
+        let code = report_until_quit(
+            &mut pump,
+            &clock,
+            // The terminal never sees it: this is the device path alone.
+            &|| false,
+            &mut FocusPoll::new(),
+            &mut out,
+        )
+        .expect("the chord ends the run cleanly");
+
+        assert_eq!(code, exit::OK);
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "ctrl\nc\n",
+            "both keys are named, and nothing past the chord is read"
+        );
+    }
+
+    /// `c` alone is just a key: only ctrl HELD makes it the quit chord, and a
+    /// released ctrl stops counting.
+    #[test]
+    fn c_without_ctrl_held_is_only_a_key() {
+        let clock = VirtualClock::new();
+        let mut pump = ScriptPump {
+            clock: VirtualClock::new(),
+            script: [
+                EventKind::KeyDown(Key::C),
+                EventKind::KeyDown(Key::LeftCtrl),
+                EventKind::KeyUp(Key::LeftCtrl),
+                EventKind::KeyDown(Key::C),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut out = Vec::new();
+
+        report_until_quit(
+            &mut pump,
+            &clock,
+            &|| false,
+            &mut FocusPoll::new(),
+            &mut out,
+        )
+        .expect("the script runs out and the stream closes");
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "c\nctrl\nc\n",
+            "the whole script was read: no quit fired"
+        );
+    }
+
+    /// And with nothing asking it to stop, presses still print by name until the
+    /// devices close.
+    #[test]
+    fn presses_print_until_the_devices_close() {
+        let clock = VirtualClock::new();
+        let mut pump = BusyPump::new(EventKind::KeyDown(Key::F9), 3);
+        let mut out = Vec::new();
+
+        let code = report_until_quit(
+            &mut pump,
+            &clock,
+            &|| false,
+            &mut FocusPoll::new(),
+            &mut out,
+        )
+        .expect("a closed stream is a clean exit");
+
+        assert_eq!(code, exit::OK);
+        assert_eq!(String::from_utf8(out).expect("utf-8"), "F9\nF9\nF9\n");
+    }
 
     /// Every canonical key name must appear somewhere in what detect-key prints — the
     /// drawing or the rendered sets. This is the guarantee that adding a key to the

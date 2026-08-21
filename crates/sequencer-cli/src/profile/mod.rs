@@ -65,46 +65,12 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
 
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
-        // Injections pass through grabs like real presses, and EVERY profile's grabs
-        // hear them — a feedback circle can span files. The whole future set is
-        // checked before anything links: this batch, plus what is already applied
-        // (minus the versions this batch replaces). The manager re-checks at load,
-        // for links made by hand.
-        let batch_names: Vec<String> = files.iter().map(|file| linked_name(file)).collect();
-        let mut already_applied: Vec<(String, Profile)> = Vec::new();
-        for (name, path) in state::scan_active()? {
-            if batch_names.contains(&name) {
-                continue;
-            }
-            // An unreadable or unparsable link is not running (the manager refused
-            // it too), so it is no part of the live graph.
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(profile) = parse(&text) else {
-                continue;
-            };
-            already_applied.push((name, profile));
-        }
-        let mut graph: Vec<(&str, &Profile)> = batch_names
-            .iter()
-            .map(String::as_str)
-            .zip(parsed.iter())
-            .collect();
-        graph.extend(
-            already_applied
-                .iter()
-                .map(|(name, profile)| (name.as_str(), profile)),
-        );
-        if let Some(circle) = format::trigger_cycle(&graph) {
-            return Err(Error::Profile {
-                path: "profile-apply".to_owned(),
-                detail: format!(
-                    "refused: these binds would trigger each other in a circle: {}",
-                    circle.join(" -> ")
-                ),
-            });
-        }
+        refuse_circles_across_the_set(&files, &parsed)?;
+
+        // A manager on its way out is about to remove the links it was enforcing, and
+        // it decided which those are before we got here. Linking into that would be
+        // reporting success onto cleanup — so wait for it to finish first.
+        await_stopping_manager(deps)?;
 
         let mut placed = Vec::with_capacity(parsed.len());
         for (file, profile) in files.iter().zip(&parsed) {
@@ -145,12 +111,21 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
                     announce(deps.out, applied, profile, false)?;
                 }
                 deps.out.flush()?;
+                let ours: std::collections::BTreeSet<String> = placed
+                    .iter()
+                    .filter_map(|(applied, _)| match applied {
+                        state::Applied::Linked(link) | state::Applied::Reapplied(link) => link
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned()),
+                    })
+                    .collect();
                 let outcome = manager::manage(deps.out, lock);
                 if outcome.is_err() {
-                    // The manager never got going, so nothing is being enforced: the
-                    // links this call just made would otherwise outlive the run that
-                    // was supposed to honour them.
-                    let _ = state::clear_active();
+                    // The manager never got going (or died on an error), so nothing is
+                    // enforcing the links this call just made. Only those: anything
+                    // that arrived meanwhile belongs to whoever manages next, and
+                    // sweeping it up would delete an apply's work behind its back.
+                    let _ = state::clear_active_named(&ours);
                 }
                 outcome
             }
@@ -162,6 +137,94 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
             "profile-apply runs on X11 only for now, and this build has no X11 backend.".to_owned(),
         ))
     }
+}
+
+/// Refuses the whole apply if the set it would create contains a feedback circle.
+///
+/// Injections pass through grabs like real presses, and EVERY profile's grabs hear
+/// them — so a circle can span files. The whole future set is checked before anything
+/// links: this batch, plus what is already applied (minus the versions this batch
+/// replaces). The manager re-checks at load, for links made by hand.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+fn refuse_circles_across_the_set(files: &[std::path::PathBuf], parsed: &[Profile]) -> Result<()> {
+    let batch_names: Vec<String> = files.iter().map(|file| linked_name(file)).collect();
+    let mut already_applied: Vec<(String, Profile)> = Vec::new();
+    for (name, path) in state::scan_active()? {
+        if batch_names.contains(&name) {
+            continue;
+        }
+        // An unreadable or unparsable link is not running (the manager refused it
+        // too), so it is no part of the live graph.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(profile) = parse(&text) else {
+            continue;
+        };
+        already_applied.push((name, profile));
+    }
+    let mut graph: Vec<(&str, &Profile)> = batch_names
+        .iter()
+        .map(String::as_str)
+        .zip(parsed.iter())
+        .collect();
+    graph.extend(
+        already_applied
+            .iter()
+            .map(|(name, profile)| (name.as_str(), profile)),
+    );
+    if let Some(circle) = format::trigger_cycle(&graph) {
+        return Err(Error::Profile {
+            path: "profile-apply".to_owned(),
+            detail: format!(
+                "refused: these binds would trigger each other in a circle: {}",
+                circle.join(" -> ")
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// How long an apply waits for a stopping manager before calling the marker stale.
+/// Generous: a teardown is a key-release ledger and a handful of unlinks, so anything
+/// approaching this means the manager died mid-stop and will never clear it.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+const STOPPING_WAIT_NANOS: u64 = 10_000_000_000;
+/// How often to look while waiting.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+const STOPPING_POLL_NANOS: u64 = 50_000_000;
+
+/// Waits for a manager that is tearing down to finish, so this apply's links are made
+/// into a set nobody is still cleaning up — and so the lock is free by the time we ask
+/// for it, which is what lets this process become the next manager instead of reporting
+/// onto one that has gone.
+///
+/// A marker nobody clears is a manager that died mid-teardown; after
+/// [`STOPPING_WAIT_NANOS`] we say so, drop it, and carry on rather than refusing to
+/// work because of leftover state.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+fn await_stopping_manager(deps: &mut Deps<'_>) -> Result<()> {
+    let Some(pid) = state::stopping_manager()? else {
+        return Ok(());
+    };
+    writeln!(
+        deps.out,
+        "waiting for the stopping manager (PID {pid}) to finish unapplying"
+    )?;
+    deps.out.flush()?;
+    let deadline = deps.clock.now().saturating_add_nanos(STOPPING_WAIT_NANOS);
+    while deps.clock.now() < deadline {
+        deps.clock
+            .sleep_until(deps.clock.now().saturating_add_nanos(STOPPING_POLL_NANOS));
+        if state::stopping_manager()?.is_none() {
+            return Ok(());
+        }
+    }
+    writeln!(
+        deps.out,
+        "that manager never finished stopping; clearing its marker and carrying on"
+    )?;
+    state::clear_stopping()
 }
 
 /// `sequencer profile-unapply`.

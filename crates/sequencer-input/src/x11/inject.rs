@@ -217,9 +217,6 @@ pub struct LiftedTap {
     root: Window,
 }
 
-/// Every modifier class, for walking a [`Mods`] set class by class.
-const CLASSES: [Mods; 5] = [Mods::SHIFT, Mods::CTRL, Mods::ALT, Mods::RALT, Mods::META];
-
 impl LiftedTap {
     /// Connects and confirms XTEST, like [`XTestSink::open`]; `None` when there is
     /// no server. Without one, contaminated taps fall back to recolourable injection.
@@ -266,7 +263,7 @@ impl LiftedTap {
         };
 
         let mut restored: Vec<u8> = Vec::new();
-        for class in CLASSES {
+        for class in Mods::CLASSES {
             if held.covers(class) && !wanted.covers(class) {
                 for key in class.watch_keys() {
                     if is_down(key)
