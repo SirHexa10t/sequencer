@@ -20,9 +20,12 @@ use sequencer_core::time::Duration;
 pub(crate) struct Profile {
     /// Every binding, in trigger-name order.
     pub(crate) binds: Vec<Bind>,
-    /// Apply only while the focused program matches one of these patterns (`*`
-    /// wildcards, case-insensitive). `None` means the profile always applies.
+    /// Apply only while the focused program matches these patterns (`*` wildcards,
+    /// case-insensitive, `!` to invert). `None` means any program.
     pub(crate) program: Option<Vec<String>>,
+    /// Apply only while the active keyboard layout matches these patterns, read the
+    /// same way as [`Profile::program`]. `None` means any layout.
+    pub(crate) kb_lang: Option<Vec<String>>,
     /// Chords that stop the whole run gracefully, releasing everything held — any
     /// one of them fires it. Empty when the file names none.
     pub(crate) emergency_stop: Vec<Vec<Key>>,
@@ -66,6 +69,10 @@ pub(crate) enum Action {
     Mirror(Vec<Holdable>),
     /// A sequence, fired once per press of the trigger.
     Seq(Vec<Step>),
+    /// `bind = "NOP"`: swallow the trigger and emit nothing. The grab already
+    /// consumes the press, so this is the whole implementation — what makes it useful
+    /// is a gated profile, where the key passes through until the gate opens.
+    Nothing,
 }
 
 /// One entry of a `seq` list.
@@ -113,6 +120,7 @@ struct RawDefaults {
     gap: Option<String>,
     suppress: Option<bool>,
     program: Option<OneOrMany>,
+    kb_lang: Option<OneOrMany>,
     emergency_stop: Option<OneOrMany>,
 }
 
@@ -181,7 +189,8 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
         optional_duration(defaults.tap.as_deref(), "defaults.tap")?.unwrap_or(DEFAULT_TAP);
     let default_gap =
         optional_duration(defaults.gap.as_deref(), "defaults.gap")?.unwrap_or(DEFAULT_GAP);
-    let program = parse_program(defaults.program)?;
+    let program = parse_patterns(defaults.program, "defaults.program")?;
+    let kb_lang = parse_patterns(defaults.kb_lang, "defaults.kb_lang")?;
     let emergency_stop = parse_emergency(defaults.emergency_stop)?;
 
     let mut binds = Vec::with_capacity(raw.binds.len());
@@ -259,6 +268,7 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
     let profile = Profile {
         binds,
         program,
+        kb_lang,
         emergency_stop,
     };
     // Injections pass through grabs like real presses, so binds whose outputs
@@ -373,6 +383,7 @@ fn action_keys(bind: &Bind) -> Vec<Key> {
         }
     };
     match &bind.action {
+        Action::Nothing => {}
         Action::Mirror(targets) => take(targets),
         Action::Seq(steps) => {
             for step in steps {
@@ -502,6 +513,7 @@ fn produced_events(bind: &Bind) -> Vec<(Key, Mods)> {
     let held = chord_mods(&bind.trigger);
     let mut events = Vec::new();
     match &bind.action {
+        Action::Nothing => {}
         Action::Mirror(targets) => {
             // Covered classes stay physically supplied; contaminating ones are
             // lifted for the tap — either way, held ∩ wanted is what surrounds it.
@@ -577,18 +589,33 @@ pub(super) fn is_modifier(key: Key) -> bool {
     )
 }
 
-/// Checks the `program` patterns: optional, but never empty — an empty pattern (or an
-/// empty list) matches nothing forever, which is a disabled profile pretending to be a
-/// working one. One pattern or several: the profile applies while ANY matches.
-fn parse_program(program: Option<OneOrMany>) -> Result<Option<Vec<String>>, String> {
-    let Some(patterns) = program.map(OneOrMany::into_vec) else {
+/// Checks a gate's patterns — `program`'s and `kb_lang`'s read identically.
+///
+/// Optional, but never empty: an empty pattern (or an empty list) matches nothing
+/// forever, which is a disabled profile pretending to be a working one. A lone `!` is
+/// the same mistake spelled differently — it inverts nothing.
+fn parse_patterns(raw: Option<OneOrMany>, field: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(patterns) = raw.map(OneOrMany::into_vec) else {
         return Ok(None);
     };
     if patterns.is_empty() {
-        return Err("defaults.program is an empty list; drop the field to always apply".to_owned());
+        return Err(format!(
+            "{field} is an empty list; drop the field to always apply"
+        ));
     }
-    if patterns.iter().any(|pattern| pattern.trim().is_empty()) {
-        return Err("defaults.program has an empty pattern; drop it to always apply".to_owned());
+    for pattern in &patterns {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "{field} has an empty pattern; drop it to always apply"
+            ));
+        }
+        if trimmed.trim_start_matches('!').trim().is_empty() {
+            return Err(format!(
+                "{field} has `{trimmed}`, which inverts nothing; write the pattern \
+                 after the `!`"
+            ));
+        }
     }
     Ok(Some(patterns))
 }
@@ -651,18 +678,35 @@ pub(crate) fn program_matches(pattern: &str, class: &str) -> bool {
     )
 }
 
-/// Whether the focused program matches any of a profile's `program` patterns.
+/// Whether `value` satisfies a gate's patterns — the focused program's name against
+/// `program`, the active layout's name against `kb_lang`.
 ///
-/// The list is alternatives, nothing more: `["*mpv*", "*celluloid*"]` covers both
-/// spellings of one player, and a single pattern behaves exactly as it did alone.
+/// Plain patterns are alternatives: `["*mpv*", "*celluloid*"]` covers both spellings of
+/// one player. A pattern starting with `!` is the opposite, a veto: it must NOT match.
+/// Both kinds may appear together, and the rule is the obvious one — *any* plain pattern
+/// matching (or none being given at all), and *no* veto matching:
+///
+/// - `"*mpv*"` — only mpv.
+/// - `"!*mpv*"` — anything except mpv.
+/// - `["*fox*", "!*private*"]` — the browser, but not its private windows.
 #[cfg_attr(
     not(all(feature = "xtest", target_os = "linux")),
     allow(dead_code, reason = "used by the X11 manager loop and by tests")
 )]
-pub(crate) fn program_applies(patterns: &[String], class: &str) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| program_matches(pattern, class))
+pub(crate) fn patterns_apply(patterns: &[String], value: &str) -> bool {
+    let (mut allowed, mut any_allow) = (false, false);
+    for pattern in patterns {
+        let trimmed = pattern.trim();
+        if let Some(vetoed) = trimmed.strip_prefix('!') {
+            if program_matches(vetoed.trim(), value) {
+                return false;
+            }
+        } else {
+            any_allow = true;
+            allowed |= program_matches(trimmed, value);
+        }
+    }
+    allowed || !any_allow
 }
 
 /// Checks one binding and lowers it into its runnable form.
@@ -687,11 +731,13 @@ fn lower_bind(
         (None, None) => {
             return Err("has neither `bind` nor `seq`; a binding needs exactly one".to_owned());
         }
+        // `bind = "NOP"` is the one target that is not keys: swallow and emit nothing.
+        (Some(target), None) if is_nop(target) => Action::Nothing,
         (Some(target), None) => Action::Mirror(parse_target(target)?),
-        (None, Some(steps)) => Action::Seq(parse_seq(steps)?),
+        (None, Some(steps)) => Action::Seq(parse_seq(steps, gap)?),
     };
     let loops = parse_loops(raw.loops.as_ref())?;
-    if loops != Loops::Once && matches!(action, Action::Mirror(_)) {
+    if loops != Loops::Once && !matches!(action, Action::Seq(_)) {
         return Err(
             "`loop` needs a `seq`: a mirror follows the trigger's own edges and has \
              nothing to repeat"
@@ -721,6 +767,13 @@ fn parse_loops(raw: Option<&RawLoops>) -> Result<Loops, String> {
             "loop = \"{word}\" is not a count; use a number or \"inf\""
         )),
     }
+}
+
+/// Whether a `bind` target is the do-nothing keyword rather than keys.
+///
+/// Spelled like every other command name, so lower case is legal too.
+fn is_nop(target: &str) -> bool {
+    target.trim().eq_ignore_ascii_case("nop")
 }
 
 /// Parses a `bind` target: one pressable, or a space-separated chord of them.
@@ -780,7 +833,7 @@ enum OpenBlock {
 
 /// Parses a `seq` list and proves its PRESSes/RELEASEs pair up and its RNG/GNR and
 /// LOOP/POOL blocks close properly — inside each other, never across.
-fn parse_seq(lines: &[String]) -> Result<Vec<Step>, String> {
+fn parse_seq(lines: &[String], gap: Duration) -> Result<Vec<Step>, String> {
     if lines.is_empty() {
         return Err("`seq` is empty".to_owned());
     }
@@ -790,7 +843,7 @@ fn parse_seq(lines: &[String]) -> Result<Vec<Step>, String> {
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
         let step =
-            parse_step(line).map_err(|detail| format!("step {number} `{line}`: {detail}"))?;
+            parse_step(line, gap).map_err(|detail| format!("step {number} `{line}`: {detail}"))?;
         match &step {
             Step::Hold(keys) => held.extend(keys.iter().copied()),
             Step::Release(keys) => {
@@ -877,7 +930,7 @@ fn parse_seq(lines: &[String]) -> Result<Vec<Step>, String> {
 
 /// Parses one step line: keys (a tap), or a keyword (PRESS/RELEASE/WAIT/RNG/GNR/
 /// LOOP/POOL) with its operands.
-fn parse_step(line: &str) -> Result<Step, String> {
+fn parse_step(line: &str, gap: Duration) -> Result<Step, String> {
     let mut tokens = line.split_whitespace();
     let Some(first) = tokens.next() else {
         return Err("the step is empty".to_owned());
@@ -886,6 +939,15 @@ fn parse_step(line: &str) -> Result<Step, String> {
     // rng, loop or pool key, which is exactly why these words were chosen over
     // `down`/`up` — both of which ARE keys.
     match first.to_ascii_lowercase().as_str() {
+        // A step that does nothing still sits between two others, and the pause at that
+        // seam is the bind's `gap` — so doing nothing IS waiting one gap, and saying so
+        // in the lowering keeps the executor from needing a case for emptiness.
+        "nop" => {
+            if let Some(extra) = tokens.next() {
+                return Err(format!("NOP does nothing and takes nothing, got `{extra}`"));
+            }
+            Ok(Step::Wait(gap))
+        }
         "press" => Ok(Step::Hold(parse_pressables(tokens, "PRESS")?)),
         "release" => Ok(Step::Release(parse_pressables(tokens, "RELEASE")?)),
         "rng" => {
@@ -1262,10 +1324,19 @@ mod tests {
         let profile = parse_ok(text);
         assert_eq!(
             profile.binds.len(),
-            9,
-            "PgUp, PgDn, F2, F6, F7, the chord, its `also` alias and the shift pair"
+            14,
+            "PgUp, PgDn, F2, F6, F7, the chord, its `also` alias, the three language \
+             NOPs, the two program NOPs and the shift pair"
         );
         assert_eq!(profile.program, Some(vec!["*".to_owned()]));
+        assert_eq!(profile.kb_lang, Some(vec!["*".to_owned()]));
+        assert!(
+            profile
+                .binds
+                .iter()
+                .any(|bind| bind.action == Action::Nothing),
+            "the template shows a swallowed key"
+        );
         assert_eq!(profile.emergency_stop, vec![vec![Key::F8]]);
         assert!(
             profile
@@ -1281,12 +1352,20 @@ mod tests {
                 .any(|b| b.action == Action::Mirror(vec![Holdable::Key(Key::VolumeUp)])),
             "PgUp mirrors volume-up"
         );
+        // By spelling, not by shape: the template gained other chords, and "the first
+        // two-key trigger" stopped meaning this one.
         let chord = profile
             .binds
             .iter()
-            .find(|b| b.trigger.len() == 2)
+            .find(|b| b.trigger_text.eq_ignore_ascii_case("ctrl i"))
             .expect("the ctrl i trigger");
         assert_eq!(chord.trigger, vec![Key::LeftCtrl, Key::I]);
+        let alias = profile
+            .binds
+            .iter()
+            .find(|b| b.trigger_text.eq_ignore_ascii_case("alt i"))
+            .expect("its `also` alias is a bind of its own");
+        assert_eq!(alias.action, chord.action, "sharing the section's action");
     }
 
     /// Omitted `tap`/`gap` fall back to the built-ins — for mirrors and, pointedly,
@@ -1513,22 +1592,111 @@ mod tests {
             "[defaults]\nprogram = [\"*mpv*\", \"*celluloid*\"]\n[binds.F6]\nseq = [\"a\"]",
         );
         let patterns = profile.program.expect("patterns");
-        assert!(program_applies(&patterns, "Celluloid"));
-        assert!(program_applies(&patterns, "mpv"));
-        assert!(!program_applies(&patterns, "firefox"));
+        assert!(patterns_apply(&patterns, "Celluloid"));
+        assert!(patterns_apply(&patterns, "mpv"));
+        assert!(!patterns_apply(&patterns, "firefox"));
 
         let single = parse_ok("[defaults]\nprogram = \"*terminal*\"\n[binds.F6]\nseq = [\"a\"]");
         assert_eq!(single.program, Some(vec!["*terminal*".to_owned()]));
     }
 
     /// An empty list, like an empty pattern, is a profile that can never apply —
-    /// refused with the way out rather than silently disabled.
+    /// refused with the way out rather than silently disabled. A lone `!` is the same
+    /// mistake: it inverts nothing.
     #[test]
     fn empty_program_lists_and_patterns_are_refused() {
         let err = parse_err("[defaults]\nprogram = []\n[binds.F6]\nseq = [\"a\"]");
         assert!(err.contains("empty list"), "{err}");
         let err = parse_err("[defaults]\nprogram = [\"*mpv*\", \" \"]\n[binds.F6]\nseq = [\"a\"]");
         assert!(err.contains("empty pattern"), "{err}");
+        let err = parse_err("[defaults]\nkb_lang = \"!\"\n[binds.F6]\nseq = [\"a\"]");
+        assert!(err.contains("inverts nothing"), "{err}");
+        let err = parse_err("[defaults]\nkb_lang = []\n[binds.F6]\nseq = [\"a\"]");
+        assert!(err.contains("kb_lang is an empty list"), "{err}");
+    }
+
+    /// `kb_lang` reads exactly like `program`, and gates on the active keyboard
+    /// layout's own name — the spelling `detect-key` prints, not an invented language
+    /// label.
+    #[test]
+    fn kb_lang_gates_on_the_layout_name() {
+        let profile = parse_ok("[defaults]\nkb_lang = [\"il\", \"ru\"]\n[binds.a]\nbind = \"NOP\"");
+        let patterns = profile.kb_lang.expect("patterns");
+        assert!(patterns_apply(&patterns, "il"));
+        assert!(patterns_apply(&patterns, "RU"), "case is folded");
+        assert!(!patterns_apply(&patterns, "us"));
+        assert_eq!(profile.program, None, "the two gates are independent");
+
+        let single = parse_ok("[defaults]\nkb_lang = \"us\"\n[binds.F6]\nseq = [\"a\"]");
+        assert_eq!(single.kb_lang, Some(vec!["us".to_owned()]));
+    }
+
+    /// A `!` pattern is a veto, and vetoes compose with plain patterns the obvious
+    /// way: any plain one matching (or none being written), and no veto matching.
+    #[test]
+    fn a_bang_pattern_inverts_the_match() {
+        let not_english = vec!["!us*".to_owned()];
+        assert!(!patterns_apply(&not_english, "us"));
+        assert!(!patterns_apply(&not_english, "us-intl"));
+        assert!(patterns_apply(&not_english, "il"));
+
+        // Plain patterns are the allow-list, `!` patterns carve out of it.
+        let browser_but_not_private = vec!["*fox*".to_owned(), "!*private*".to_owned()];
+        assert!(patterns_apply(&browser_but_not_private, "firefox"));
+        assert!(!patterns_apply(&browser_but_not_private, "firefox-private"));
+        assert!(!patterns_apply(&browser_but_not_private, "chromium"));
+
+        // Vetoes only: everything except these.
+        let neither = vec!["!*mpv*".to_owned(), "!*vlc*".to_owned()];
+        assert!(patterns_apply(&neither, "firefox"));
+        assert!(!patterns_apply(&neither, "mpv"));
+        assert!(!patterns_apply(&neither, "vlc"));
+
+        // Space after the `!` is the author's whitespace, not part of the pattern.
+        assert!(!patterns_apply(&["! us".to_owned()], "us"));
+    }
+
+    /// `bind = "NOP"` swallows the trigger and emits nothing — so it presses no keys,
+    /// can close no circle, and (having no sequence) takes no `loop`.
+    #[test]
+    fn nop_binds_swallow_their_trigger() {
+        let profile = parse_ok("[binds.a]\nbind = \"NOP\"\n\n[binds.b]\nbind = \"nop\"");
+        assert!(
+            profile
+                .binds
+                .iter()
+                .all(|bind| bind.action == Action::Nothing),
+            "either case spells it"
+        );
+        assert!(
+            profile
+                .binds
+                .iter()
+                .all(|bind| action_keys(bind).is_empty())
+        );
+        assert_eq!(warnings(&profile), Vec::<String>::new());
+
+        let err = parse_err("[binds.a]\nbind = \"NOP\"\nloop = 3");
+        assert!(err.contains("loop"), "{err}");
+    }
+
+    /// `NOP` inside a `seq` is the pause that a step-shaped nothing amounts to: one
+    /// `gap`, exactly as writing `WAIT <gap>` there would.
+    #[test]
+    fn nop_in_a_sequence_is_one_gap() {
+        let profile = parse_ok("[binds.F6]\ngap = \"40ms\"\nseq = [\"a\", \"NOP\", \"b\"]");
+        let Action::Seq(steps) = &profile.binds[0].action else {
+            panic!("a sequence");
+        };
+        assert_eq!(steps[1], Step::Wait(Duration::from_millis(40)));
+        let spelled_out =
+            parse_ok("[binds.F6]\ngap = \"40ms\"\nseq = [\"a\", \"WAIT 40ms\", \"b\"]");
+        assert_eq!(
+            profile.binds[0].action, spelled_out.binds[0].action,
+            "NOP and the gap written out are the same sequence"
+        );
+        let err = parse_err("[binds.F6]\nseq = [\"NOP 5\"]");
+        assert!(err.contains("takes nothing"), "{err}");
     }
 
     /// `emergency_stop` may list alternatives — any one of them is the stop — and an

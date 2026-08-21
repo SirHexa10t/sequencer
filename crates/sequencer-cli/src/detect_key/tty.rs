@@ -155,7 +155,7 @@ impl Drop for Silencer {
 /// Reads the terminal until Ctrl+C or EOF, printing each press by name.
 pub(super) fn run(out: &mut dyn std::io::Write) -> Result<u8> {
     let _guard = RawGuard::enable()?;
-    let mut focus = super::FocusPoll::new();
+    let mut focus = super::SessionPoll::new();
     focus.report(out)?;
     let mut buf = Vec::with_capacity(16);
     loop {

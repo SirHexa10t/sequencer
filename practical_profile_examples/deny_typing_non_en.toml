@@ -1,0 +1,216 @@
+# Refuse to type while the keyboard is on a non-English layout, in the named programs.
+#
+# `kb_lang` matches the LAYOUT NAME your system uses — run `sequencer detect-key` and
+# switch language: it prints `lang: us`, `lang: il`, ... Those are the spellings to write
+# here ("English" is not one of them). `!` inverts, so `!us*` is "every layout except us".
+#
+# Each bind swallows one key: the grab consumes the press and `NOP` emits nothing, so the
+# key does nothing while BOTH gates match; and behaves completely normally otherwise.
+
+# This is a hacky profile; nothing's wrong with that. It shows the versatility of our tool.
+
+[defaults]
+emergency_stop = "ctrl shift e"
+program = ["*librewolf*", "*vivaldi*"]
+kb_lang = "!us*"   # every layout except us / us-intl / us(dvorak)...
+
+[binds.q]
+bind = "NOP"
+
+[binds.w]
+bind = "NOP"
+
+[binds.e]
+bind = "NOP"
+
+[binds.r]
+bind = "NOP"
+
+[binds.t]
+bind = "NOP"
+
+[binds.y]
+bind = "NOP"
+
+[binds.u]
+bind = "NOP"
+
+[binds.i]
+bind = "NOP"
+
+[binds.o]
+bind = "NOP"
+
+[binds.p]
+bind = "NOP"
+
+[binds."["]
+bind = "NOP"
+
+[binds."]"]
+bind = "NOP"
+
+[binds.a]
+bind = "NOP"
+
+[binds.s]
+bind = "NOP"
+
+[binds.d]
+bind = "NOP"
+
+[binds.f]
+bind = "NOP"
+
+[binds.g]
+bind = "NOP"
+
+[binds.h]
+bind = "NOP"
+
+[binds.j]
+bind = "NOP"
+
+[binds.k]
+bind = "NOP"
+
+[binds.l]
+bind = "NOP"
+
+[binds.";"]
+bind = "NOP"
+
+[binds."'"]
+bind = "NOP"
+
+[binds.z]
+bind = "NOP"
+
+[binds.x]
+bind = "NOP"
+
+[binds.c]
+bind = "NOP"
+
+[binds.v]
+bind = "NOP"
+
+[binds.b]
+bind = "NOP"
+
+[binds.n]
+bind = "NOP"
+
+[binds.m]
+bind = "NOP"
+
+[binds.","]
+bind = "NOP"
+
+[binds."."]
+bind = "NOP"
+
+[binds."/"]
+bind = "NOP"
+
+
+# Modifiers are part of the trigger, so shift+<char> is NOT covered by [binds.<char>] unless we specify them
+[binds."shift q"]
+bind = "NOP"
+
+[binds."shift w"]
+bind = "NOP"
+
+[binds."shift e"]
+bind = "NOP"
+
+[binds."shift r"]
+bind = "NOP"
+
+[binds."shift t"]
+bind = "NOP"
+
+[binds."shift y"]
+bind = "NOP"
+
+[binds."shift u"]
+bind = "NOP"
+
+[binds."shift i"]
+bind = "NOP"
+
+[binds."shift o"]
+bind = "NOP"
+
+[binds."shift p"]
+bind = "NOP"
+
+[binds."shift ["]
+bind = "NOP"
+
+[binds."shift ]"]
+bind = "NOP"
+
+[binds."shift a"]
+bind = "NOP"
+
+[binds."shift s"]
+bind = "NOP"
+
+[binds."shift d"]
+bind = "NOP"
+
+[binds."shift f"]
+bind = "NOP"
+
+[binds."shift g"]
+bind = "NOP"
+
+[binds."shift h"]
+bind = "NOP"
+
+[binds."shift j"]
+bind = "NOP"
+
+[binds."shift k"]
+bind = "NOP"
+
+[binds."shift l"]
+bind = "NOP"
+
+[binds."shift ;"]
+bind = "NOP"
+
+[binds."shift '"]
+bind = "NOP"
+
+[binds."shift z"]
+bind = "NOP"
+
+[binds."shift x"]
+bind = "NOP"
+
+[binds."shift c"]
+bind = "NOP"
+
+[binds."shift v"]
+bind = "NOP"
+
+[binds."shift b"]
+bind = "NOP"
+
+[binds."shift n"]
+bind = "NOP"
+
+[binds."shift m"]
+bind = "NOP"
+
+[binds."shift ,"]
+bind = "NOP"
+
+[binds."shift ."]
+bind = "NOP"
+
+[binds."shift /"]
+bind = "NOP"
+

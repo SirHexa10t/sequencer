@@ -292,13 +292,20 @@ recolours what gets typed),
 sequences with
 `PRESS`/`RELEASE`/`WAIT` steps, chords, per-bind
 timing, `loop` counts (`4`, or `"inf"` until the trigger is pressed again), `RNG`/`GNR`
-chance blocks (`0.25` == `25%` == `1/4`), and a `program` pattern that applies the
-profile only while a matching program has focus — is documented by example in
+chance blocks (`0.25` == `25%` == `1/4`), `bind = "NOP"` to swallow a key and emit
+nothing, and the two session gates — `program` and `kb_lang`, applying the profile only
+while the focused program, or the active keyboard layout, matches (`!` inverts a
+pattern) — is documented by example in
 [`example_profile.toml`](example_profile.toml), which doubles as the parser's test
 fixture, so the documentation cannot drift from what is accepted.
 
-With `program` set, the run watches focus (~5×/s) and grabs or releases its triggers as
-the matching program comes and goes — a dormant profile eats no keys. The
+With a gate set, the run watches it (~5×/s) and grabs or releases the profile's triggers
+as the match comes and goes — a dormant profile eats no keys. `program` matches the
+window class and `kb_lang` the active layout's own name (`us`, `il`); `sequencer
+detect-key` prints both, as `focus:` and `lang:` lines, which is how you learn the
+spelling to write. Together they express things neither does alone: `kb_lang = "!us"`
+with a handful of `NOP` binds refuses to type in one program while the keyboard is on
+another language, and leaves those keys untouched everywhere else. The
 `emergency_stop` key keeps its own grab either way; pressing it unapplies exactly the
 profiles that named that key — nothing is global among scripts — and releases whatever
 they still pressed. A stopped `loop` does the same for its own keys.

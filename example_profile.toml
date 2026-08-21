@@ -29,10 +29,18 @@ tap = "8ms"      # (default) optional overwrite: how long a tap holds the key do
 gap = "30ms"     # (default) optional overwrite: the pause between steps, unless an explicit WAIT is specified;
 suppress = true  # (default) optional overwrite: bind-activation consumes input-keys 
                  #   (on exact modifier-keys ; binding "<key>" means "shift <key>" presses pass through)
-program = "*"    # optional: profile applies only while the focused program matches (otherwise: global/whole-system)
-                 #   `*`: program-name wildcard  ;  `["*mpv*", "*celluloid*"]`: a list of program-names to apply-on
+program = "*"    # (default) optional: profile applies only while the focused program matches (otherwise: global/whole-system)
+                 #   `!` / `*`: program-name NOT / wildcard, for a program-name / list of names to apply-on
+                 #     e.g.: `["*mpv*", "*celluloid*", "!*ampverse*"]`: media-players, with some filtering of an incidentally caught app name
                  #   A profile that activates on a focused program ECLIPSES global profiles' binds, when the binds (inputs) are the same
                  #   Run `sequencer detect-key` and focus (click on) your targeted program(s), to discover their name.
+                 #   An unreadable gate (no EWMH) keeps gated profiles DORMANT
+kb_lang = "*"    # (default) optional: profile applies only while the active keyboard-layout matches
+                 #   `!` / `*`: language NOT / wildcard, for a language / list of languages to apply-on
+                 #     e.g.: `["*chrom*", "!*chroma*"]`: anything with "chrom", not "chroma" (chrome, chromium)
+                 #   Layout NAMES, as your system spells them: "us", "il", "ru" (NOT "English"/"Hebrew"/"Russian")
+                 #   Run `sequencer detect-key` and change your keyboard-input language to print the system's name for your language.
+                 #   An unreadable gate (no XKB) keeps gated profiles DORMANT
 emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile, releasing all of its own binds.
                        #   To stop all profiles: SIGTERM (Ctrl+C) on the manager's process.
                        #   Supports alternatives' list, like `program` field. Chords fire on the EXACT combination.
@@ -42,6 +50,7 @@ emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile
 
 #   bind = "<key or chord>"   remap: register alternative tap/press in your system
 #                               limited to 'tap' only, in some problematic use-case ("edge-cases" below)
+#   bind = "NOP"              emit NOTHING ; keypress "vanishes" if you left the default "suppress"
 #   also = [ ... ]            (optional) extra bind-alias, making more than 1 bind act the same
 #   seq  = [ ... ]            sequence of steps (commands below), runs when bind is triggered
 #                               (re-pressing the spelling that started a sequence stops it).
@@ -60,6 +69,8 @@ emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile
 #   WAIT <duration>           pause, replacing the `gap` waiting period between prior and next commands
 #                               <duration>s are: <num><unit>, units: ms/s/m/h, decimals fine ("WAIT 1.5s")
 #                               only zero may drop the unit: "WAIT 0" = no pause (practically `gap`-erasure)
+#   NOP                       do nothing; still considered a command, so it practically enters a `gap`-long pause
+#                               (identical to writing `WAIT <your gap>` in that spot)
 #   RNG <chance>              the enclosed steps run by chance: 0.25 == 25% == 1/4
 #   GNR                       close the script-block of last `RNG`
 #   LOOP <n>                  the enclosed steps repeat n times
@@ -143,6 +154,40 @@ seq = [
     "Enter",
     "Ctrl w",
 ]
+
+
+# ================================= gates and swallowing on language =================================
+
+# commenting this out to avoid duplicate-key (previously defined) - we'll keep this file apply-able 
+# [defaults] 
+# kb_lang = "!us"   <- applies on every layout EXCEPT us; NOP eats the key
+
+[binds.q]
+bind = "NOP"
+
+[binds."shift q"]     # the bare key and the chord are separate binds; swallow both
+bind = "NOP"
+
+[binds."ctrl q"]
+bind = "NOP"
+
+# <...same for other letter-keys...>
+
+
+# ================================= gates and swallowing on program =================================
+
+# commenting this out to avoid duplicate-key (previously defined) - we'll keep this file apply-able 
+# [defaults] 
+# program = "*my_favorite_game*"
+
+# no tabbing away
+[binds."alt tab"]
+bind = "NOP"
+
+# no rage-quitting
+[binds."alt f4"]
+bind = "NOP"
+
 
 
 # ================================= edge-cases =================================

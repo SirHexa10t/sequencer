@@ -114,7 +114,10 @@ fn reference() -> String {
     text.push_str(
         "\nKeys that have no char to go by are named: backspace, enter, the modifiers (ctl, shift...), the arrows (up, down..), space (separator for chord members).\n",
     );
-    text.push_str("\nOn X11, the focused program prints as `focus: <name>` whenever it changes.\n");
+    text.push_str(
+        "\nOn X11, the focused program prints as `focus: <name>` and the keyboard layout as\
+        \n`lang: <name>`, each whenever it changes — the spellings `program` and `kb_lang` match.\n",
+    );
     text
 }
 
@@ -158,7 +161,7 @@ pub(crate) fn detect_key(args: &DetectKeyArgs, deps: &mut Deps<'_>) -> Result<u8
             pump,
             deps.clock,
             &|| false,
-            &mut FocusPoll::silent(),
+            &mut SessionPoll::silent(),
             deps.out,
         );
     }
@@ -192,7 +195,7 @@ fn report_until_quit(
     pump: &mut dyn EventPump,
     clock: &dyn sequencer_core::time::Clock,
     quit_requested: &dyn Fn() -> bool,
-    focus: &mut FocusPoll,
+    focus: &mut SessionPoll,
     out: &mut dyn std::io::Write,
 ) -> Result<u8> {
     let mut checks: u32 = 0;
@@ -256,22 +259,26 @@ fn pressed_name(kind: EventKind) -> Option<String> {
 mod decode;
 mod tty;
 
-/// Prints the focused program's name whenever it changes — `focus: firefox` — the
-/// identifier a per-program profile will match on later. Keys print constantly; focus
-/// only on a switch, which is what makes both readable in one stream.
+/// Prints what the *session* is doing whenever it changes — `focus: firefox`,
+/// `lang: us` — the identifiers a profile's `program` and `kb_lang` gates match on.
+/// Keys print constantly; these only on a switch, which is what makes them all
+/// readable in one stream.
 ///
 /// Best-effort by design: on Wayland or without the `xtest` feature there is nothing to
-/// ask, and the run simply reports keys alone (the intro says focus is X11-only).
-struct FocusPoll {
+/// ask, and the run simply reports keys alone (the intro says both are X11-only).
+struct SessionPoll {
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     watcher: Option<sequencer_input::FocusWatcher>,
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    layout: Option<sequencer_input::LayoutWatcher>,
     last: Option<String>,
+    last_lang: Option<String>,
     /// The window that had focus when the run began — the terminal it was started
     /// from, since starting it is the last thing that happened there.
     home: Option<u32>,
 }
 
-impl FocusPoll {
+impl SessionPoll {
     fn new() -> Self {
         #[cfg(all(feature = "xtest", target_os = "linux"))]
         let watcher = sequencer_input::FocusWatcher::open();
@@ -290,7 +297,10 @@ impl FocusPoll {
             },
             #[cfg(all(feature = "xtest", target_os = "linux"))]
             watcher,
+            #[cfg(all(feature = "xtest", target_os = "linux"))]
+            layout: sequencer_input::LayoutWatcher::open(),
             last: None,
+            last_lang: None,
         }
     }
 
@@ -300,7 +310,10 @@ impl FocusPoll {
         Self {
             #[cfg(all(feature = "xtest", target_os = "linux"))]
             watcher: None,
+            #[cfg(all(feature = "xtest", target_os = "linux"))]
+            layout: None,
             last: None,
+            last_lang: None,
             home: None,
         }
     }
@@ -330,19 +343,42 @@ impl FocusPoll {
         None
     }
 
-    /// Asks for the current focus and prints it if it changed.
+    /// Asks for the focus and the layout, and prints each if it changed.
+    ///
+    /// An unreadable answer keeps the last known one: a window flickering through an
+    /// unnamed state must not re-announce its neighbour afterwards, and a layout that
+    /// cannot be named is not a layout change.
     fn report(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
-        let Some(class) = self.current() else {
-            // Unreadable focus keeps the last known name: a window flickering through
-            // an unnamed state must not re-announce its neighbour afterwards.
-            return Ok(());
-        };
-        if self.last.as_deref() != Some(class.as_str()) {
+        if let Some(class) = self.current()
+            && self.last.as_deref() != Some(class.as_str())
+        {
             writeln!(out, "focus: {class}")?;
             out.flush()?;
             self.last = Some(class);
         }
+        if let Some(lang) = self.language()
+            && self.last_lang.as_deref() != Some(lang.as_str())
+        {
+            writeln!(out, "lang: {lang}")?;
+            out.flush()?;
+            self.last_lang = Some(lang);
+        }
         Ok(())
+    }
+
+    /// The active keyboard layout's name, as `kb_lang` matches it.
+    #[cfg(all(feature = "xtest", target_os = "linux"))]
+    fn language(&self) -> Option<String> {
+        self.layout.as_ref()?.current()
+    }
+
+    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the stub keeps both builds on one call shape"
+    )]
+    fn language(&self) -> Option<String> {
+        None
     }
 
     #[cfg(all(feature = "xtest", target_os = "linux"))]
@@ -400,7 +436,7 @@ mod platform {
             silenced = silencer.is_some(),
             "detect-key: terminal state before reading devices"
         );
-        let mut focus = super::FocusPoll::new();
+        let mut focus = super::SessionPoll::new();
         focus.report(out)?;
 
         let mut pump = crate::runtime::CapturePump::new(stream, &clock);
@@ -481,8 +517,14 @@ mod tests {
         let mut pump = BusyPump::new(EventKind::Motion { x: 4, y: 9 }, 1_000);
         let mut out = Vec::new();
 
-        let code = report_until_quit(&mut pump, &clock, &|| true, &mut FocusPoll::new(), &mut out)
-            .expect("the loop reports its own exit");
+        let code = report_until_quit(
+            &mut pump,
+            &clock,
+            &|| true,
+            &mut SessionPoll::new(),
+            &mut out,
+        )
+        .expect("the loop reports its own exit");
 
         assert_eq!(code, exit::OK);
         assert!(
@@ -547,7 +589,7 @@ mod tests {
             &clock,
             // The terminal never sees it: this is the device path alone.
             &|| false,
-            &mut FocusPoll::new(),
+            &mut SessionPoll::new(),
             &mut out,
         )
         .expect("the chord ends the run cleanly");
@@ -582,7 +624,7 @@ mod tests {
             &mut pump,
             &clock,
             &|| false,
-            &mut FocusPoll::new(),
+            &mut SessionPoll::new(),
             &mut out,
         )
         .expect("the script runs out and the stream closes");
@@ -606,7 +648,7 @@ mod tests {
             &mut pump,
             &clock,
             &|| false,
-            &mut FocusPoll::new(),
+            &mut SessionPoll::new(),
             &mut out,
         )
         .expect("a closed stream is a clean exit");

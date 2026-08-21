@@ -58,20 +58,24 @@ pub(crate) fn profile_check(args: &ProfileCheckArgs, deps: &mut Deps<'_>) -> Res
                 } else {
                     writeln!(
                         deps.out,
-                        "{path}: ok ({} binds{})",
+                        "{path}: ok ({} binds{}{})",
                         profile.binds.len(),
-                        profile
-                            .program
-                            .as_deref()
-                            .map_or(String::new(), |patterns| {
-                                format!(", for program {}", patterns.join(" | "))
-                            })
+                        gate_note("program", profile.program.as_deref()),
+                        gate_note("kb_lang", profile.kb_lang.as_deref())
                     )?;
                 }
             }
         }
     }
     Ok(if bad == 0 { exit::OK } else { exit::FAILURE })
+}
+
+/// One gate's patterns for the summary line, or nothing when the profile has no such
+/// gate: `, for program *mpv* | *celluloid*`.
+fn gate_note(field: &str, patterns: Option<&[String]>) -> String {
+    patterns.map_or(String::new(), |patterns| {
+        format!(", for {field} {}", patterns.join(" | "))
+    })
 }
 
 /// Writes `text` over `path` through a temporary file in the same directory.
@@ -228,6 +232,8 @@ fn canonical_step(step: &str) -> String {
         "PRESS" | "RELEASE" | "WAIT" | "RNG" | "LOOP"
     ) {
         (Some(upper), tokens.collect())
+    } else if first.eq_ignore_ascii_case("NOP") {
+        return "NOP".to_owned();
     } else if first.eq_ignore_ascii_case("GNR") {
         return "GNR".to_owned();
     } else if first.eq_ignore_ascii_case("POOL") {

@@ -10,6 +10,8 @@
 //!   all**: the whole run is an ordinary X client.
 //! - [`focus`]: which program is focused — the manager's per-program gating asks it,
 //!   and `detect-key` reports it.
+//! - [`layout`]: which keyboard layout is active — the same pair of consumers, for
+//!   `kb_lang` gating.
 //!
 //! Neither reaches a Wayland client or the console; the [`crate::linux`] backend remains the
 //! one that works everywhere, and callers pick per session at runtime.
@@ -17,10 +19,12 @@
 pub mod capture;
 pub mod focus;
 pub mod inject;
+pub mod layout;
 
 pub use capture::{GrabCapture, GrabError, KeyProbe, KeyboardState};
 pub use focus::FocusWatcher;
 pub use inject::{LiftedTap, XTestSink};
+pub use layout::LayoutWatcher;
 
 /// Whether this really is an X11 session that both halves can use.
 ///

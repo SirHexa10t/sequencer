@@ -14,12 +14,12 @@ use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
-use super::format::{chord_mods, primary_key, program_applies, trigger_cycle};
+use super::format::{chord_mods, patterns_apply, primary_key, trigger_cycle};
 use super::state::{LockGuard, scan_active};
 use super::{Profile, parse, run};
 use crate::runtime::{CapturePump, EventPump, Wake};
 use crate::{Error, Result, exit};
-use sequencer_input::{Epoch, FocusWatcher, GrabCapture, SystemClock, XTestSink};
+use sequencer_input::{Epoch, FocusWatcher, GrabCapture, LayoutWatcher, SystemClock, XTestSink};
 
 /// Ctrl+C (and SIGTERM) set this; the loop notices within one heartbeat and stops
 /// through the normal teardown.
@@ -93,7 +93,8 @@ struct Slot {
     /// nothing here, which is what keeps a running profile from mutating under the
     /// user's hands without their say-so.
     stamp: Option<std::time::SystemTime>,
-    /// The profile wants to be active (its program matches, or it has none).
+    /// The profile wants to be active: every gate it declares (`program`, `kb_lang`)
+    /// reads as matching, or it declares none.
     want: bool,
     /// Activation failed on a grab conflict; warned once, retried on changes.
     blocked: bool,
@@ -104,6 +105,13 @@ impl Slot {
     /// modifier classes, one per alternative spelling.
     fn stop_chords(&self) -> Vec<(Key, Mods)> {
         run::stop_chords(&self.profile)
+    }
+
+    /// Whether this profile answers to a session gate at all (`program`, `kb_lang`).
+    /// Gated profiles outrank global ones in the claim pass: they are the specific
+    /// case, and the specific case is what a collision should resolve to.
+    fn is_gated(&self) -> bool {
+        self.profile.program.is_some() || self.profile.kb_lang.is_some()
     }
 }
 
@@ -153,6 +161,54 @@ fn claim_triggers(
     claim
 }
 
+/// One session gate's answer for a slot, this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// The profile does not declare this gate at all.
+    Absent,
+    /// It declares it, but the session cannot answer right now.
+    Unreadable,
+    /// It declares it and the reading is in.
+    Read(bool),
+}
+
+/// Whether a slot wants to be active, from each gate it declares.
+///
+/// Any gate reading false shuts the slot; every gate reading true opens it; an
+/// unreadable gate keeps the last decision rather than flapping the grabs — holding a
+/// grab through a blink costs a swallowed key, where dropping and retaking it costs the
+/// keys pressed in between. (Acting is the stricter question, and [`licensed`] answers
+/// it: there, unreadable is a refusal.)
+fn wants_activation(last: bool, gates: [Gate; 2]) -> bool {
+    let mut unreadable = false;
+    for gate in gates {
+        match gate {
+            Gate::Read(false) => return false,
+            Gate::Read(true) | Gate::Absent => {}
+            Gate::Unreadable => unreadable = true,
+        }
+    }
+    !unreadable || last
+}
+
+/// Re-reads every slot's gates against the session as it is right now.
+fn refresh_wants(slots: &mut BTreeMap<String, Slot>, class: Option<&str>, lang: Option<&str>) {
+    let reading = |patterns: &Option<Vec<String>>, value: Option<&str>| match (patterns, value) {
+        (None, _) => Gate::Absent,
+        (Some(_), None) => Gate::Unreadable,
+        (Some(patterns), Some(value)) => Gate::Read(patterns_apply(patterns, value)),
+    };
+    for slot in slots.values_mut() {
+        slot.want = wants_activation(
+            slot.want,
+            [
+                reading(&slot.profile.program, class),
+                reading(&slot.profile.kb_lang, lang),
+            ],
+        );
+    }
+}
+
 /// The bracketed spelling of the bind owning `signature` in `profile` — the first
 /// spelling, when side-variants share it.
 fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
@@ -195,6 +251,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
     let mut failed: BTreeMap<String, Option<std::time::SystemTime>> = BTreeMap::new();
     let mut emergency: Option<(BTreeSet<Vec<Key>>, GrabCapture)> = None;
     let mut focus: Option<FocusWatcher> = None;
+    let mut layout: Option<LayoutWatcher> = None;
     // One live connection for "is that key still down?" — the deferred-tap question.
     let probe = sequencer_input::KeyProbe::open();
     // Contaminated mirrors tap between lifted modifiers — this owns that path;
@@ -228,6 +285,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                 &mut failed,
                 &mut emergency,
                 &mut focus,
+                &mut layout,
                 scanned_dir,
             ) {
                 break Err(err);
@@ -265,6 +323,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                     probe.as_ref(),
                     lifter.as_ref(),
                     focus.as_ref(),
+                    layout.as_ref(),
                 ) {
                     break Err(err);
                 }
@@ -314,6 +373,7 @@ fn dispatch(
     probe: Option<&sequencer_input::KeyProbe>,
     lifter: Option<&sequencer_input::LiftedTap>,
     focus: Option<&FocusWatcher>,
+    layout: Option<&LayoutWatcher>,
 ) -> Result<()> {
     let (sequencer_core::input::EventKind::KeyDown(key)
     | sequencer_core::input::EventKind::KeyUp(key)) = event.kind
@@ -340,16 +400,27 @@ fn dispatch(
         return Ok(());
     };
     let name = name.clone();
-    // The gate re-asks focus live, so a running sequence stops the moment its
-    // program loses focus rather than typing into whatever has it now. A profile
-    // with no `program` has no gate — it is always licensed.
-    let program = slot.profile.program.clone();
-    let gate_fn = move || match &program {
-        None => true,
-        Some(patterns) => {
-            let class = focus.and_then(FocusWatcher::focused_class);
-            licensed(patterns, class.as_deref())
-        }
+    // The gate re-asks live, so a running sequence stops the moment its program loses
+    // focus (or the layout switches) rather than typing into whatever has it now. A
+    // profile with neither gate is always licensed.
+    let gates = (slot.profile.program.clone(), slot.profile.kb_lang.clone());
+    let gate_fn = move || {
+        let class = gates
+            .0
+            .is_some()
+            .then(|| focus.and_then(FocusWatcher::focused_class))
+            .flatten();
+        let lang = gates
+            .1
+            .is_some()
+            .then(|| layout.and_then(LayoutWatcher::current))
+            .flatten();
+        licensed(
+            gates.0.as_deref(),
+            class.as_deref(),
+            gates.1.as_deref(),
+            lang.as_deref(),
+        )
     };
     // A deferred tap asks the server whether the trigger's modifiers are still
     // physically down; with no probe the answer is "no" and taps fire immediately.
@@ -373,11 +444,8 @@ fn dispatch(
         // Only this slot's own stop chords may end its in-flight sequence; another
         // profile's stop is not its business.
         stop: &stops,
-        gate: slot
-            .profile
-            .program
-            .as_ref()
-            .map(|_| &gate_fn as &dyn Fn() -> bool),
+        gate: (slot.profile.program.is_some() || slot.profile.kb_lang.is_some())
+            .then_some(&gate_fn as &dyn Fn() -> bool),
         mods_down: Some(&mods_down_fn as &dyn Fn(Mods) -> bool),
         key_down: Some(&key_down_fn as &dyn Fn(Key) -> bool),
         lift: Some(&lift_fn as run::LiftTap<'_>),
@@ -390,17 +458,28 @@ fn dispatch(
     }
 }
 
-/// Whether a program-gated profile is licensed to act right now.
+/// Whether a gated profile is licensed to act right now: every gate it declares must
+/// read as matching.
 ///
-/// Unreadable focus is NOT a licence. The class reads as `None` for exactly the states
-/// a closing program produces — `_NET_ACTIVE_WINDOW` cleared, or still naming a window
-/// that has already been destroyed — and acting then is how a sequence ends up typing
-/// into whatever inherited the focus. Grab bookkeeping makes the opposite call on
+/// An unreadable answer is NOT a licence. The focused class reads as `None` for exactly
+/// the states a closing program produces — `_NET_ACTIVE_WINDOW` cleared, or still naming
+/// a window already destroyed — and acting then is how a sequence ends up typing into
+/// whatever inherited the focus; an unreadable layout is the same bet on a profile that
+/// exists to act on one language only. Grab bookkeeping makes the opposite call on
 /// purpose ([`reconcile_activation`] keeps the last decision rather than flapping):
 /// holding a grab through a blink costs a swallowed key, acting on one costs the wrong
 /// window.
-fn licensed(patterns: &[String], class: Option<&str>) -> bool {
-    class.is_some_and(|class| program_applies(patterns, class))
+fn licensed(
+    program: Option<&[String]>,
+    class: Option<&str>,
+    kb_lang: Option<&[String]>,
+    layout: Option<&str>,
+) -> bool {
+    let open = |patterns: Option<&[String]>, value: Option<&str>| match patterns {
+        None => true,
+        Some(patterns) => value.is_some_and(|value| patterns_apply(patterns, value)),
+    };
+    open(program, class) && open(kb_lang, layout)
 }
 
 /// A one-line warning if the server still has a modifier active that no key is holding
@@ -532,14 +611,24 @@ fn rescan(
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
     emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
     focus: &mut Option<FocusWatcher>,
+    layout: &mut Option<LayoutWatcher>,
     rescan_dir: bool,
 ) -> Result<()> {
     if rescan_dir {
         reconcile_set(out, clock, sink, slots, failed)?;
     }
     reconcile_emergency(out, epoch, queue, slots, emergency);
-    ensure_focus(out, slots, focus)?;
-    reconcile_activation(out, epoch, queue, sink, clock, slots, focus.as_ref())?;
+    ensure_watchers(out, slots, focus, layout)?;
+    reconcile_activation(
+        out,
+        epoch,
+        queue,
+        sink,
+        clock,
+        slots,
+        focus.as_ref(),
+        layout.as_ref(),
+    )?;
     out.flush()?;
     Ok(())
 }
@@ -580,11 +669,14 @@ fn reconcile_emergency(
     }
 }
 
-/// Opens the focus watcher the first time a program-gated profile appears.
-fn ensure_focus(
+/// Opens each watcher the first time a profile gated on it appears — focus for
+/// `program`, XKB for `kb_lang`. A session that cannot answer is said out loud once,
+/// because the profiles waiting on that answer will never activate.
+fn ensure_watchers(
     out: &mut dyn std::io::Write,
     slots: &BTreeMap<String, Slot>,
     focus: &mut Option<FocusWatcher>,
+    layout: &mut Option<LayoutWatcher>,
 ) -> Result<()> {
     if focus.is_none() && slots.values().any(|slot| slot.profile.program.is_some()) {
         *focus = FocusWatcher::open();
@@ -592,6 +684,16 @@ fn ensure_focus(
             writeln!(
                 out,
                 "focus is unreadable (no EWMH?): program-gated profiles stay dormant"
+            )?;
+        }
+    }
+    if layout.is_none() && slots.values().any(|slot| slot.profile.kb_lang.is_some()) {
+        *layout = LayoutWatcher::open();
+        if layout.is_none() {
+            writeln!(
+                out,
+                "the keyboard layout is unreadable (no XKB?): kb_lang-gated profiles \
+                 stay dormant"
             )?;
         }
     }
@@ -604,6 +706,10 @@ fn ensure_focus(
 /// alphabetical within a tier. A colliding bind yields individually (its siblings
 /// stay live) and resumes the moment its claimant goes dormant. Grabs feed the
 /// shared `queue`; a deactivating slot drains its ledger.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the manager's whole state, one pass"
+)]
 fn reconcile_activation(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
@@ -612,17 +718,11 @@ fn reconcile_activation(
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     focus: Option<&FocusWatcher>,
+    layout: Option<&LayoutWatcher>,
 ) -> Result<()> {
     let class = focus.and_then(FocusWatcher::focused_class);
-    for slot in slots.values_mut() {
-        slot.want = match &slot.profile.program {
-            None => true,
-            // Unreadable focus keeps the last decision rather than flapping.
-            Some(patterns) => class
-                .as_deref()
-                .map_or(slot.want, |class| program_applies(patterns, class)),
-        };
-    }
+    let lang = layout.and_then(LayoutWatcher::current);
+    refresh_wants(slots, class.as_deref(), lang.as_deref());
 
     // The claim pass. Stops are seeded for every slot, dormant ones included — the
     // emergency grab stays alive regardless of focus, and no bind may shadow it.
@@ -633,12 +733,12 @@ fn reconcile_activation(
         .collect();
     let in_order: Vec<String> = slots
         .iter()
-        .filter(|(_, slot)| slot.want && slot.profile.program.is_some())
+        .filter(|(_, slot)| slot.want && slot.is_gated())
         .map(|(name, _)| name.clone())
         .chain(
             slots
                 .iter()
-                .filter(|(_, slot)| slot.want && slot.profile.program.is_none())
+                .filter(|(_, slot)| slot.want && !slot.is_gated())
                 .map(|(name, _)| name.clone()),
         )
         .collect();
@@ -856,26 +956,71 @@ mod tests {
         parse(text).expect("test profile parses")
     }
 
-    /// A gated profile acts only on a focus reading that matches. Unreadable focus is
-    /// not a licence: it is what a program *exiting* looks like — the active-window
-    /// property cleared, or naming a window already destroyed — and firing then types
-    /// into whatever inherited the focus.
+    /// A gated profile acts only on readings that match — every gate it declares.
+    /// Unreadable is not a licence: it is what a program *exiting* looks like (the
+    /// active-window property cleared, or naming a window already destroyed), and
+    /// firing then types into whatever inherited the focus.
     #[test]
-    fn an_unreadable_focus_is_not_a_licence_to_act() {
-        let patterns = vec!["*mpv*".to_owned()];
-        assert!(licensed(&patterns, Some("mpv")));
+    fn a_gate_with_no_reading_is_not_a_licence_to_act() {
+        let mpv = vec!["*mpv*".to_owned()];
+        let english = vec!["us".to_owned()];
+
+        // One gate at a time.
+        assert!(licensed(Some(&mpv), Some("mpv"), None, None));
         assert!(
-            licensed(&patterns, Some("Celluloid-mpv")),
+            licensed(Some(&mpv), Some("Celluloid-mpv"), None, None),
             "glob, folded case"
         );
-        assert!(!licensed(&patterns, Some("firefox")));
+        assert!(!licensed(Some(&mpv), Some("firefox"), None, None));
         assert!(
-            !licensed(&patterns, None),
+            !licensed(Some(&mpv), None, None, None),
             "no readable class means no licence"
         );
+        assert!(!licensed(Some(&mpv), Some(""), None, None));
+        assert!(!licensed(None, None, Some(&english), None), "nor layout");
+
+        // Both gates: each must agree, and an ungated profile always may.
+        assert!(licensed(
+            Some(&mpv),
+            Some("mpv"),
+            Some(&english),
+            Some("us")
+        ));
+        assert!(!licensed(
+            Some(&mpv),
+            Some("mpv"),
+            Some(&english),
+            Some("il")
+        ));
+        assert!(licensed(None, None, None, None));
+    }
+
+    /// Activation is the looser question: any gate reading false shuts the slot, all
+    /// reading true opens it, and one that cannot be read holds the last answer rather
+    /// than flapping the grabs.
+    #[test]
+    fn an_unreadable_gate_holds_the_last_activation() {
         assert!(
-            !licensed(&patterns, Some("")),
-            "and neither does a blank one"
+            wants_activation(false, [Gate::Absent, Gate::Absent]),
+            "ungated: always on"
+        );
+        assert!(wants_activation(false, [Gate::Read(true), Gate::Absent]));
+        assert!(!wants_activation(true, [Gate::Read(false), Gate::Absent]));
+        assert!(
+            !wants_activation(true, [Gate::Read(true), Gate::Read(false)]),
+            "one shut gate is enough"
+        );
+        assert!(
+            wants_activation(true, [Gate::Unreadable, Gate::Read(true)]),
+            "unreadable holds the last answer: was on, stays on"
+        );
+        assert!(
+            !wants_activation(false, [Gate::Unreadable, Gate::Read(true)]),
+            "and was off, stays off"
+        );
+        assert!(
+            !wants_activation(true, [Gate::Unreadable, Gate::Read(false)]),
+            "a shut gate still wins over an unreadable one"
         );
     }
 

@@ -209,6 +209,9 @@ impl<'a> Executor<'a> {
             }
             if let Some(bind) = bind_of(self.profile, key, event.mods, pumps.key_down) {
                 match &bind.action {
+                    // Swallowed: the grab consumed the press, and that is the whole
+                    // point of `bind = "NOP"`. Nothing to emit, nothing to release.
+                    Action::Nothing => {}
                     Action::Mirror(targets) => {
                         let mut targets = targets.clone();
                         let tap = bind.tap;
