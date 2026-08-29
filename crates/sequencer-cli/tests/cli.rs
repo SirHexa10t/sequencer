@@ -17,7 +17,7 @@ use predicates::prelude::*;
 
 use sequencer_cli::runtime::ScriptedPump;
 use sequencer_cli::{
-    ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, GlobalArgs, ProfileApplyArgs, dispatch,
+    ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, ProfileApplyArgs, dispatch,
     exit,
 };
 use sequencer_core::emit::EmitAction;
@@ -328,7 +328,7 @@ fn profile_apply_accepts_the_shipped_template() {
 
     let args = ProfileApplyArgs {
         files: vec![concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_profile.toml").into()],
-        global: GlobalArgs::new(),
+        ..ProfileApplyArgs::new()
     };
     let code = dispatch(&Command::ProfileApply(args), &mut deps).expect("should run");
 

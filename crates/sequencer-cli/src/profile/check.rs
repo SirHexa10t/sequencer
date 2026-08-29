@@ -27,8 +27,11 @@ use super::format::{is_modifier, parse};
 /// counted, not returned as an error — checking several files should report on all of
 /// them, and the exit code carries the verdict.
 pub(crate) fn profile_check(args: &ProfileCheckArgs, deps: &mut Deps<'_>) -> Result<u8> {
+    // The same expansion `profile-apply` uses — directories and files, mixed freely —
+    // so "check what apply would take" is literally the same argument list.
+    let files = super::expand_profile_args(&args.files)?;
     let mut bad = 0_u32;
-    for file in &args.files {
+    for file in &files {
         let path = file.display().to_string();
         let text = std::fs::read_to_string(file).map_err(|source| Error::ScriptRead {
             path: path.clone(),

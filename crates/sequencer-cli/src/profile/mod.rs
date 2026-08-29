@@ -32,6 +32,22 @@ pub(crate) use manager::caught_interrupt;
 pub(crate) use check::profile_check;
 pub(crate) use format::{Action, Bind, Loops, Profile, Step, parse};
 
+/// The applied set right now: each profile's name in the set and the file its link
+/// resolves to. Empty when nothing is applied — and always empty off Linux, where
+/// nothing can have been applied to begin with. For embedders that list state; a name
+/// here is exactly what `profile-unapply` accepts.
+#[must_use]
+pub fn applied_profiles() -> Vec<(String, std::path::PathBuf)> {
+    #[cfg(target_os = "linux")]
+    {
+        state::scan_active().map(|set| set.into_iter().collect()).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
 /// `sequencer profile-apply`.
 ///
 /// Validates every file, links each into the active set — re-linking an applied one,
@@ -463,6 +479,39 @@ fn resolve_one(token: &str, names: &[String]) -> std::result::Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_store(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sequencer-store-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Directories expand to their direct `.toml`s in name order, files pass through
+    /// as written, and the two mix freely — the shared ground under `profile-apply`
+    /// and `profile-check`, so "check what apply would take" is the same argument.
+    #[test]
+    fn expansion_mixes_directories_and_paths() {
+        let dir = temp_store("expand-dir");
+        std::fs::write(dir.join("b.toml"), "").unwrap();
+        std::fs::write(dir.join("a.toml"), "").unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/deep.toml"), "").unwrap();
+        let file = temp_store("expand-file").join("gaming.toml");
+        std::fs::write(&file, "").unwrap();
+
+        let files = expand_profile_args(&[file.clone(), dir.clone()]).unwrap();
+        assert_eq!(
+            files,
+            vec![file, dir.join("a.toml"), dir.join("b.toml")],
+            "files as written, then the directory's direct .tomls in name order — \
+             nested/deep.toml stays out (non-recursive on purpose)"
+        );
+    }
 
     /// The picker takes numbers, names (with or without .toml), paths, or `all` — and
     /// says what it cannot place instead of guessing.

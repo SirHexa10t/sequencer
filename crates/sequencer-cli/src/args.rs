@@ -240,10 +240,29 @@ pub struct ProfileApplyArgs {
     pub global: GlobalArgs,
 }
 
+impl ProfileApplyArgs {
+    /// Every flag at its command-line default.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            files: Vec::new(),
+            global: GlobalArgs::new(),
+        }
+    }
+}
+
+impl Default for ProfileApplyArgs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `sequencer profile-check`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ProfileCheckArgs {
-    /// Binds files to check. Nothing is applied and no state is touched.
+    /// Binds files to check. Nothing is applied and no state is touched. A directory
+    /// names every `.toml` directly inside it, in name order — the same rule as
+    /// `profile-apply`, so "check what apply would take" is the same argument.
     #[arg(value_name = "FILE", num_args = 1.., required = true)]
     pub files: Vec<PathBuf>,
 
@@ -254,6 +273,24 @@ pub struct ProfileCheckArgs {
     /// Shared options.
     #[command(flatten)]
     pub global: GlobalArgs,
+}
+
+impl ProfileCheckArgs {
+    /// Every flag at its command-line default.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            files: Vec::new(),
+            format: false,
+            global: GlobalArgs::new(),
+        }
+    }
+}
+
+impl Default for ProfileCheckArgs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// `sequencer profile-unapply`.
@@ -267,6 +304,23 @@ pub struct ProfileUnapplyArgs {
     /// Shared options.
     #[command(flatten)]
     pub global: GlobalArgs,
+}
+
+impl ProfileUnapplyArgs {
+    /// Every flag at its command-line default.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            global: GlobalArgs::new(),
+        }
+    }
+}
+
+impl Default for ProfileUnapplyArgs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Rejects a bad rate at parse time, so `--cps 0` is a clean usage error rather than a
@@ -363,19 +417,9 @@ mod tests {
             Command::Bench(BenchArgs::new()),
             Command::Doctor(DoctorArgs::new()),
             Command::DetectKey(DetectKeyArgs::new()),
-            Command::ProfileApply(ProfileApplyArgs {
-                files: Vec::new(),
-                global: GlobalArgs::new(),
-            }),
-            Command::ProfileUnapply(ProfileUnapplyArgs {
-                names: Vec::new(),
-                global: GlobalArgs::new(),
-            }),
-            Command::ProfileCheck(ProfileCheckArgs {
-                files: Vec::new(),
-                format: false,
-                global: GlobalArgs::new(),
-            }),
+            Command::ProfileApply(ProfileApplyArgs::new()),
+            Command::ProfileUnapply(ProfileUnapplyArgs::new()),
+            Command::ProfileCheck(ProfileCheckArgs::new()),
             Command::WriteScript(WriteScriptArgs::new()),
         ];
         assert_eq!(

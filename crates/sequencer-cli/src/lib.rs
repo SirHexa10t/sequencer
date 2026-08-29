@@ -82,6 +82,9 @@ pub mod runtime;
 pub mod write_script;
 
 #[cfg(feature = "cli")]
+pub use profile::applied_profiles;
+
+#[cfg(feature = "cli")]
 mod elevate;
 // Colour for the clicker's banner; there is no banner without the command line.
 #[cfg(feature = "cli")]
