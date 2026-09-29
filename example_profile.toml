@@ -56,6 +56,9 @@ emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile
 #                               (re-pressing the spelling that started a sequence stops it).
 #   loop = <n> / "inf"        (optional, seq only) repeats the whole sequence
 #                               re-triggering the bind stops it early and releases its held-down keys
+#   only_while_pressed = true (optional, seq only) the sequence runs only while the trigger is held down;
+#                               letting go stops it (releasing its held-down keys). Combines with `loop`:
+#                               `loop = "inf"` + this = repeat while held ; `loop = 5` + this = up to 5 times while held
 #   tap  = "<duration>"       (optional) per-bind override of the [defaults] timings
 #   gap  = "<duration>"       (optional) per-bind override of the [defaults] timings
 
@@ -84,7 +87,8 @@ emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile
 
 # ================================= edge mirrors =================================
 
-# The classic remap: PgUp becomes a volume key, auto-repeat included.
+# The classic remap: PgUp becomes a volume key - one step per press.
+# (Holding it does NOT repeat: a key grab hears one press per physical press; the OS auto-repeat never reaches it.)
 [binds.PgUp]
 bind = "volume-up"
 

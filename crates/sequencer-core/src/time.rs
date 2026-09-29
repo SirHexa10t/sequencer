@@ -8,8 +8,6 @@ use core::num::NonZeroU64;
 
 pub use core::time::Duration;
 
-use crate::validate::ConfigError;
-
 /// Monotonic nanoseconds since an opaque epoch chosen by the runner.
 ///
 /// Deliberately not `std::time::Instant`: the engine must not know about the OS. Every
@@ -98,6 +96,15 @@ fn round_to_u64(x: f64) -> u64 {
 /// there is no "period of zero means infinite loop" case to defend against downstream.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Period(NonZeroU64);
+
+/// A rate that cannot be run as written.
+#[derive(Clone, PartialEq, Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// A rate that is not a finite positive number.
+    #[error("clicks per second must be a finite positive number, got {0}")]
+    CpsOutOfRange(f64),
+}
 
 impl Period {
     /// Converts a rate in clicks (or key presses) per second into a period.

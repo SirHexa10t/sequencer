@@ -7,7 +7,7 @@
 //! And it means the layout question is already answered when the work starts.
 //!
 //! The engine can very nearly do this already: [`crate::clicker`] lowers its settings into a
-//! [`Profile`](sequencer_core::ir::Profile) of emit-and-wait steps, and a script is the same
+//! binds `Profile` of tap-hold-wait steps, and a script is the same
 //! IR with the steps read from a file instead of generated from a rate. What is missing is a
 //! script format, its parser, and the validation to reject a sequence that would leave a key
 //! held. `profile-apply` already runs key-triggered *output* sequences for

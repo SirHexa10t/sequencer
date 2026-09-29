@@ -12,7 +12,6 @@
 //! | raw argv | [`run`] / [`try_run`] | parse and execute; help and usage handled |
 //! | a parsed [`Cli`] | [`run_cli`] / [`try_run_cli`] | execute against the real backend |
 //! | a [`Command`] inside your own parser | [`Command::run`] / [`run_command`] | one subcommand |
-//! | a plain config, no clap | [`run_clicker`] | the engine, nothing else |
 //!
 //! Every flag is a public field, and each args struct has a `new()` giving the
 //! command-line defaults. Build one with struct-update syntax so a flag added in a later
@@ -62,13 +61,15 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 // The subcommand bodies take the clap argument structs, so they live behind the same
-// gate. What remains without `cli` is the engine wiring -- `runtime`, `Deps`,
-// `run_clicker` -- which is exactly what an embedder who wants the engine and not the
-// command line asks for.
+// gate -- and so does the binds format, whose parser is serde+toml, which `cli` brings.
+// What remains without `cli` is the plumbing: `runtime` (the pumps and the run summary)
+// and `Deps`, for an embedder that wires the crates below to a loop of its own.
 #[cfg(feature = "cli")]
 mod backend;
 #[cfg(feature = "cli")]
 pub mod bench;
+#[cfg(feature = "cli")]
+mod binds;
 #[cfg(feature = "cli")]
 pub mod clicker;
 #[cfg(feature = "cli")]
@@ -118,12 +119,10 @@ pub use crate::error::Error;
 #[cfg(feature = "cli")]
 pub use crate::write_script::WriteScriptArgs;
 
-use sequencer_core::clicker::ClickConfig;
 use sequencer_core::emit::InputSink;
 use sequencer_core::time::Clock;
-use sequencer_core::{CompiledProfile, Engine};
 
-use crate::runtime::{EventPump, RunSummary, cadence_of, fuse_limit, run_engine};
+use crate::runtime::EventPump;
 
 /// This crate's result type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -199,7 +198,7 @@ where
 
 /// Prints an error and everything underneath it.
 ///
-/// Only the argv entry points report for themselves; an embedder calling [`run_clicker`]
+/// Only the argv entry points report for themselves; an embedder calling [`run_command`]
 /// renders its own.
 ///
 /// Walking the chain matters here: the sentence a user can act on -- which permission is
@@ -313,32 +312,6 @@ pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
         Command::ProfileUnapply(args) => profile::unprofile_apply(args, deps),
         Command::ProfileCheck(args) => profile::profile_check(args, deps),
     }
-}
-
-/// Runs the clicker from a plain config, with no clap involved.
-///
-/// Compiles with `--no-default-features`, for an embedder that wants the engine and none
-/// of the command-line surface.
-///
-/// # Errors
-///
-/// If the config does not describe a runnable profile, or the sink fails.
-pub fn run_clicker(
-    config: &ClickConfig,
-    sink: &mut dyn InputSink,
-    clock: &dyn Clock,
-    pump: &mut dyn EventPump,
-) -> Result<RunSummary> {
-    let profile = CompiledProfile::validate(config.to_profile()?)?;
-    let mut engine = Engine::new(profile, 0);
-    run_engine(
-        &mut engine,
-        sink,
-        clock,
-        pump,
-        fuse_limit(config.cps),
-        cadence_of(config.cps),
-    )
 }
 
 /// The signal (SIGINT/SIGTERM) that ended a run this process served, if any.

@@ -97,7 +97,7 @@ const fn x11_handles_everything(x11_usable: bool) -> bool {
 /// in the usual way, unprivileged and instantly.
 fn wants_devices(command: &Command) -> bool {
     match command {
-        Command::Clicker(args) => args.config().to_profile().is_ok(),
+        Command::Clicker(args) => crate::clicker::binds_profile(&args.config()).is_ok(),
         Command::Bench(_) => true,
         // Exact detection reads the devices; `--no-sudo` reads the terminal instead.
         Command::DetectKey(args) => !args.no_sudo,

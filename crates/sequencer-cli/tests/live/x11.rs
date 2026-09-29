@@ -120,26 +120,41 @@ struct Manager {
 
 impl Manager {
     fn start(config: &TempConfig, profiles: &[&Path]) -> Self {
-        let log = config.dir().join("manager.log");
+        let mut args: Vec<std::ffi::OsString> = vec!["profile-apply".into(), "-vv".into()];
+        args.extend(profiles.iter().map(|path| path.as_os_str().to_owned()));
+        Self::spawn(config, &args, "managing")
+    }
+
+    /// The clicker, spawned the same way: a plain process on the temp config, `-vv`,
+    /// ready once its banner is in the log.
+    fn clicker(config: &TempConfig, flags: &[&str]) -> Self {
+        let mut args: Vec<std::ffi::OsString> = vec!["clicker".into(), "-vv".into()];
+        args.extend(flags.iter().map(std::ffi::OsString::from));
+        Self::spawn(config, &args, "Quit:")
+    }
+
+    /// Any subcommand as a child with its output in one log, considered started once
+    /// `ready` appears there.
+    fn spawn(config: &TempConfig, args: &[std::ffi::OsString], ready: &str) -> Self {
+        let log = config.dir().join("child.log");
         let out = std::fs::File::create(&log).expect("log file");
         let err = out.try_clone().expect("log file handle");
         let child = Command::new(harness::bin())
-            .args(["profile-apply", "-vv"])
-            .args(profiles)
+            .args(args)
             .env("SEQUENCER_CONFIG_DIR", config.dir())
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
             .spawn()
-            .expect("manager spawns");
-        let manager = Self { child, log };
+            .expect("child spawns");
+        let spawned = Self { child, log };
         assert!(
-            harness::await_line(&manager.log, "managing", 10),
-            "manager never said 'managing': {}",
-            harness::read(&manager.log)
+            harness::await_line(&spawned.log, ready, 10),
+            "child never said {ready:?}: {}",
+            harness::read(&spawned.log)
         );
-        manager
+        spawned
     }
 
     fn log(&self) -> &Path {
@@ -517,6 +532,69 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
 /// Ctrl+C semantics plus focus gating: a program-gated profile stays dormant and
 /// eats nothing; SIGINT stops everything, clears the set, and the process dies BY
 /// the signal — which is what hands the user's shell its prompt back cleanly.
+/// The clicker on a real X server: a tap of the activation key starts the toggle, the
+/// next tap stops it, the quit key ends the run and the report counts what was sent.
+/// The action is the Pause key, which no focused application does anything with.
+#[test]
+#[ignore = "live: needs a real X session + keyboard injection; SUDO-TEST.sh runs it in its second pass"]
+fn the_clicker_toggles_on_real_key_taps_and_quits() {
+    let _serial = harness::serial();
+    if !ready() {
+        return;
+    }
+    let config = TempConfig::new();
+    let mut clicker = Manager::clicker(
+        &config,
+        &[
+            "--toggle",
+            "--cps",
+            "50",
+            "--kb-key",
+            "pause",
+            "--activate",
+            "f9",
+            "--quit",
+            "f8",
+        ],
+    );
+
+    // Start: injections begin and keep coming.
+    let before = harness::inject_count(clicker.log());
+    tap_chord(&[Key::F9]);
+    assert!(
+        injections_grow(clicker.log(), before, 3),
+        "a tap of F9 starts the clicking: {}",
+        harness::read(clicker.log())
+    );
+
+    // Stop: the next tap ends it, and the count stops moving.
+    tap_chord(&[Key::F9]);
+    let stopped = settled_injections(clicker.log());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        harness::inject_count(clicker.log()),
+        stopped,
+        "the second tap stops the clicking: {}",
+        harness::read(clicker.log())
+    );
+
+    // Quit: the process ends on its own and reports.
+    tap_chord(&[Key::F8]);
+    let status = clicker
+        .ended_within(3)
+        .expect("the quit key ends the clicker");
+    assert!(status.success(), "a quit is a clean exit, got {status:?}");
+    let text = harness::read(clicker.log());
+    assert!(
+        text.contains("sent ") && text.contains("repetitions"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("sent 0 repetitions"),
+        "something was sent between the taps: {text}"
+    );
+}
+
 #[test]
 #[ignore = "live: needs a real X session + keyboard injection; SUDO-TEST.sh runs it in its second pass"]
 fn ctrl_c_stops_everything_and_dies_by_the_signal() {

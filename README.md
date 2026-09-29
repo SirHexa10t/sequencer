@@ -23,12 +23,12 @@ Yet to write
 - **Clicks at the cursor**, without moving it. Any mouse button.
 - **No rate ceiling of ours.** The limit is your machine and your input stack, and
   `sequencer bench` measures both.
-- **The rate you asked for.** Repetitions are scheduled against absolute deadlines in
-  integer nanoseconds, so 20/s stays 20/s over hours instead of drifting. When the machine
-  cannot keep up it drops the missed slots and says how many, rather than firing a
-  catch-up burst.
-- **Nothing gets left held down**, including after a panic — checked by a property test
-  across hundreds of random cancellation scenarios.
+- **No catch-up, ever.** Repetitions are paced by the gap between them, so a click that
+  ran late is simply late — a busy machine never builds up a debt that comes out as a
+  burst. The exit report says what was actually sent, and at what rate.
+- **Nothing gets left held down**, including after a panic: every run releases what it
+  pressed on every way out, and a drop guard covers the unwinding one — tested with a
+  sink that gives up mid-sequence.
 - **Works on Wayland**, which tools built on X11 automation APIs cannot.
 - **Nothing to set up on X11.** An X11 run is an ordinary X client: no group to join, no
   device to open, no password. Off X11 it can borrow sudo for a single run rather than
@@ -175,8 +175,7 @@ On exit it reports what it **sent** — repetitions, actions, the rate that work
 the rate you asked for — with "not all may arrive" right on the line, deliberately never
 "achieved". Every number is counted as this process hands events to the backend; what an
 application ends up acting on can be lower, and this tool cannot see that from the inside.
-`bench` is the one that measures what came back out. If the machine could not keep up it
-also says how many repetitions were skipped, and a final `ran 12.3s` line is the stopwatch
+`bench` is the one that measures what came back out. A final `ran 12.3s` line is the stopwatch
 for the session.
 
 Two hold durations matter and are separately tunable: `--button-hold-ms` (default 8) and
@@ -398,8 +397,7 @@ second argument is how *your* command line spells the doctor command, so the adv
 is runnable.
 
 The library never calls `process::exit`, never installs a tracing subscriber or signal
-handler, and never reads `std::env::args` for you. For the engine with no clap at all,
-depend on it with `default-features = false` and call `run_clicker`.
+handler, and never reads `std::env::args` for you.
 
 The two backends are separate features, both on by default, and either alone is a complete
 build. `--features cli,xtest` is X11-only with no evdev in your dependency graph and no
@@ -410,20 +408,21 @@ session type at the cost of the permission.
 
 | Crate | What it holds |
 |---|---|
-| `sequencer-core` | The engine. `#![no_std]`, one dependency, no clock, no threads, no I/O. |
+| `sequencer-core` | The vocabulary: keys as positions, events, actions, time. `#![no_std]`, one dependency, no clock, no threads, no I/O. |
 | `sequencer-input` | Every operating-system call in the project. |
-| `sequencer-cli` | The clap surface, the run loop, and the `sequencer` binary. |
+| `sequencer-cli` | The clap surface, the binds format and its executor, and the `sequencer` binary. |
 
-`sequencer-core` has no path to an OS input API in its dependency graph, and never reads a
-clock — the runner passes time in. That is what makes "iteration 10,000 starts at exactly
-500 seconds" an exact assertion that runs in microseconds. Timing is the whole ballgame for
-an autoclicker, and a test suite that has to sleep in real time is one nobody runs.
+`sequencer-core` has no path to an OS input API in its dependency graph and never reads a
+clock, and the executor takes its clock as a parameter — so the tests hand it a virtual one.
+That is what makes "the release was noticed mid-wait, not after the 10 s `WAIT`" an exact
+assertion that runs in microseconds. Timing is the whole ballgame for an autoclicker, and a
+test suite that has to sleep in real time is one nobody runs.
 
-Within each crate, one product's worth of behaviour lives in its own directory
-(`clicker/`, `profile/`, `detect_key/`, `write_script/`), while the engine, the step IR, the run loop
-and both input backends (`linux/` and `x11/`) stay general. The engine already runs sequences of steps with
-loops, waits and per-binding repeat and cancellation policies; the clicker is one profile
-expressed in that.
+Within `sequencer-cli`, one product's worth of behaviour lives in its own directory
+(`clicker/`, `profile/`, `detect_key/`, `write_script/`), while the binds format, its executor
+and both input backends (`linux/` and `x11/`) stay general. The executor runs one binds
+profile — taps, holds, waits, loops, chance — and the clicker is one such profile, built from
+its flags rather than read from a file.
 
 ## Development
 
@@ -458,7 +457,7 @@ dependency's licence is a correctness matter.
 
 ## Platform support
 
-Linux only. The engine is platform-independent and the workspace cross-compiles for Windows
+Linux only. The core and the executor are platform-independent and the workspace cross-compiles for Windows
 and macOS — the backends are target-gated, so those builds contain none of them and every
 command that needs a device says so — but no backend for either is written.
 

@@ -3,7 +3,7 @@
 //!
 //! X11-only for now, like the rest of the run path. The on-disk set it manages lives
 //! in [`super::state`]; the per-profile execution it dispatches lives in
-//! [`super::run`]. Hotkeys never wait on the maintenance cadence: every grab feeds one
+//! [`crate::binds::run`]. Hotkeys never wait on the maintenance cadence: every grab feeds one
 //! shared queue and the loop *blocks* on it, waking the moment a key arrives.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,9 +14,11 @@ use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
-use super::format::{chord_mods, patterns_apply, primary_key, trigger_cycle};
 use super::state::{LockGuard, scan_active};
-use super::{Profile, parse, run};
+use crate::binds::format::{
+    Profile, chord_mods, parse, patterns_apply, primary_key, trigger_cycle,
+};
+use crate::binds::run;
 use crate::runtime::{CapturePump, EventPump, Wake};
 use crate::{Error, Result, exit};
 use sequencer_input::{Epoch, FocusWatcher, GrabCapture, LayoutWatcher, SystemClock, XTestSink};

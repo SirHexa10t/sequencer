@@ -24,7 +24,7 @@ use sequencer_core::time::{Clock, Duration};
 use crate::runtime::{EventPump, Wake};
 use crate::{Error, Result};
 
-use super::{Action, Bind, Loops, Profile, Step};
+use super::format::{Action, Bind, Loops, Profile, Step};
 
 /// How the run ended, for the caller that owns the outer loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub(crate) enum Outcome {
 /// The lifted-tap seam's shape: one whole tap — targets, the trigger's held classes,
 /// the trigger's own key when the target re-presses it, and the hold duration —
 /// answering whether the backend could fire it.
-pub(super) type LiftTap<'a> = &'a dyn Fn(&[Holdable], Mods, Option<Key>, Duration) -> bool;
+pub(crate) type LiftTap<'a> = &'a dyn Fn(&[Holdable], Mods, Option<Key>, Duration) -> bool;
 
 /// What a run listens to and answers to while executing.
 ///
@@ -55,13 +55,13 @@ pub(super) type LiftTap<'a> = &'a dyn Fn(&[Holdable], Mods, Option<Key>, Duratio
 /// tap that must re-press the very key the hand is still on. `lift` fires a whole
 /// tap with the standing held keys lifted out of its way and pressed back after —
 /// the path a tap takes when the hand's held classes would recolour it.
-pub(super) struct Pumps<'a> {
-    pub(super) triggers: &'a mut dyn EventPump,
-    pub(super) stop: &'a [(Key, Mods)],
-    pub(super) gate: Option<&'a dyn Fn() -> bool>,
-    pub(super) mods_down: Option<&'a dyn Fn(Mods) -> bool>,
-    pub(super) key_down: Option<&'a dyn Fn(Key) -> bool>,
-    pub(super) lift: Option<LiftTap<'a>>,
+pub(crate) struct Pumps<'a> {
+    pub(crate) triggers: &'a mut dyn EventPump,
+    pub(crate) stop: &'a [(Key, Mods)],
+    pub(crate) gate: Option<&'a dyn Fn() -> bool>,
+    pub(crate) mods_down: Option<&'a dyn Fn(Mods) -> bool>,
+    pub(crate) key_down: Option<&'a dyn Fn(Key) -> bool>,
+    pub(crate) lift: Option<LiftTap<'a>>,
 }
 
 impl Pumps<'_> {
@@ -71,38 +71,65 @@ impl Pumps<'_> {
     }
 }
 
-/// Runs `profile` until the pump closes or the emergency key is pressed. Releases
-/// everything on the way out. `seed` feeds the RNG steps; a fixed seed replays a run.
+/// Runs `profile` as a plain process until the pump closes or the emergency key is
+/// pressed. Releases everything on the way out. `seed` feeds the RNG steps; a fixed
+/// seed replays a run. `key_down` is the one probe this entry wires: an
+/// `only_while_pressed` bind needs to know its trigger came up, and on X11 that never
+/// arrives as an event (the grab's active phase ends on the press) — pass the server's
+/// answer, or `None` where releases are delivered as events (the device path) or where
+/// there are none to watch (tests, mirrors-only profiles).
 pub(crate) fn run(
     profile: &Profile,
     sink: &mut dyn InputSink,
     clock: &dyn Clock,
     pump: &mut dyn EventPump,
     seed: u64,
+    key_down: Option<&dyn Fn(Key) -> bool>,
 ) -> Result<Outcome> {
     let mut rng = Rng::new(seed);
     let mut held = Vec::new();
     let stops = stop_chords(profile);
-    let mut executor = Executor::new(profile, sink, clock, &mut rng, &mut held);
-    let mut pumps = Pumps {
-        triggers: pump,
-        stop: &stops,
-        gate: None,
-        mods_down: None,
-        key_down: None,
-        lift: None,
+    let guard = ReleaseGuard { sink };
+    let outcome = {
+        let mut executor = Executor::new(profile, guard.sink, clock, &mut rng, &mut held);
+        let mut pumps = Pumps {
+            triggers: pump,
+            stop: &stops,
+            gate: None,
+            mods_down: None,
+            key_down,
+            lift: None,
+        };
+        executor.event_loop(&mut pumps)
     };
-    let outcome = executor.event_loop(&mut pumps);
     // The exit invariant, on the error path too: nothing stays down because the run
-    // ended. Reverse order, so a chorded modifier outlives what it modified.
-    drain_held(sink, clock, &mut held);
-    sink.release_all();
+    // ended. Reverse order, so a chorded modifier outlives what it modified. The guard
+    // then releases whatever the sink itself still believes is down — and it does the
+    // same on a panic, which is the one exit this line cannot cover.
+    drain_held(guard.sink, clock, &mut held);
     outcome
+}
+
+/// Releases everything the sink holds when the run leaves, however it leaves.
+///
+/// Owns the borrow rather than taking one alongside, because a guard that merely borrowed
+/// would conflict with using the sink inside the loop. This is the layer that covers a
+/// panic: unwinding runs `drop`, `drop` releases, and the user does not end up with a
+/// modifier key stuck down. It is also why the release profile must not set
+/// `panic = "abort"`.
+struct ReleaseGuard<'a> {
+    sink: &'a mut dyn InputSink,
+}
+
+impl Drop for ReleaseGuard<'_> {
+    fn drop(&mut self) {
+        self.sink.release_all();
+    }
 }
 
 /// A profile's emergency chords the way their events will arrive: primary plus held
 /// modifier classes, one entry per alternative spelling.
-pub(super) fn stop_chords(profile: &Profile) -> Vec<(Key, Mods)> {
+pub(crate) fn stop_chords(profile: &Profile) -> Vec<(Key, Mods)> {
     profile
         .emergency_stop
         .iter()
@@ -118,7 +145,7 @@ pub(super) fn stop_chords(profile: &Profile) -> Vec<(Key, Mods)> {
 /// Releases a ledger in reverse — the exit invariant, callable by any loop owner. A
 /// deactivated profile whose trigger key-ups will never arrive must not leave its
 /// mirrors down, and a stopping run must not leave anything down at all.
-pub(super) fn drain_held(sink: &mut dyn InputSink, clock: &dyn Clock, held: &mut Vec<Holdable>) {
+pub(crate) fn drain_held(sink: &mut dyn InputSink, clock: &dyn Clock, held: &mut Vec<Holdable>) {
     for target in held.drain(..).rev() {
         emit_infallible(sink, clock, target.up());
     }
@@ -130,7 +157,7 @@ pub(super) fn drain_held(sink: &mut dyn InputSink, clock: &dyn Clock, held: &mut
 /// `rng` and `held` are borrowed rather than owned so a manager running several
 /// profiles can keep per-profile ledgers (a deactivating profile drains only its own
 /// mirrors) and one shared dice cup, constructing a view per dispatched event.
-pub(super) struct Executor<'a> {
+pub(crate) struct Executor<'a> {
     profile: &'a Profile,
     sink: &'a mut dyn InputSink,
     clock: &'a dyn Clock,
@@ -163,7 +190,7 @@ enum Heard {
 }
 
 impl<'a> Executor<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         profile: &'a Profile,
         sink: &'a mut dyn InputSink,
         clock: &'a dyn Clock,
@@ -195,7 +222,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Reacts to one trigger-pump event. `Some(outcome)` ends the whole run.
-    pub(super) fn handle(
+    pub(crate) fn handle(
         &mut self,
         event: sequencer_core::input::InputEvent,
         pumps: &mut Pumps<'_>,
@@ -304,7 +331,8 @@ impl<'a> Executor<'a> {
     /// active grab is what lets the injected keys reach the rest of the session (see
     /// the capture backend), and once ended the trigger's own release is routed
     /// elsewhere — a held target would have nothing to release it. Holding the trigger
-    /// still repeats the effect, because X auto-repeat re-presses it.
+    /// does not repeat the tap either: OS auto-repeat never reaches a grab (see the
+    /// capture backend), so one physical press is exactly one tap.
     fn tap_chord(&mut self, targets: &[Holdable], tap: Duration) -> Result<()> {
         for target in targets {
             emit(self.sink, self.clock, target.down())?;
@@ -505,16 +533,23 @@ impl<'a> Executor<'a> {
             self.clock.sleep_until(deadline);
             return Ok(Heard::Nothing);
         }
-        // With a gate to watch, the wait is chunked so focus loss is noticed mid-pause
-        // rather than after it; events still wake the wait instantly either way.
+        // With a gate to watch — or a held trigger to watch come up — the wait is
+        // chunked so the change is noticed mid-pause rather than after it; events still
+        // wake the wait instantly either way.
+        let probing = bind.is_some_and(|bind| bind.only_while_pressed && pumps.key_down.is_some());
         loop {
             if let Some(gate) = pumps.gate
                 && !gate()
             {
                 return Ok(Heard::GateLost);
             }
+            if let Some(bind) = bind
+                && trigger_up(bind, pumps)
+            {
+                return Ok(Heard::StopBind);
+            }
             let now = self.clock.now();
-            let chunk = if pumps.gate.is_some() {
+            let chunk = if pumps.gate.is_some() || probing {
                 deadline.min(now.saturating_add_nanos(CHUNK_NANOS))
             } else {
                 deadline
@@ -533,6 +568,12 @@ impl<'a> Executor<'a> {
                         {
                             return Ok(Heard::StopBind);
                         }
+                    }
+                    if let EventKind::KeyUp(key) = event.kind
+                        && let Some(bind) = bind
+                        && released_trigger(bind, key)
+                    {
+                        return Ok(Heard::StopBind);
                     }
                     // Any other event mid-sequence is dropped: two sequences cannot
                     // run at once in this executor, and queueing them for later has
@@ -554,12 +595,12 @@ impl<'a> Executor<'a> {
     }
 
     /// Parks until `key` is physically up — the wait a tap owes when its target
-    /// re-presses the trigger's own key. The emergency chord still stops everything,
-    /// a closed gate abandons the tap, and re-presses of the still-held trigger
-    /// (X auto-repeat) are swallowed so one press queues one tap. (A poll, not a wait
-    /// on events: after the ungrab the hand's releases are routed elsewhere and can
-    /// never arrive here.) Without a probe it fires immediately: better a swallowed
-    /// edge than a tap that never comes.
+    /// re-presses the trigger's own key. The emergency chord still stops everything
+    /// and a closed gate abandons the tap; a second press of the still-held trigger
+    /// cannot arrive (auto-repeat never reaches a grab), so one press queues one tap.
+    /// (A poll, not a wait on events: after the ungrab the hand's releases are routed
+    /// elsewhere and can never arrive here.) Without a probe it fires immediately:
+    /// better a swallowed edge than a tap that never comes.
     fn await_key_release(&mut self, key: Key, pumps: &mut Pumps<'_>) -> Result<Heard> {
         let Some(key_down) = pumps.key_down else {
             return Ok(Heard::Nothing);
@@ -603,6 +644,9 @@ impl<'a> Executor<'a> {
         {
             return Ok(Heard::GateLost);
         }
+        if trigger_up(bind, pumps) {
+            return Ok(Heard::StopBind);
+        }
         if self.pump_dead {
             return Ok(Heard::Nothing);
         }
@@ -617,6 +661,11 @@ impl<'a> Executor<'a> {
                             return Ok(Heard::StopBind);
                         }
                     }
+                    if let EventKind::KeyUp(key) = event.kind
+                        && released_trigger(bind, key)
+                    {
+                        return Ok(Heard::StopBind);
+                    }
                     tracing::debug!("input during a sequence ignored");
                 }
                 Wake::Deadline => return Ok(Heard::Nothing),
@@ -627,6 +676,26 @@ impl<'a> Executor<'a> {
             }
         }
     }
+}
+
+/// Whether a `KeyUp` of `key` is the trigger of an `only_while_pressed` bind coming up.
+///
+/// The device path delivers the release as an event; the X11 grab never does (its
+/// active grab ends on the press, so the release is routed elsewhere), which is what
+/// [`Pumps::key_down`] is for — see [`trigger_up`]. Both feed the same decision.
+fn released_trigger(bind: &Bind, key: Key) -> bool {
+    bind.only_while_pressed && super::format::primary_key(&bind.trigger) == Some(key)
+}
+
+/// Whether an `only_while_pressed` bind's trigger is physically up right now, by the
+/// probe. Without a probe the answer is "not that we can see": the event path is then
+/// the only source, and on the device backend it is a complete one.
+fn trigger_up(bind: &Bind, pumps: &Pumps<'_>) -> bool {
+    bind.only_while_pressed
+        && match (pumps.key_down, super::format::primary_key(&bind.trigger)) {
+            (Some(key_down), Some(key)) => !key_down(key),
+            _ => false,
+        }
 }
 
 /// The index just past the GNR that closes the block opened before `from`.
@@ -770,13 +839,250 @@ mod tests {
     }
 
     fn run_events(text: &str, events: Vec<(Timestamp, InputEvent)>) -> Vec<EmitAction> {
-        let profile = super::super::parse(text).expect("profile should parse");
+        let profile = crate::binds::format::parse(text).expect("profile should parse");
         let clock = VirtualClock::new();
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
         let mut pump = ScriptedPump::new(events);
-        run(&profile, &mut sink, &clock, &mut pump, 0).expect("run should succeed");
+        run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("run should succeed");
         watcher.recorded().iter().map(|e| e.action).collect()
+    }
+
+    /// A pump that plays its script, then idles: a timed wait times out at its deadline
+    /// (the clock is moved there, as a real wait would) instead of reporting the source
+    /// closed — what a live capture looks like between key presses. A *blocking* wait
+    /// with nothing left is the run's end, as it is for a scripted pump.
+    struct IdlePump<'a> {
+        script: std::collections::VecDeque<InputEvent>,
+        clock: &'a VirtualClock,
+    }
+
+    impl EventPump for IdlePump<'_> {
+        fn wait_until(&mut self, deadline: Option<Timestamp>) -> Wake {
+            if let Some(event) = self.script.pop_front() {
+                return Wake::Event(event);
+            }
+            match deadline {
+                Some(deadline) => {
+                    self.clock.set(deadline);
+                    Wake::Deadline
+                }
+                None => Wake::Interrupted,
+            }
+        }
+    }
+
+    /// Like [`run_events`], with the X11 key probe wired and a pump that idles rather
+    /// than closes, so a held loop's polling can be watched mid-wait.
+    fn run_events_probed(
+        text: &str,
+        events: Vec<(Timestamp, InputEvent)>,
+        key_down: &dyn Fn(Key) -> bool,
+    ) -> (Vec<EmitAction>, Timestamp) {
+        let profile = crate::binds::format::parse(text).expect("profile should parse");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut pump = IdlePump {
+            script: events.into_iter().map(|(_, event)| event).collect(),
+            clock: &clock,
+        };
+        run(&profile, &mut sink, &clock, &mut pump, 0, Some(key_down)).expect("run should succeed");
+        let actions = watcher.recorded().iter().map(|e| e.action).collect();
+        (actions, clock.now())
+    }
+
+    /// `only_while_pressed`: the loop ends when its trigger comes up. On the device path
+    /// the release is an event, heard mid-wait like a re-press would be.
+    #[test]
+    fn a_held_loop_ends_when_its_trigger_is_released() {
+        let actions = run_events(
+            "[binds.F6]\nloop = \"inf\"\nonly_while_pressed = true\nseq = [\"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\"]",
+            vec![press(Key::F6), release(Key::F6)],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftCtrl),
+                EmitAction::KeyUp(Key::LeftCtrl)
+            ],
+            "stop mid-wait, then release what was pressed"
+        );
+    }
+
+    /// On X11 the release never arrives as an event (the grab's active phase ends on
+    /// the press), so the probe answers instead — and the wait is chunked so the answer
+    /// is heard mid-pause, not after a 10s WAIT has run its course.
+    #[test]
+    fn a_held_loop_ends_when_the_probe_says_the_trigger_is_up() {
+        let asks = std::cell::Cell::new(0_u32);
+        // Down for the first two asks, up from the third: the release lands mid-wait.
+        let key_down = |key: Key| {
+            asks.set(asks.get() + 1);
+            key == Key::F6 && asks.get() <= 2
+        };
+        let (actions, ended_at) = run_events_probed(
+            "[binds.F6]\nloop = \"inf\"\nonly_while_pressed = true\nseq = [\"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\"]",
+            vec![press(Key::F6)],
+            &key_down,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::LeftCtrl),
+                EmitAction::KeyUp(Key::LeftCtrl)
+            ]
+        );
+        assert!(
+            ended_at < Timestamp::from_millis(1_000),
+            "the release was noticed mid-wait, not after the 10s WAIT: ended at {ended_at:?}"
+        );
+    }
+
+    /// A chord trigger is held as long as its PRIMARY key is: letting go of the modifier
+    /// alone does not end the loop (the grab delivered the chord as one press of F6, and
+    /// F6 is what is still down), letting go of F6 does.
+    #[test]
+    fn a_chord_held_loop_ends_on_the_primary_key_not_the_modifier() {
+        let text = "[binds.\"ctrl F6\"]\nloop = \"inf\"\nonly_while_pressed = true\nseq = [\"PRESS a\", \"WAIT 10s\", \"b\", \"RELEASE a\"]";
+        let chord = Mods::of_chord(&[Key::LeftCtrl]);
+
+        // Ctrl comes up mid-wait: ignored, the iteration completes (`b` fires).
+        let actions = run_events(
+            text,
+            vec![press_with(Key::F6, chord), release(Key::LeftCtrl)],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                EmitAction::KeyDown(Key::A),
+                EmitAction::KeyDown(Key::B),
+                EmitAction::KeyUp(Key::B),
+                EmitAction::KeyUp(Key::A)
+            ],
+            "the modifier's release is not the trigger's release"
+        );
+
+        // F6 comes up mid-wait: the loop stops there and lets go of `a`.
+        let actions = run_events(text, vec![press_with(Key::F6, chord), release(Key::F6)]);
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::A), EmitAction::KeyUp(Key::A)]
+        );
+    }
+
+    /// The briefest tap: the probe already says "up" the first time it is asked, during
+    /// the first tap's own hold. Exactly one repetition happens, and it still completes
+    /// its release — the original clicker complaint, "tapping too briefly does
+    /// nothing", answered: a tap is one click.
+    #[test]
+    fn the_briefest_tap_is_exactly_one_repetition() {
+        let (actions, ended_at) = run_events_probed(
+            "[binds.F6]\nloop = \"inf\"\nonly_while_pressed = true\nseq = [\"a\"]",
+            vec![press(Key::F6)],
+            &|_: Key| false,
+        );
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::A), EmitAction::KeyUp(Key::A)],
+            "one tap, completed, and no second iteration"
+        );
+        assert!(
+            ended_at < Timestamp::from_millis(100),
+            "the loop ended on the first probe: {ended_at:?}"
+        );
+    }
+
+    /// The emergency chord outranks a held loop, mid-hold: the run ends, not just the
+    /// loop, and what the loop pressed is released.
+    #[test]
+    fn the_emergency_chord_ends_a_held_loop_and_the_run() {
+        let profile = crate::binds::format::parse(
+            "[defaults]\nemergency_stop = \"F8\"\n[binds.F6]\nloop = \"inf\"\nonly_while_pressed = true\nseq = [\"PRESS a\", \"WAIT 10s\", \"RELEASE a\"]",
+        )
+        .expect("parses");
+        let clock = VirtualClock::new();
+        let mut sink = MockInjector::new();
+        let watcher = sink.clone();
+        let mut pump = ScriptedPump::new(vec![press(Key::F6), press(Key::F8)]);
+        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("runs");
+        assert_eq!(outcome, Outcome::EmergencyStop);
+        let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::A), EmitAction::KeyUp(Key::A)]
+        );
+    }
+
+    /// A sink that gives up mid-run, to prove the guard: whatever the executor was
+    /// holding, and whatever the sink itself still believes is down, is released while
+    /// unwinding — a stuck modifier is the one failure this loop may never leave behind.
+    struct FailingSink {
+        inner: MockInjector,
+        emits_before_panic: u32,
+    }
+
+    impl InputSink for FailingSink {
+        fn emit(&mut self, emit: &Emit) -> Result<(), sequencer_core::emit::SinkError> {
+            assert!(self.emits_before_panic > 0, "the sink gave up");
+            self.emits_before_panic -= 1;
+            self.inner.emit(emit)
+        }
+
+        fn release_all(&mut self) {
+            self.inner.release_all();
+        }
+    }
+
+    /// The release guard fires on a panic. `PRESS ctrl` goes down, the next emit
+    /// panics, and the sink still sees exactly one `release_all` on the way out.
+    #[test]
+    fn a_panic_mid_run_still_releases_everything() {
+        let profile = crate::binds::format::parse(
+            "[binds.F6]\nseq = [\"PRESS ctrl\", \"a\", \"RELEASE ctrl\"]",
+        )
+        .expect("parses");
+        let clock = VirtualClock::new();
+        let inner = MockInjector::new();
+        let watcher = inner.clone();
+        let mut sink = FailingSink {
+            inner,
+            emits_before_panic: 1,
+        };
+        let mut pump = ScriptedPump::new(vec![press(Key::F6)]);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run(&profile, &mut sink, &clock, &mut pump, 0, None);
+        }));
+        assert!(unwound.is_err(), "the sink's panic propagates");
+        assert_eq!(
+            watcher.release_all_calls(),
+            1,
+            "the guard released on the way out of the panic"
+        );
+        assert_eq!(
+            watcher
+                .recorded()
+                .iter()
+                .map(|e| e.action)
+                .collect::<Vec<_>>(),
+            vec![EmitAction::KeyDown(Key::LeftCtrl)],
+            "ctrl went down before the sink gave up; release_all is what brings it up"
+        );
+    }
+
+    /// A counted loop under `only_while_pressed` is "up to N while pressed": the release
+    /// cuts it short.
+    #[test]
+    fn a_release_cuts_a_counted_held_loop_short() {
+        let actions = run_events(
+            "[binds.F6]\nloop = 5\nonly_while_pressed = true\nseq = [\"a\"]",
+            vec![press(Key::F6), release(Key::F6)],
+        );
+        assert_eq!(
+            actions,
+            vec![EmitAction::KeyDown(Key::A), EmitAction::KeyUp(Key::A)],
+            "one iteration ran; the release, heard at the seam, ended the rest"
+        );
     }
 
     /// A chord target taps as one gesture: members down in listed order, up in
@@ -815,10 +1121,10 @@ mod tests {
         );
     }
 
-    /// Each trigger press is one complete tap, so X auto-repeat (which arrives as
-    /// extra downs) repeats the effect — holding PgUp keeps stepping the volume. It
-    /// also means nothing is ever left held, which is what makes losing the trigger's
-    /// release to the ungrab harmless.
+    /// Each trigger press is one complete tap: a second press is a second tap, and
+    /// nothing is ever left held — which is what makes losing the trigger's release to
+    /// the ungrab harmless. (Holding the key adds no presses: auto-repeat never reaches
+    /// a grab, so `PgUp -> volume-up` steps once per press.)
     #[test]
     fn every_trigger_press_is_a_complete_tap() {
         let actions = run_events(
@@ -965,8 +1271,8 @@ mod tests {
     /// ctrl+w closed no terminal tab while a physical ctrl+shift+w did.)
     #[test]
     fn a_mirror_that_represses_its_own_trigger_key_waits_for_the_key_to_lift() {
-        let profile =
-            super::super::parse("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"").expect("parses");
+        let profile = crate::binds::format::parse("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"")
+            .expect("parses");
         let clock = VirtualClock::new();
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
@@ -1079,7 +1385,7 @@ mod tests {
     /// twin of full-chord trigger matching, exact in both directions.
     #[test]
     fn a_subset_of_the_stop_chord_does_not_stop_the_run() {
-        let profile = super::super::parse(
+        let profile = crate::binds::format::parse(
             "[defaults]\nemergency_stop = \"ctrl shift e\"\n[binds.F6]\nbind = \"p\"",
         )
         .expect("parses");
@@ -1090,7 +1396,7 @@ mod tests {
             press_with(Key::E, Mods::of_chord(&[Key::LeftCtrl])),
             press(Key::F6),
         ]);
-        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
+        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("runs");
         assert_eq!(outcome, Outcome::SourceClosed, "ctrl e is not ctrl shift e");
         let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
         assert_eq!(
@@ -1105,7 +1411,8 @@ mod tests {
     /// classes handed over so the backend knows what to lift. No parking, no delay.
     #[test]
     fn a_contaminated_mirror_taps_between_lifted_modifiers() {
-        let profile = super::super::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
+        let profile =
+            crate::binds::format::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
         let clock = VirtualClock::new();
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
@@ -1169,7 +1476,7 @@ mod tests {
                 Mods::of_chord(&[Key::LeftShift]),
             ),
         ] {
-            let profile = super::super::parse(text).expect("parses");
+            let profile = crate::binds::format::parse(text).expect("parses");
             let clock = VirtualClock::new();
             let mut sink = MockInjector::new();
             let mut rng = Rng::new(0);
@@ -1206,7 +1513,8 @@ mod tests {
     /// sink — recoloured beats never.
     #[test]
     fn a_failed_lift_falls_back_to_the_real_sink() {
-        let profile = super::super::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
+        let profile =
+            crate::binds::format::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
         let clock = VirtualClock::new();
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
@@ -1247,7 +1555,7 @@ mod tests {
         // Right shift down: the rshift spelling wins — contaminated, so the lift
         // seam fires its clean `q` and the plain sink stays silent.
         {
-            let profile = super::super::parse(text).expect("parses");
+            let profile = crate::binds::format::parse(text).expect("parses");
             let clock = VirtualClock::new();
             let mut sink = MockInjector::new();
             let watcher = sink.clone();
@@ -1283,7 +1591,7 @@ mod tests {
         // Left shift down: the generic spelling wins — covered, so the plain sink
         // taps the delta `]` under the hand's shift and the lift stays unused.
         {
-            let profile = super::super::parse(text).expect("parses");
+            let profile = crate::binds::format::parse(text).expect("parses");
             let clock = VirtualClock::new();
             let mut sink = MockInjector::new();
             let watcher = sink.clone();
@@ -1326,7 +1634,8 @@ mod tests {
     /// break ties between side twins.
     #[test]
     fn a_lone_spelling_catches_either_shift() {
-        let profile = super::super::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
+        let profile =
+            crate::binds::format::parse("[binds.\"shift b\"]\nbind = \"p\"").expect("parses");
         let clock = VirtualClock::new();
         let mut sink = MockInjector::new();
         let mut rng = Rng::new(0);
@@ -1382,8 +1691,8 @@ mod tests {
     /// what the hand no longer supplies — the full target, ctrl included.
     #[test]
     fn a_chord_released_during_the_wait_is_synthesized_whole() {
-        let profile =
-            super::super::parse("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"").expect("parses");
+        let profile = crate::binds::format::parse("[binds.\"ctrl w\"]\nbind = \"ctrl shift w\"")
+            .expect("parses");
         let clock = VirtualClock::new();
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
@@ -1447,7 +1756,7 @@ mod tests {
     /// Any spelling in an emergency_stop list ends the run.
     #[test]
     fn any_stop_alternative_ends_the_run() {
-        let profile = super::super::parse(
+        let profile = crate::binds::format::parse(
             "[defaults]\nemergency_stop = [\"F8\", \"ctrl shift e\"]\n[binds.F6]\nbind = \"p\"",
         )
         .expect("parses");
@@ -1457,7 +1766,7 @@ mod tests {
             Key::E,
             Mods::of_chord(&[Key::LeftCtrl, Key::LeftShift]),
         )]);
-        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
+        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("runs");
         assert_eq!(outcome, Outcome::EmergencyStop);
     }
 
@@ -1508,7 +1817,7 @@ mod tests {
     /// markers themselves claim none.
     #[test]
     fn the_gap_sits_between_loop_iterations() {
-        let profile = super::super::parse(
+        let profile = crate::binds::format::parse(
             "[binds.F6]\ntap = \"0\"\ngap = \"30ms\"\nseq = [\"LOOP 2\", \"a\", \"POOL\", \"b\"]",
         )
         .expect("parses");
@@ -1516,7 +1825,7 @@ mod tests {
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
         let mut pump = ScriptedPump::new(vec![press(Key::F6)]);
-        run(&profile, &mut sink, &clock, &mut pump, 0).expect("runs");
+        run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("runs");
 
         let downs: Vec<_> = watcher
             .recorded()
@@ -1607,7 +1916,7 @@ mod tests {
     /// whatever has focus once the program lost it.
     #[test]
     fn a_closed_gate_stops_a_running_sequence_and_releases() {
-        let profile = super::super::parse(
+        let profile = crate::binds::format::parse(
             "[binds.F6]\nloop = \"inf\"\nseq = [\"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\"]",
         )
         .expect("profile should parse");
@@ -1652,7 +1961,7 @@ mod tests {
     /// everything pressed comes back up.
     #[test]
     fn the_emergency_key_stops_the_run_and_releases() {
-        let profile = super::super::parse(
+        let profile = crate::binds::format::parse(
             "[defaults]\nemergency_stop = \"F8\"\n[binds.F6]\nloop = \"inf\"\nseq = [\"PRESS ctrl\", \"WAIT 10s\", \"RELEASE ctrl\"]",
         )
         .expect("profile should parse");
@@ -1660,7 +1969,8 @@ mod tests {
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
         let mut pump = ScriptedPump::new(vec![press(Key::F6), press(Key::F8)]);
-        let outcome = run(&profile, &mut sink, &clock, &mut pump, 0).expect("run should succeed");
+        let outcome =
+            run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("run should succeed");
         assert_eq!(outcome, Outcome::EmergencyStop);
         let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
         assert_eq!(
@@ -1677,7 +1987,7 @@ mod tests {
     /// clock the sleeps are visible as the timestamps of the surrounding emits.
     #[test]
     fn wait_replaces_the_gap_at_its_seam_only() {
-        let profile = super::super::parse(
+        let profile = crate::binds::format::parse(
             "[binds.F6]\ntap = \"0\"\ngap = \"30ms\"\nseq = [\"a\", \"b\", \"WAIT 200ms\", \"c\"]",
         )
         .expect("profile should parse");
@@ -1685,7 +1995,7 @@ mod tests {
         let mut sink = MockInjector::new();
         let watcher = sink.clone();
         let mut pump = ScriptedPump::new(vec![press(Key::F6)]);
-        run(&profile, &mut sink, &clock, &mut pump, 0).expect("run should succeed");
+        run(&profile, &mut sink, &clock, &mut pump, 0, None).expect("run should succeed");
 
         let downs: Vec<_> = watcher
             .recorded()

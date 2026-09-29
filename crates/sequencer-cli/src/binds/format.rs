@@ -47,6 +47,10 @@ pub(crate) struct Bind {
     /// How many times a press runs the sequence. Pressing the trigger again stops it
     /// early, releasing whatever the sequence still held.
     pub(crate) loops: Loops,
+    /// The sequence runs only while the trigger is physically down: letting go ends it
+    /// at the next seam, releasing whatever it still held. Composes with `loops` —
+    /// "up to N times while pressed" is `loop = N` plus this.
+    pub(crate) only_while_pressed: bool,
 }
 
 /// How often one press repeats a sequence.
@@ -59,6 +63,80 @@ pub(crate) enum Loops {
     Times(u32),
     /// Until the trigger is pressed again (`loop = "inf"`).
     Infinite,
+}
+
+impl Profile {
+    /// Every check a profile must pass that is about the *set* of binds rather than any
+    /// one of them: no stop chord doubling as a trigger, no two spellings sharing a grab,
+    /// no circle of binds feeding each other. Called by [`parse`] once a file's binds are
+    /// lowered, and by the clicker with a bind it built in memory — one validator, so a
+    /// profile with no file behind it is held to exactly a file's standard.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, in the format's own words.
+    pub(crate) fn assemble(
+        binds: Vec<Bind>,
+        program: Option<Vec<String>>,
+        kb_lang: Option<Vec<String>>,
+        emergency_stop: Vec<Vec<Key>>,
+    ) -> Result<Self, String> {
+        for stop in &emergency_stop {
+            if let Some(bind) = binds.iter().find(|bind| &bind.trigger == stop) {
+                return Err(format!(
+                    "emergency_stop is also the trigger of [binds.\"{}\"] — one key cannot both \
+                     run a binding and stop the run",
+                    bind.trigger_text
+                ));
+            }
+        }
+        // A bare key and a chord over it (`i` and `ctrl i`) are DISJOINT grabs: bindings
+        // name their modifier state exactly (lock permutations included), so the server
+        // arbitrates deterministically and both may coexist — the bare bind fires only
+        // on the bare press, and unbound variants pass through to the application.
+        // Left and right shift/ctrl/meta share one X modifier bit, so `rshift >` and
+        // `shift >` are the SAME grab. Side-variant spellings may coexist: the manager
+        // grabs the combination once and routes each press to the side physically held.
+        // (Identical spellings were already refused above as one trigger twice.) A stop
+        // chord, matched by folded classes alone, must stay unambiguous — it may not
+        // blur into any bind's grab. Alt is the exception to the folding: right alt is
+        // AltGr, its own bit.
+        let mut grabs: BTreeMap<(Option<Key>, Mods), String> = BTreeMap::new();
+        for bind in &binds {
+            let signature = (primary_key(&bind.trigger), chord_mods(&bind.trigger));
+            let label = format!("[binds.\"{}\"]", bind.trigger_text);
+            grabs.entry(signature).or_insert(label);
+        }
+        // The stop chords join the same grab space — the manager grabs them alongside
+        // the triggers, and X cannot hold two grabs on one combination.
+        for stop in &emergency_stop {
+            let signature = (primary_key(stop), chord_mods(stop));
+            let label = format!("emergency_stop \"{}\"", chord_text(stop));
+            if let Some(previous) = grabs.insert(signature, label.clone()) {
+                return Err(format!(
+                    "{previous} and {label} are the same grab: X cannot tell left from \
+                     right shift/ctrl/meta, so these are one key combination twice"
+                ));
+            }
+        }
+        let profile = Profile {
+            binds,
+            program,
+            kb_lang,
+            emergency_stop,
+        };
+        // Injections pass through grabs like real presses, so binds whose outputs
+        // trigger each other in a circle are a runaway machine with no hand on it —
+        // refused whole. (Circles can also span files; apply re-checks the whole set.)
+        if let Some(circle) = trigger_cycle(&[("", &profile)]) {
+            return Err(format!(
+                "these binds trigger each other in a circle: {} — a profile must not \
+                 feed itself",
+                circle.join(" -> ")
+            ));
+        }
+        Ok(profile)
+    }
 }
 
 /// What a binding does.
@@ -154,6 +232,7 @@ struct RawBind {
     /// `loop` in the file; TOML has no bare keys, so infinity is spelled `"inf"`.
     #[serde(rename = "loop")]
     loops: Option<RawLoops>,
+    only_while_pressed: Option<bool>,
 }
 
 /// `loop = 4` or `loop = "inf"`.
@@ -227,65 +306,11 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
             binds.push(bind);
         }
     }
-    for stop in &emergency_stop {
-        if let Some(bind) = binds.iter().find(|bind| &bind.trigger == stop) {
-            return Err(format!(
-                "emergency_stop is also the trigger of [binds.\"{}\"] — one key cannot both \
-                 run a binding and stop the run",
-                bind.trigger_text
-            ));
-        }
-    }
-    // A bare key and a chord over it (`i` and `ctrl i`) are DISJOINT grabs: bindings
-    // name their modifier state exactly (lock permutations included), so the server
-    // arbitrates deterministically and both may coexist — the bare bind fires only
-    // on the bare press, and unbound variants pass through to the application.
-    // Left and right shift/ctrl/meta share one X modifier bit, so `rshift >` and
-    // `shift >` are the SAME grab. Side-variant spellings may coexist: the manager
-    // grabs the combination once and routes each press to the side physically held.
-    // (Identical spellings were already refused above as one trigger twice.) A stop
-    // chord, matched by folded classes alone, must stay unambiguous — it may not
-    // blur into any bind's grab. Alt is the exception to the folding: right alt is
-    // AltGr, its own bit.
-    let mut grabs: BTreeMap<(Option<Key>, Mods), String> = BTreeMap::new();
-    for bind in &binds {
-        let signature = (primary_key(&bind.trigger), chord_mods(&bind.trigger));
-        let label = format!("[binds.\"{}\"]", bind.trigger_text);
-        grabs.entry(signature).or_insert(label);
-    }
-    // The stop chords join the same grab space — the manager grabs them alongside
-    // the triggers, and X cannot hold two grabs on one combination.
-    for stop in &emergency_stop {
-        let signature = (primary_key(stop), chord_mods(stop));
-        let label = format!("emergency_stop \"{}\"", chord_text(stop));
-        if let Some(previous) = grabs.insert(signature, label.clone()) {
-            return Err(format!(
-                "{previous} and {label} are the same grab: X cannot tell left from \
-                 right shift/ctrl/meta, so these are one key combination twice"
-            ));
-        }
-    }
-    let profile = Profile {
-        binds,
-        program,
-        kb_lang,
-        emergency_stop,
-    };
-    // Injections pass through grabs like real presses, so binds whose outputs
-    // trigger each other in a circle are a runaway machine with no hand on it —
-    // refused whole. (Circles can also span files; apply re-checks the whole set.)
-    if let Some(circle) = trigger_cycle(&[("", &profile)]) {
-        return Err(format!(
-            "these binds trigger each other in a circle: {} — a profile must not \
-             feed itself",
-            circle.join(" -> ")
-        ));
-    }
-    Ok(profile)
+    Profile::assemble(binds, program, kb_lang, emergency_stop)
 }
 
 /// A chord the way a user would write it: the keys' display names, space-joined.
-pub(super) fn chord_text(chord: &[Key]) -> String {
+pub(crate) fn chord_text(chord: &[Key]) -> String {
     chord
         .iter()
         .map(ToString::to_string)
@@ -575,7 +600,7 @@ fn chord_events(targets: &[Holdable], baseline: Mods, events: &mut Vec<(Key, Mod
 }
 
 /// Whether a key only decorates a chord rather than anchoring it.
-pub(super) fn is_modifier(key: Key) -> bool {
+pub(crate) fn is_modifier(key: Key) -> bool {
     matches!(
         key,
         Key::LeftShift
@@ -744,6 +769,14 @@ fn lower_bind(
                 .to_owned(),
         );
     }
+    let only_while_pressed = raw.only_while_pressed.unwrap_or(false);
+    if only_while_pressed && !matches!(action, Action::Seq(_)) {
+        return Err(
+            "`only_while_pressed` needs a `seq`: a mirror is one tap per press, and \
+             there is nothing for a release to cut short"
+                .to_owned(),
+        );
+    }
     Ok(Bind {
         trigger_text: trigger_text.to_owned(),
         trigger,
@@ -751,6 +784,7 @@ fn lower_bind(
         tap,
         gap,
         loops,
+        only_while_pressed,
     })
 }
 
@@ -1654,6 +1688,43 @@ mod tests {
 
         // Space after the `!` is the author's whitespace, not part of the pattern.
         assert!(!patterns_apply(&["! us".to_owned()], "us"));
+    }
+
+    /// `only_while_pressed` reads as a plain flag, and only a `seq` can carry it: a
+    /// mirror is one tap per press, with nothing for a release to cut short.
+    #[test]
+    fn only_while_pressed_needs_a_sequence() {
+        let held = parse_ok("[binds.F6]\nloop = \"inf\"\nonly_while_pressed = true\nseq = [\"a\"]");
+        assert!(held.binds[0].only_while_pressed);
+        let plain = parse_ok("[binds.F6]\nseq = [\"a\"]");
+        assert!(!plain.binds[0].only_while_pressed, "off unless written");
+
+        let err = parse_err("[binds.F6]\nonly_while_pressed = true\nbind = \"a\"");
+        assert!(
+            err.contains("only_while_pressed") && err.contains("seq"),
+            "{err}"
+        );
+    }
+
+    /// The set-level checks are one function, so a profile built in memory (the
+    /// clicker's) is held to a file's standard: a stop chord that is also a trigger is
+    /// refused there too.
+    #[test]
+    fn assemble_holds_a_built_profile_to_a_files_checks() {
+        let bind = Bind {
+            trigger_text: "F9".to_owned(),
+            trigger: vec![Key::F9],
+            action: Action::Seq(vec![Step::Tap(vec![Holdable::Key(Key::A)])]),
+            tap: DEFAULT_TAP,
+            gap: DEFAULT_GAP,
+            loops: Loops::Infinite,
+            only_while_pressed: true,
+        };
+        let err = Profile::assemble(vec![bind.clone()], None, None, vec![vec![Key::F9]])
+            .expect_err("F9 cannot both run the bind and stop the run");
+        assert!(err.contains("emergency_stop"), "{err}");
+        let ok = Profile::assemble(vec![bind], None, None, vec![vec![Key::F8]]).expect("valid");
+        assert_eq!(ok.binds.len(), 1);
     }
 
     /// `bind = "NOP"` swallows the trigger and emits nothing — so it presses no keys,

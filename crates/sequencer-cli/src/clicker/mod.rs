@@ -10,15 +10,18 @@
 //! finding the shared machinery shaped around whichever command happened to exist first.
 
 pub mod args;
+mod config;
 
 pub use args::{ClickerArgs, MouseButton};
+pub use config::{ActivationMode, ClickAction, ClickConfig};
 
-use sequencer_core::CompiledProfile;
-use sequencer_core::clicker::{ActivationMode, ClickAction, ClickConfig};
+use sequencer_core::emit::{EmitAction, Holdable};
+use sequencer_core::time::{Duration, Period};
 
-use crate::backend::run_profile;
-use crate::runtime::{RunSummary, fuse_limit};
-use crate::{Deps, Result, exit};
+use crate::backend::run_binds;
+use crate::binds::format::{Action, Bind, Loops, Profile, Step};
+use crate::runtime::{RunSummary, cadence_of};
+use crate::{Deps, Error, Result, exit};
 
 /// `sequencer clicker`.
 ///
@@ -28,7 +31,7 @@ use crate::{Deps, Result, exit};
 /// opened.
 pub fn clicker(args: &ClickerArgs, deps: &mut Deps<'_>) -> Result<u8> {
     let config = args.config();
-    let profile = CompiledProfile::validate(config.to_profile()?)?;
+    let profile = binds_profile(&config)?;
 
     if !args.global.quiet {
         describe(&config, deps)?;
@@ -39,15 +42,70 @@ pub fn clicker(args: &ClickerArgs, deps: &mut Deps<'_>) -> Result<u8> {
     // The only keys the run binds — all an X11 grab needs to ask for, and deliberately no
     // more: a broader grab would be a keylogger.
     let hotkeys = [config.activate, config.quit];
-    let summary = run_profile(
-        profile,
-        fuse_limit(config.cps),
-        crate::runtime::cadence_of(config.cps),
+    let summary = run_binds(
+        &profile,
+        repetition_marker(&config),
+        cadence_of(config.cps),
         &hotkeys,
         deps,
     )?;
     report(&summary, args, deps)?;
     Ok(exit::OK)
+}
+
+/// The clicker as a binds profile: one bind on the activation key whose sequence is a
+/// single tap of the action, `emergency_stop` on the quit key, and no gate.
+///
+/// Exactly what a user could write in a file — and held to a file's checks through
+/// [`Profile::assemble`] — which is the point: the clicker is not a second way to run a
+/// repeated key, it is the first product on the same one. The mode is the `loop`: HOLD
+/// is a loop that lasts while the trigger is down, TOGGLE one that lasts until the
+/// trigger is pressed again; `--limit` caps either.
+///
+/// # Errors
+///
+/// A rate outside what a period can express, or a quit key that is also the activation
+/// key — the format refuses both in its own words.
+pub(crate) fn binds_profile(config: &ClickConfig) -> Result<Profile> {
+    let period = Period::from_cps(config.cps)?.nanos();
+    let (target, hold) = match config.action {
+        ClickAction::Button(button) => (Holdable::Button(button), config.button_hold),
+        ClickAction::Key(key) => (Holdable::Key(key), config.key_hold),
+    };
+    // The hold fits inside the period, half of it at most: the button has to spend a
+    // while up between clicks, or at a fast rate it would never come up at all.
+    let hold_nanos = u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX);
+    let tap_nanos = hold_nanos.min(period / 2);
+    let tap = Duration::from_nanos(tap_nanos);
+    let gap = Duration::from_nanos(period.saturating_sub(tap_nanos));
+    let loops = match u32::try_from(config.limit) {
+        Ok(0) | Err(_) => Loops::Infinite,
+        Ok(1) => Loops::Once,
+        Ok(times) => Loops::Times(times),
+    };
+    let bind = Bind {
+        trigger_text: config.activate.to_string(),
+        trigger: vec![config.activate],
+        action: Action::Seq(vec![Step::Tap(vec![target])]),
+        tap,
+        gap,
+        loops,
+        only_while_pressed: config.mode == ActivationMode::Hold,
+    };
+    Profile::assemble(vec![bind], None, None, vec![vec![config.quit]]).map_err(|detail| {
+        Error::Profile {
+            path: "clicker".to_owned(),
+            detail,
+        }
+    })
+}
+
+/// The action that begins each repetition — what the exit report counts.
+fn repetition_marker(config: &ClickConfig) -> EmitAction {
+    match config.action {
+        ClickAction::Button(button) => EmitAction::ButtonDown(button),
+        ClickAction::Key(key) => EmitAction::KeyDown(key),
+    }
 }
 
 /// Prints the settings in the words a user would use, so a surprising result can be
@@ -102,21 +160,6 @@ fn report(summary: &RunSummary, args: &ClickerArgs, deps: &mut Deps<'_>) -> Resu
             "sent {} repetitions ({} actions) — not all may arrive.",
             summary.iterations, summary.emitted
         )?,
-    }
-    if summary.slots_skipped > 0 {
-        writeln!(
-            deps.out,
-            "{} repetitions were skipped: this machine could not keep up with {}/s. \
-             The rate above is what it managed to send.",
-            summary.slots_skipped, args.cps
-        )?;
-    }
-    if summary.throttled > 0 {
-        writeln!(
-            deps.out,
-            "{} actions were dropped by the output rate limit.",
-            summary.throttled
-        )?;
     }
     // A stopwatch, not a statistic: the user decides when a run starts and stops, so this
     // measures their session rather than the tool. That is also why it is wall time and
@@ -194,5 +237,115 @@ mod tests {
         });
         let expected_tail = format!("| Limit: {}", crate::style::key("5"));
         assert!(limited.trim().ends_with(&expected_tail), "{limited:?}");
+    }
+}
+
+#[cfg(test)]
+mod lowering_tests {
+    use super::*;
+    use sequencer_core::input::{Button, Key};
+
+    fn config(mode: ActivationMode, cps: f64, limit: u64) -> ClickConfig {
+        ClickConfig {
+            cps,
+            mode,
+            limit,
+            ..ClickConfig::new()
+        }
+    }
+
+    /// The defaults, as a profile: hold F9 for 20/s left clicks, F8 stops — one bind
+    /// whose loop lasts while the trigger is down, timed so tap + gap is the period.
+    #[test]
+    fn the_defaults_lower_to_a_held_infinite_loop() {
+        let profile = binds_profile(&ClickConfig::new()).expect("the defaults are runnable");
+        assert_eq!(profile.emergency_stop, vec![vec![Key::F8]]);
+        assert_eq!(profile.program, None);
+        assert_eq!(profile.kb_lang, None);
+        let bind = &profile.binds[0];
+        assert_eq!(bind.trigger, vec![Key::F9]);
+        assert_eq!(
+            bind.action,
+            Action::Seq(vec![Step::Tap(vec![Holdable::Button(Button::Left)])])
+        );
+        assert_eq!(bind.loops, Loops::Infinite);
+        assert!(
+            bind.only_while_pressed,
+            "HOLD is a loop that lasts while pressed"
+        );
+        assert_eq!(bind.tap, Duration::from_millis(8));
+        assert_eq!(
+            bind.gap,
+            Duration::from_millis(42),
+            "tap + gap is the 50ms period"
+        );
+        assert_eq!(
+            repetition_marker(&ClickConfig::new()),
+            EmitAction::ButtonDown(Button::Left)
+        );
+    }
+
+    /// TOGGLE is the loop that lasts until the trigger is pressed again; `--limit` caps
+    /// either mode, and a limit of one is a plain run.
+    #[test]
+    fn toggle_and_limit_are_the_loop() {
+        let toggle = binds_profile(&config(ActivationMode::Toggle, 20.0, 0)).unwrap();
+        assert!(!toggle.binds[0].only_while_pressed);
+        assert_eq!(toggle.binds[0].loops, Loops::Infinite);
+
+        let capped = binds_profile(&config(ActivationMode::Hold, 20.0, 100)).unwrap();
+        assert_eq!(capped.binds[0].loops, Loops::Times(100));
+        assert!(
+            capped.binds[0].only_while_pressed,
+            "up to 100 while pressed"
+        );
+
+        let once = binds_profile(&config(ActivationMode::Toggle, 20.0, 1)).unwrap();
+        assert_eq!(once.binds[0].loops, Loops::Once);
+    }
+
+    /// Every flag lands: a key action, its own hold, and the activation and quit keys.
+    #[test]
+    fn every_flag_lands_in_the_profile() {
+        let custom = ClickConfig {
+            action: ClickAction::Key(Key::F),
+            key_hold: Duration::from_millis(3),
+            activate: Key::F7,
+            quit: Key::Escape,
+            ..ClickConfig::new()
+        };
+        let profile = binds_profile(&custom).unwrap();
+        let bind = &profile.binds[0];
+        assert_eq!(bind.trigger, vec![Key::F7]);
+        assert_eq!(bind.trigger_text, "F7");
+        assert_eq!(profile.emergency_stop, vec![vec![Key::Escape]]);
+        assert_eq!(
+            bind.action,
+            Action::Seq(vec![Step::Tap(vec![Holdable::Key(Key::F)])])
+        );
+        assert_eq!(bind.tap, Duration::from_millis(3));
+        assert_eq!(repetition_marker(&custom), EmitAction::KeyDown(Key::F));
+    }
+
+    /// At a rate whose period is shorter than the hold, the hold shrinks to half the
+    /// period so the button still comes up between clicks — the same rule as always.
+    #[test]
+    fn the_hold_shrinks_to_fit_a_fast_rate() {
+        let fast = binds_profile(&config(ActivationMode::Hold, 500.0, 0)).unwrap();
+        let bind = &fast.binds[0];
+        assert_eq!(bind.tap, Duration::from_millis(1), "half of a 2ms period");
+        assert_eq!(bind.gap, Duration::from_millis(1));
+    }
+
+    /// The quit key cannot also be the activation key — refused by the same validator
+    /// a binds file goes through, in its words.
+    #[test]
+    fn a_quit_key_that_is_the_activation_key_is_refused() {
+        let clash = ClickConfig {
+            quit: Key::F9,
+            ..ClickConfig::new()
+        };
+        let err = binds_profile(&clash).expect_err("F9 cannot both run and stop");
+        assert!(err.to_string().contains("emergency_stop"), "{err}");
     }
 }

@@ -1,12 +1,11 @@
-//! Events flowing *out*: what the engine wants done to the outside world.
+//! Events flowing *out*: what a run wants done to the outside world.
 //!
-//! The engine never calls a sink. It appends to an [`EmitBuf`] and returns; the runner
-//! drains that buffer into the real [`InputSink`]. Keeping the engine's output a value
-//! rather than a side effect is what makes every behavioural test a plain comparison of
-//! two lists.
+//! An [`Emit`] is a value — an action and the instant it was meant for — and an
+//! [`InputSink`] is the one contract a backend fulfils to perform it. Keeping the output
+//! a value rather than a side effect is what makes a behavioural test a plain comparison
+//! of two lists: a recording sink is a sink like any other.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use crate::input::{Button, Key};
 use crate::time::Timestamp;
@@ -111,53 +110,6 @@ pub struct Emit {
     ///
     /// See [`crate::input::EventOrigin`] for why zero is the safe default.
     pub level: u8,
-}
-
-/// The engine's output buffer for one tick.
-///
-/// Owned by the runner and reused across ticks, so the steady state allocates nothing.
-/// Only the engine can push, so an `EmitBuf` handed to a test is necessarily a faithful
-/// record of what the engine decided.
-#[derive(Debug, Default, Clone)]
-pub struct EmitBuf {
-    actions: Vec<Emit>,
-}
-
-impl EmitBuf {
-    /// An empty buffer.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            actions: Vec::new(),
-        }
-    }
-
-    /// The actions emitted since the last [`EmitBuf::clear`].
-    #[must_use]
-    pub fn as_slice(&self) -> &[Emit] {
-        &self.actions
-    }
-
-    /// Whether anything was emitted.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.actions.is_empty()
-    }
-
-    /// How many actions are buffered.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.actions.len()
-    }
-
-    /// Drops the buffered actions, keeping the allocation for the next tick.
-    pub fn clear(&mut self) {
-        self.actions.clear();
-    }
-
-    pub(crate) fn push(&mut self, emit: Emit) {
-        self.actions.push(emit);
-    }
 }
 
 /// Something went wrong talking to the OS.

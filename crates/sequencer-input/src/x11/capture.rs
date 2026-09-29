@@ -15,13 +15,13 @@
 //!   hotkeys this is arguably the better behaviour (F9 no longer also types into the focused
 //!   window), but it is a real difference from the evdev backend's silent observation.
 //!
-//! Two masking policies, by entry point. A HOTKEY ([`GrabCapture::start`], the clicker's
-//! activation and quit keys) grabs its bare key with [`ModMask::ANY`]: F9 is F9 with
-//! NumLock on, CapsLock on, or Shift held. A BINDING ([`GrabCapture::start_into`], the
-//! profile manager) names its modifier state exactly, lock permutations included — so
-//! `b` and `shift b` are disjoint grabs the server arbitrates deterministically, and an
-//! unbound variant (shift+b when only `b` is bound) passes through to the application
-//! instead of being swallowed. If *another* client already holds a grab on the key
+//! Every grab names its modifier state exactly, lock permutations included: `b` and
+//! `shift b` are disjoint grabs the server arbitrates deterministically, and an unbound
+//! variant (shift+b when only `b` is bound) passes through to the application instead of
+//! being swallowed. The clicker's hotkeys and the manager's binds are grabbed alike — the
+//! executor matches a trigger by its exact modifier classes, so the grab must too. (A
+//! catch-all `ModMask::ANY` policy once served the clicker; it retired with the engine
+//! that needed it.) If *another* client already holds a grab on the key
 //! ([`GrabError::AlreadyGrabbed`]), the run refuses and names the key. Falling back to
 //! reading devices would demand access, and possibly a password, for a problem no
 //! privilege can fix — the answer is a different `--activate` key, so that is what the
@@ -40,7 +40,7 @@ use x11rb::rust_connection::RustConnection;
 
 use sequencer_core::input::{InputEvent, Key, Mods};
 
-use crate::capture::{CaptureStream, Epoch, EventQueue};
+use crate::capture::{Epoch, EventQueue};
 
 /// How often the reader thread wakes to check the stop flag while no events arrive.
 ///
@@ -77,7 +77,7 @@ pub enum GrabError {
     AlreadyGrabbed(Key),
 }
 
-/// Grabs the named keys and feeds their presses into a [`CaptureStream`].
+/// Grabs the named keys and feeds their presses into a [`crate::capture::CaptureStream`].
 #[derive(Debug)]
 pub struct GrabCapture {
     running: Arc<AtomicBool>,
@@ -85,44 +85,23 @@ pub struct GrabCapture {
 }
 
 impl GrabCapture {
-    /// Connects, grabs `keys` on the root window, and starts the reader thread.
+    /// Connects, grabs every chord on the root window, feeds the presses into `queue`,
+    /// and starts the reader thread.
+    ///
+    /// Feeding a queue the caller made — rather than returning a fresh stream — is what
+    /// lets several grabs (one per profile, plus an emergency grab) share a single
+    /// stream, so a run loop can *block* on all of them at once rather than take turns
+    /// polling each. A single-grab run makes a queue and passes it just the same.
     ///
     /// # Errors
     ///
     /// [`GrabError`] — no server, an unmappable key, or a key someone else holds. Nothing is
     /// left half-done on failure: the connection drops, and dropping it releases any grabs
     /// this client took.
-    pub fn start(epoch: &Epoch, keys: &[Key]) -> Result<(Self, CaptureStream), GrabError> {
-        let chords: Vec<Vec<Key>> = keys.iter().map(|key| alloc_one(*key)).collect();
-        let (queue, stream) = CaptureStream::channel(256);
-        let capture = Self::grab(epoch, &chords, queue, BareMask::CatchAll)?;
-        Ok((capture, stream))
-    }
-
-    /// [`GrabCapture::start`], feeding an existing queue instead of creating one.
-    ///
-    /// This is what lets several grabs — one per profile, plus an emergency grab —
-    /// share a single stream, so a run loop can *block* on all of them at once rather
-    /// than take turns polling each.
-    ///
-    /// # Errors
-    ///
-    /// As [`GrabCapture::start`].
     pub fn start_into(
         epoch: &Epoch,
         chords: &[Vec<Key>],
         queue: EventQueue,
-    ) -> Result<Self, GrabError> {
-        Self::grab(epoch, chords, queue, BareMask::Exact)
-    }
-
-    /// The shared machinery behind both entry points: grab every chord under the
-    /// given bare-key policy, then start the reader thread.
-    fn grab(
-        epoch: &Epoch,
-        chords: &[Vec<Key>],
-        queue: EventQueue,
-        bare: BareMask,
     ) -> Result<Self, GrabError> {
         let (conn, screen) =
             RustConnection::connect(None).map_err(|err| GrabError::Connect(Box::new(err)))?;
@@ -131,7 +110,7 @@ impl GrabCapture {
         for chord in chords {
             let (mods, key) = split_chord(chord)?;
             let keycode = super::inject::x_keycode(key).ok_or(GrabError::Unmappable(key))?;
-            for mask in mask_variants(mods, bare) {
+            for mask in mask_variants(mods) {
                 conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC)
                     .map_err(|err| GrabError::Connect(Box::new(err)))?
                     .check()
@@ -208,11 +187,6 @@ fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running
     }
 }
 
-/// One key as a one-element chord.
-fn alloc_one(key: Key) -> Vec<Key> {
-    vec![key]
-}
-
 /// Splits a chord into its modifier mask and the single key it decorates.
 ///
 /// X grabs one keycode plus a modifier state, which is exactly a chord's shape — but it
@@ -254,32 +228,12 @@ fn modifier_mask(key: Key) -> Option<ModMask> {
     })
 }
 
-/// How a bare key's grab treats modifier state it did not name.
-///
-/// A hotkey catches the key under ANY state — the clicker's F9 is F9 even while
-/// shift is held. A binding names its state exactly, so `b` and `shift b` are
-/// disjoint grabs and an unbound variant passes through to the application. The
-/// wildcard and an exact grab cannot share a keycode (X arbitrates only between
-/// disjoint exact masks), which is why this is a per-entry-point policy rather
-/// than a per-key choice.
-#[derive(Debug, Clone, Copy)]
-enum BareMask {
-    /// [`ModMask::ANY`]: the key under every modifier state.
-    CatchAll,
-    /// The no-modifier state, lock permutations included.
-    Exact,
-}
-
 /// The same chord with every combination of the "who cares" lock bits.
 ///
 /// CapsLock (Lock) and NumLock (Mod2) sit in the same state field as real modifiers, so
 /// a grab that names neither simply never fires while either is on. Every hotkey tool
-/// grabs all four permutations for this reason. A catch-all bare key skips the
-/// permutations: ANY already covers the locks (and everything else).
-fn mask_variants(mods: ModMask, bare: BareMask) -> Vec<ModMask> {
-    if mods == ModMask::default() && matches!(bare, BareMask::CatchAll) {
-        return vec![ModMask::ANY];
-    }
+/// grabs all four permutations for this reason.
+fn mask_variants(mods: ModMask) -> Vec<ModMask> {
     vec![
         mods,
         mods | ModMask::LOCK,
@@ -296,10 +250,13 @@ fn mask_variants(mods: ModMask, bare: BareMask) -> Vec<ModMask> {
 /// event's `state` field. Dropping it here once made `ctrl w` indistinguishable from
 /// `ctrl shift w` downstream.
 ///
-/// X's auto-repeat arrives as release/press pairs at the same timestamp; unlike the evdev
-/// path there is no repeat flag to filter on. Harmless here: the engine derives its own
-/// edges from state transitions, so a re-press of a held key is a no-op — the same reason
-/// the evdev reader could afford to drop kernel repeats rather than needing to.
+/// OS auto-repeat never arrives here at all: a passive grab activates on a physical
+/// press, and the server does not re-activate it for the repeat presses it generates
+/// while the key stays down — one physical press is one KeyPress to this client. (Field-
+/// verified twice: a held `loop = "inf"` trigger ran uninterrupted for seconds, and a held
+/// `PgUp -> volume-up` mirror stepped exactly once.) So there is no repeat to filter, and
+/// nothing downstream needs to tell a repeat from a re-press. The evdev reader is the one
+/// that sees kernel repeats, and it drops them itself.
 fn translate(event: &Event) -> Option<(sequencer_core::input::EventKind, Mods)> {
     use sequencer_core::input::EventKind;
     match event {
@@ -457,29 +414,23 @@ fn key_from_x(keycode: u8) -> Option<Key> {
 mod tests {
     use super::*;
 
-    /// The two masking policies: a hotkey's bare key catches EVERY state; a binding's
-    /// bare key names exactly the no-modifier state plus the lock permutations, so
-    /// `b` and `shift b` become disjoint grabs. Chords are exact under either policy.
+    /// A bare key names exactly the no-modifier state plus the three lock permutations,
+    /// so `b` and `shift b` are disjoint grabs; a chord names its own state the same way.
+    /// Never the wildcard: a catch-all grab cannot share a keycode with an exact one.
     #[test]
-    fn bare_keys_mask_by_policy_and_chords_are_always_exact() {
+    fn every_grab_names_its_state_exactly_with_lock_permutations() {
+        let bare = mask_variants(ModMask::default());
         assert_eq!(
-            mask_variants(ModMask::default(), BareMask::CatchAll),
-            vec![ModMask::ANY]
-        );
-        let exact = mask_variants(ModMask::default(), BareMask::Exact);
-        assert_eq!(
-            exact.len(),
+            bare.len(),
             4,
             "the no-modifier state plus three lock variants"
         );
-        assert!(exact.contains(&ModMask::default()));
-        assert!(exact.contains(&(ModMask::LOCK | ModMask::M2)));
-        assert!(!exact.contains(&ModMask::ANY), "no wildcard for a binding");
-        assert_eq!(
-            mask_variants(ModMask::SHIFT, BareMask::CatchAll),
-            mask_variants(ModMask::SHIFT, BareMask::Exact),
-            "a chord names its state exactly, whoever asks"
-        );
+        assert!(bare.contains(&ModMask::default()));
+        assert!(bare.contains(&(ModMask::LOCK | ModMask::M2)));
+        assert!(!bare.contains(&ModMask::ANY), "no wildcard, ever");
+        let chord = mask_variants(ModMask::SHIFT);
+        assert_eq!(chord.len(), 4);
+        assert!(chord.iter().all(|mask| mask.contains(ModMask::SHIFT)));
     }
 
     /// A class is stuck when the state claims it and no key down supplies it. A finger

@@ -1,7 +1,7 @@
 //! What can go wrong, and what exit code it means.
 
 use sequencer_core::SinkError;
-use sequencer_core::validate::ConfigError;
+use sequencer_core::time::ConfigError;
 
 use crate::exit;
 

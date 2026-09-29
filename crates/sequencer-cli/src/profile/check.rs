@@ -1,6 +1,6 @@
 //! `profile-check`: say whether a binds file is sound, and optionally tidy it.
 //!
-//! Checking is the same [`super::format::parse`] every run performs — one validator, so
+//! Checking is the same [`crate::binds::format::parse`] every run performs — one validator, so
 //! a file this command blesses is a file `profile-apply` will accept. What it adds is
 //! *not applying*: no symlink, no lock, no grabs, so it is safe to wire into an editor
 //! or a pre-commit hook.
@@ -17,7 +17,7 @@ use sequencer_core::input::Key;
 use crate::args::ProfileCheckArgs;
 use crate::{Deps, Error, Result, exit};
 
-use super::format::{is_modifier, parse};
+use crate::binds::format::{is_modifier, parse};
 
 /// `sequencer profile-check`.
 ///
@@ -43,7 +43,7 @@ pub(crate) fn profile_check(args: &ProfileCheckArgs, deps: &mut Deps<'_>) -> Res
                 bad += 1;
             }
             Ok(profile) => {
-                for warning in super::format::warnings(&profile) {
+                for warning in crate::binds::format::warnings(&profile) {
                     writeln!(
                         deps.out,
                         "{path}: {}",

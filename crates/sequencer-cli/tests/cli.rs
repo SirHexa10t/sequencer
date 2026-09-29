@@ -17,8 +17,7 @@ use predicates::prelude::*;
 
 use sequencer_cli::runtime::ScriptedPump;
 use sequencer_cli::{
-    ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, ProfileApplyArgs, dispatch,
-    exit,
+    ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, ProfileApplyArgs, dispatch, exit,
 };
 use sequencer_core::emit::EmitAction;
 use sequencer_core::input::{Button, EventKind, InputEvent, Key};
@@ -99,6 +98,98 @@ fn the_exit_report_caveats_sent_and_ends_with_a_stopwatch() {
     assert!(
         report.lines().last().unwrap().starts_with("ran "),
         "the last line is the stopwatch: {report}"
+    );
+}
+
+/// Drives the clicker through `dispatch` with a scripted trigger stream and returns what
+/// reached the sink, plus the exit report.
+fn click_with(
+    args: ClickerArgs,
+    events: Vec<(Timestamp, InputEvent)>,
+) -> (Vec<EmitAction>, String) {
+    let mut out = Vec::new();
+    let clock = VirtualClock::new();
+    let mut sink = MockInjector::new();
+    let watcher = sink.clone();
+    let mut pump = ScriptedPump::new(events);
+    let mut deps = Deps::new(&mut out, &clock);
+    deps.sink = Some(&mut sink);
+    deps.pump = Some(&mut pump);
+    let code = dispatch(&Command::Clicker(args), &mut deps).expect("should run");
+    assert_eq!(code, exit::OK);
+    let actions = watcher.recorded().iter().map(|e| e.action).collect();
+    (actions, String::from_utf8(out).expect("the report is text"))
+}
+
+fn release(key: Key) -> (Timestamp, InputEvent) {
+    (
+        Timestamp::ZERO,
+        InputEvent::physical(Timestamp::ZERO, EventKind::KeyUp(key)),
+    )
+}
+
+/// HOLD, the default: press starts, release stops — a tap is exactly one click, and the
+/// report counts it. (The original complaint, "tapping too briefly does nothing".)
+#[test]
+fn a_tap_in_hold_mode_is_one_click() {
+    let (actions, report) = click_with(ClickerArgs::new(), vec![press(Key::F9), release(Key::F9)]);
+    assert_eq!(
+        actions,
+        vec![
+            EmitAction::ButtonDown(Button::Left),
+            EmitAction::ButtonUp(Button::Left)
+        ]
+    );
+    assert!(report.contains("sent 1 repetitions"), "{report}");
+}
+
+/// TOGGLE: press starts, the next press stops. Nothing about a release is involved —
+/// which is what makes it work on X11, where a grab never delivers one.
+#[test]
+fn a_second_press_in_toggle_mode_stops_the_clicking() {
+    let args = ClickerArgs {
+        toggle: true,
+        ..ClickerArgs::new()
+    };
+    let (actions, report) = click_with(args, vec![press(Key::F9), press(Key::F9)]);
+    assert_eq!(
+        actions,
+        vec![
+            EmitAction::ButtonDown(Button::Left),
+            EmitAction::ButtonUp(Button::Left)
+        ],
+        "one repetition ran between the two presses, then it stopped"
+    );
+    assert!(report.contains("sent 1 repetitions"), "{report}");
+}
+
+/// The quit key ends the run before anything is sent, and the run still reports.
+#[test]
+fn the_quit_key_ends_the_run() {
+    let (actions, report) = click_with(ClickerArgs::new(), vec![press(Key::F8)]);
+    assert!(actions.is_empty(), "{actions:?}");
+    assert!(report.contains("sent 0 repetitions"), "{report}");
+}
+
+/// The keys are the user's to choose, and they land where the flags say.
+#[test]
+fn custom_activation_and_quit_keys_are_honoured() {
+    let args = ClickerArgs {
+        activate: Key::F7,
+        quit: Key::Escape,
+        ..ClickerArgs::new()
+    };
+    // F9 is nobody's key now: ignored. F7 starts; Escape quits mid-hold.
+    let (actions, _) = click_with(
+        args,
+        vec![press(Key::F9), press(Key::F7), press(Key::Escape)],
+    );
+    assert_eq!(
+        actions,
+        vec![
+            EmitAction::ButtonDown(Button::Left),
+            EmitAction::ButtonUp(Button::Left)
+        ]
     );
 }
 

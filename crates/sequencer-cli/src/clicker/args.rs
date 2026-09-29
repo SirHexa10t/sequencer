@@ -5,8 +5,8 @@
 //! one, while the shared pieces ([`GlobalArgs`] and the key parser) stay where both can
 //! reach them.
 
+use super::config::{ActivationMode, ClickAction, ClickConfig};
 use clap::{Args, ValueEnum};
-use sequencer_core::clicker::{ActivationMode, ClickAction, ClickConfig};
 use sequencer_core::input::Key;
 use sequencer_core::time::{Duration, Period};
 
@@ -122,7 +122,7 @@ impl ClickerArgs {
     ///
     /// Infallible: every value was already checked by its parser, so a caller who built
     /// this from the command line cannot reach an error here. A caller who built it by
-    /// hand can still produce a bad rate, which [`ClickConfig::to_profile`] catches.
+    /// hand can still produce a bad rate, which the lowering into a profile catches.
     #[must_use]
     pub fn config(&self) -> ClickConfig {
         ClickConfig {
@@ -167,8 +167,8 @@ pub(crate) fn parse_cps(raw: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::clicker::ActivationMode;
     use clap::Parser as _;
-    use sequencer_core::clicker::ActivationMode;
     use sequencer_core::input::Key;
 
     use super::*;
