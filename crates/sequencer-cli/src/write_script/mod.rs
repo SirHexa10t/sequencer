@@ -1,16 +1,15 @@
 //! `write-script`: run a scripted sequence of input events. **Not implemented.**
 //!
 //! A placeholder with a real command behind it, kept for two reasons. It marks the shape the
-//! next product takes — a sibling of [`crate::clicker`], reusing the engine, the step IR, the
-//! run loop and both input backends unchanged — so the split between "one product" and "the
-//! shared machinery" has a second occupant proving it rather than one occupant asserting it.
-//! And it means the layout question is already answered when the work starts.
+//! next product takes — a sibling of `profile`, reusing the binds format, its executor and
+//! the input backends unchanged — so the split between "one product" and "the shared
+//! machinery" has a second occupant proving it rather than one occupant asserting it. And
+//! it means the layout question is already answered when the work starts.
 //!
-//! The engine can very nearly do this already: [`crate::clicker`] lowers its settings into a
-//! binds `Profile` of tap-hold-wait steps, and a script is the same
-//! IR with the steps read from a file instead of generated from a rate. What is missing is a
-//! script format, its parser, and the validation to reject a sequence that would leave a key
-//! held. `profile-apply` already runs key-triggered *output* sequences for
+//! The executor can very nearly do this already: a script is a binds `Profile` of
+//! tap-hold-wait steps, read from a file and run once rather than fired by a trigger. What
+//! is missing is a script format, its parser, and the validation to reject a sequence that
+//! would leave a key held. `profile-apply` already runs key-triggered *output* sequences for
 //! testing; this is the other direction — scripted *output*.
 
 pub mod args;
@@ -31,8 +30,8 @@ pub fn write_script(_args: &WriteScriptArgs, deps: &mut Deps<'_>) -> Result<u8> 
     writeln!(
         deps.out,
         "TODO: write-script is not implemented yet — it will record what you do into a \
-         binds-file sequence. For now, `clicker` repeats one action and `profile-apply` \
-         runs the sequences a binds file spells out."
+         binds-file sequence. For now, `profile-apply` runs the sequences a binds file \
+         spells out."
     )?;
     Ok(exit::OK)
 }

@@ -96,10 +96,10 @@ impl Holdable {
     }
 }
 
-/// One emitted action, with the time the engine intended it.
+/// One emitted action, with the time it was scheduled for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Emit {
-    /// When the engine meant this to happen.
+    /// When this was meant to happen.
     ///
     /// This is the scheduled time, not the wall-clock time it reaches the OS, which is
     /// what makes cadence assertions in tests exact.

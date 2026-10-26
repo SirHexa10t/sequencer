@@ -1,31 +1,29 @@
-//! Hotkeys by X11 key grab — hearing the activation key without reading `/dev/input`.
+//! Triggers by X11 key grab — hearing a profile's keys without reading `/dev/input`.
 //!
 //! The evdev capture watches every input device, which needs read access the kernel guards
 //! (the `input` group, or session mode's sudo). On X11 there is a narrower ask that needs no
 //! privilege at all: a **passive key grab** on the root window for exactly the keys the run
-//! binds — the activation key and the quit key. The server then delivers those presses to
-//! this connection whichever window has focus, which is the whole job.
+//! binds — its triggers and its stop keys. The server then delivers those presses to this
+//! connection whichever window has focus, which is the whole job.
 //!
 //! Two ways this deliberately differs from the evdev capture:
 //!
-//! - **It sees only the grabbed keys.** Evdev capture forwards everything and lets the engine
+//! - **It sees only the grabbed keys.** Evdev capture forwards everything and lets the run loop
 //!   ignore the rest; a grab that broad would be a keylogger. The caller names the keys.
 //! - **The grabbed keys stop reaching other applications** while the run is active. A grab is
-//!   exclusive — that is how the server knows who wants the key. For an autoclicker's
-//!   hotkeys this is arguably the better behaviour (F9 no longer also types into the focused
+//!   exclusive — that is how the server knows who wants the key. For a bound key this is the
+//!   better behaviour (it does what it is bound to, and no longer also types into the focused
 //!   window), but it is a real difference from the evdev backend's silent observation.
 //!
 //! Every grab names its modifier state exactly, lock permutations included: `b` and
 //! `shift b` are disjoint grabs the server arbitrates deterministically, and an unbound
 //! variant (shift+b when only `b` is bound) passes through to the application instead of
-//! being swallowed. The clicker's hotkeys and the manager's binds are grabbed alike — the
-//! executor matches a trigger by its exact modifier classes, so the grab must too. (A
-//! catch-all `ModMask::ANY` policy once served the clicker; it retired with the engine
-//! that needed it.) If *another* client already holds a grab on the key
-//! ([`GrabError::AlreadyGrabbed`]), the run refuses and names the key. Falling back to
-//! reading devices would demand access, and possibly a password, for a problem no
-//! privilege can fix — the answer is a different `--activate` key, so that is what the
-//! error says.
+//! being swallowed. The executor matches a trigger by its exact modifier classes, so the
+//! grab must too. (A catch-all `ModMask::ANY` policy once served an earlier engine; it
+//! retired with the engine that needed it.) If *another* client already holds a grab on
+//! the key ([`GrabError::AlreadyGrabbed`]), the grab fails and names the key. Falling back
+//! to reading devices would demand access, and possibly a password, for a problem no
+//! privilege can fix — the answer is a different key, or freeing that one.
 //!
 //! Events are stamped on arrival with the shared [`Epoch`] and pushed into the same
 //! [`EventQueue`] the evdev backend fills, so the pump above is one code path.
@@ -70,10 +68,7 @@ pub enum GrabError {
     ModifiersOnly,
 
     /// Another client already owns a grab on this key (a desktop shortcut, usually).
-    #[error(
-        "{0} is already grabbed by another program (a desktop keyboard shortcut?) — \
-         pick a different key with --activate/--quit"
-    )]
+    #[error("{0} is already grabbed by another program (a desktop keyboard shortcut?)")]
     AlreadyGrabbed(Key),
 }
 
@@ -150,7 +145,7 @@ impl Drop for GrabCapture {
     }
 }
 
-/// Reads grabbed-key events until told to stop, translating each to the engine's shape.
+/// Reads grabbed-key events until told to stop, translating each into the core's event shape.
 fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running: &AtomicBool) {
     while running.load(Ordering::Relaxed) {
         match conn.poll_for_event() {
@@ -170,17 +165,17 @@ fn pump_events(conn: &RustConnection, queue: &EventQueue, epoch: &Epoch, running
                 let Some((kind, mods)) = translate(&event) else {
                     continue;
                 };
-                // Stamped on arrival, on the runner's timeline — same rule as the evdev
-                // reader, so cadence phase-locks to the press either way.
+                // Stamped on arrival, on the runner's timeline: the same rule as the evdev
+                // reader (see `InputEvent::at`).
                 if !queue.offer(InputEvent::physical(epoch.now(), kind).with_mods(mods)) {
-                    tracing::trace!("capture queue full, event dropped");
+                    log::trace!("capture queue full, event dropped");
                 }
             }
             Ok(None) => std::thread::sleep(POLL_EVERY),
             Err(err) => {
                 // The server hung up (session ended, most likely). The queue closing on
-                // drop is what tells the pump, which tells the engine to shut down.
-                tracing::debug!(%err, "X connection lost; capture stopping");
+                // drop is what tells the pump, which tells the run loop to shut down.
+                log::debug!("X connection lost; capture stopping err={err}");
                 return;
             }
         }
@@ -242,7 +237,7 @@ fn mask_variants(mods: ModMask) -> Vec<ModMask> {
     ]
 }
 
-/// A grabbed-key X event as the engine's event kind plus the modifier classes that
+/// A grabbed-key X event as the core's event kind plus the modifier classes that
 /// were held; anything else is `None`.
 ///
 /// The modifiers matter because this is the only place they exist: a grab fires a
@@ -268,12 +263,12 @@ fn translate(event: &Event) -> Option<(sequencer_core::input::EventKind, Mods)> 
             EventKind::KeyUp(key_from_x(release.detail)?),
             mods_of(release.state),
         )),
-        // MappingNotify and friends: nothing the engine binds to.
+        // MappingNotify and friends: nothing a bind can name.
         _ => None,
     }
 }
 
-/// The engine's modifier classes for an X state mask. Locks (Lock, Mod2) are not
+/// The core's modifier classes for an X state mask. Locks (Lock, Mod2) are not
 /// modifiers a chord can name, so they are not classes either.
 fn mods_of(state: x11rb::protocol::xproto::KeyButMask) -> Mods {
     use x11rb::protocol::xproto::KeyButMask;
@@ -404,7 +399,7 @@ fn keys_in(bitmap: &[u8; 32]) -> Vec<Key> {
     keys
 }
 
-/// The inverse of [`super::inject::x_keycode`]: X keycode back to the engine's key.
+/// The inverse of [`super::inject::x_keycode`]: X keycode back to the core's key.
 fn key_from_x(keycode: u8) -> Option<Key> {
     let code = u16::from(keycode).checked_sub(super::inject::EVDEV_TO_X_KEYCODE)?;
     crate::linux::keymap::code_to_key(evdev::KeyCode(code))
@@ -477,19 +472,19 @@ mod tests {
         assert_eq!(key_from_x(7), None);
     }
 
-    /// A key another program owns names itself and points at the fix. The caller turns
-    /// this into a usage error rather than falling back to reading devices, so the message
-    /// is the only thing the user gets — it has to be the actionable one.
+    /// A key another program owns names itself and the likely owner. Nothing falls back
+    /// to reading devices instead, so the message is all the user gets — it has to say
+    /// which key to free or rebind.
     #[test]
-    fn an_already_grabbed_key_names_itself_and_the_flags_that_change_it() {
+    fn an_already_grabbed_key_names_itself_and_its_likely_owner() {
         let message = GrabError::AlreadyGrabbed(Key::F9).to_string();
         assert!(
             message.contains("f9") || message.contains("F9"),
             "{message}"
         );
         assert!(
-            message.contains("--activate") && message.contains("--quit"),
-            "the fix is a different key, and the message must say which flags: {message}"
+            message.contains("another program"),
+            "the fault is outside this one, and the message must say so: {message}"
         );
     }
 }

@@ -1,10 +1,10 @@
 //! Measuring how fast synthetic input actually gets through.
 //!
-//! The engine's own accounting can only report what it *wrote*. That is not the same as
+//! A run's own accounting can only report what it *wrote*. That is not the same as
 //! what arrived: the kernel, or whatever is reading the device, can coalesce or drop
-//! events under load. So this writes through the same [`UinputSink`] the clicker uses,
-//! and simultaneously **reads its own virtual device back**, counting what a real
-//! consumer would have seen. The gap between the two numbers is the interesting part.
+//! events under load. So this writes through [`UinputSink`] and simultaneously **reads
+//! its own virtual device back**, counting what a real consumer would have seen. The gap
+//! between the two numbers is the interesting part.
 //!
 //! It presses [`Key::F24`] rather than clicking. F24 exists on no physical keyboard and
 //! essentially nothing binds to it, so a benchmark does not click on whatever happens to
@@ -271,7 +271,7 @@ fn spawn_counter(mut device: Device, delivered: Arc<AtomicU64>, reading: Arc<Ato
             }
         });
     if let Err(err) = spawned {
-        tracing::warn!(%err, "could not start the bench reader; delivered will read zero");
+        log::warn!("could not start the bench reader; delivered will read zero err={err}");
     }
 }
 

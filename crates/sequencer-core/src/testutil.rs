@@ -14,15 +14,15 @@ use crate::time::{Clock, Duration, Timestamp};
 /// A clock that only moves when told to.
 ///
 /// Time travel is the point: a thousand simulated seconds cost microseconds, so the
-/// timing assertions that actually matter for an autoclicker are cheap enough to run on
+/// timing assertions that actually matter for synthetic input are cheap enough to run on
 /// every commit.
 #[derive(Debug, Default)]
 pub struct VirtualClock {
     now: Cell<Timestamp>,
     /// How far past a requested deadline [`Clock::sleep_until`] lands.
     ///
-    /// Simulates a busy machine descheduling the process. Set it to 500 ms to exercise
-    /// the catch-up clamp without needing a loaded machine to reproduce it on.
+    /// Simulates a busy machine descheduling the process, so a test can show what a late
+    /// wake does to the pacing without needing a loaded machine to reproduce it on.
     overshoot: Cell<Duration>,
     slept: RefCell<Vec<(Timestamp, Timestamp)>>,
 }
@@ -50,7 +50,7 @@ impl VirtualClock {
     /// Moves time to `to`, in either direction.
     ///
     /// Going backwards is allowed on purpose: NTP steps and suspend/resume do it to real
-    /// clocks, and the engine has to survive it.
+    /// clocks, and code built on `Timestamp` has to survive it.
     pub fn set(&self, to: Timestamp) {
         self.now.set(to);
     }

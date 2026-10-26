@@ -1,17 +1,16 @@
-//! Watching `/dev/input` for the trigger key.
+//! Watching `/dev/input` for key and button presses.
 //!
 //! Reading the device nodes directly is what makes this work the same on X11, on Wayland,
 //! and on a bare console — it sits below the display server rather than asking one for
 //! permission. The cost is that it needs read access to `/dev/input`, which
 //! [`crate::Requirement::EvdevReadable`] explains.
 //!
-//! **Observe only.** The devices are not grabbed exclusively, so a trigger key still does
-//! its normal thing — pressing F9 both starts the clicker and sends F9 to whatever has
-//! focus. That matches the Python prototype's behaviour. Hiding the trigger would mean an
-//! exclusive `EVIOCGRAB` and re-injecting every other keystroke, which puts the process
-//! between the user and their keyboard: if it hangs while holding the grab, the keyboard
-//! stops responding until it is killed from another virtual terminal. Not a trade worth
-//! making for an autoclicker.
+//! **Observe only.** The devices are not grabbed exclusively, so a key still does its
+//! normal thing — whatever has focus receives it too. Hiding keys would mean an exclusive
+//! `EVIOCGRAB` and re-injecting every other keystroke, which puts the process between the
+//! user and their keyboard: if it hangs while holding the grab, the keyboard stops
+//! responding until it is killed from another virtual terminal. Not a trade worth making
+//! for a listener.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +31,6 @@ const QUEUE_CAPACITY: usize = 1024;
 pub struct EvdevCapture {
     epoch: Epoch,
     running: Arc<AtomicBool>,
-    watching: usize,
 }
 
 impl EvdevCapture {
@@ -42,14 +40,7 @@ impl EvdevCapture {
         Self {
             epoch,
             running: Arc::new(AtomicBool::new(false)),
-            watching: 0,
         }
-    }
-
-    /// How many devices are being read.
-    #[must_use]
-    pub const fn watching(&self) -> usize {
-        self.watching
     }
 
     /// Every device that reports keys or buttons, excluding our own virtual one.
@@ -57,9 +48,9 @@ impl EvdevCapture {
     pub fn openable_devices() -> Vec<(std::path::PathBuf, Device)> {
         let mut found = Vec::new();
         for (path, device) in evdev::enumerate() {
-            // Our own uinput device reports keys too, so without this filter the clicker
-            // would read its own clicks back and, with a mouse-button trigger, retrigger
-            // itself. Excluding by name is exact and needs no timing heuristics.
+            // Our own uinput device reports keys too, and nothing sequencer synthesises may
+            // come back as the user's input. Excluding by name is exact and needs no timing
+            // heuristics.
             if device.name() == Some(DEVICE_NAME) {
                 continue;
             }
@@ -88,7 +79,6 @@ impl EvdevCapture {
 
         let (queue, stream) = CaptureStream::channel(QUEUE_CAPACITY);
         self.running.store(true, Ordering::SeqCst);
-        self.watching = devices.len();
 
         for (path, device) in devices {
             let queue = queue.clone();
@@ -105,8 +95,8 @@ impl EvdevCapture {
                 .spawn(move || pump_device(device, &queue, &epoch, &running));
 
             match spawned {
-                Ok(_handle) => tracing::debug!(device = %name, path = %path.display(), "watching"),
-                Err(err) => tracing::warn!(device = %name, %err, "could not watch device"),
+                Ok(_handle) => log::debug!("watching device={name} path={}", path.display()),
+                Err(err) => log::warn!("could not watch device device={name} err={err}"),
             }
         }
 
@@ -119,7 +109,6 @@ impl EvdevCapture {
     /// until then, which is harmless: they hold nothing and the process can exit.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.watching = 0;
     }
 }
 
@@ -130,7 +119,7 @@ fn pump_device(mut device: Device, queue: &EventQueue, epoch: &Epoch, running: &
             Ok(events) => events,
             // A device being unplugged is ordinary, not an error worth shouting about.
             Err(err) => {
-                tracing::debug!(%err, "stopped reading device");
+                log::debug!("stopped reading device err={err}");
                 return;
             }
         };
@@ -138,12 +127,11 @@ fn pump_device(mut device: Device, queue: &EventQueue, epoch: &Epoch, running: &
             let Some(kind) = translate(event) else {
                 continue;
             };
-            // Stamped on arrival, on the runner's timeline, so repeat cadence
-            // phase-locks to the press rather than to when the loop got around to it.
+            // Stamped on arrival, on the runner's timeline (see `InputEvent::at`).
             if !queue.offer(InputEvent::physical(epoch.now(), kind)) {
                 // The queue is bounded and the counter is surfaced by the runner; there
                 // is nothing useful to do here but keep reading.
-                tracing::trace!("capture queue full, event dropped");
+                log::trace!("capture queue full, event dropped");
             }
         }
     }
@@ -153,8 +141,10 @@ fn pump_device(mut device: Device, queue: &EventQueue, epoch: &Epoch, running: &
 fn translate(event: evdev::InputEvent) -> Option<EventKind> {
     match event.destructure() {
         EventSummary::Key(_, code, value) => {
-            // 0 is release, 1 is press, 2 is the kernel's auto-repeat. The engine derives
-            // its own edges from transitions, so forwarding repeats would be noise.
+            // 0 is release, 1 is press, 2 is the kernel's auto-repeat. The executor reads
+            // every press as a trigger, so a forwarded repeat would re-fire a bind or stop
+            // its loop while the key is merely held. Dropping repeats here also matches
+            // the X11 backend, where auto-repeat never reaches a grab.
             let pressed = match value {
                 0 => false,
                 1 => true,
@@ -255,8 +245,8 @@ mod tests {
 
     #[test]
     fn kernel_auto_repeat_is_ignored() {
-        // Value 2 is the kernel repeating a held key. The engine derives edges from
-        // transitions, so passing these along would be pure noise.
+        // Value 2 is the kernel repeating a held key. The executor reads every press as
+        // a trigger, so passing repeats along would re-fire binds while a key is held.
         assert_eq!(translate(key_event(KeyCode::KEY_F9, 2)), None);
     }
 
@@ -275,10 +265,7 @@ mod tests {
         // not panic, and the no-device path must name the fix.
         let mut capture = EvdevCapture::new(Epoch::start());
         match capture.start() {
-            Ok(_stream) => {
-                assert!(capture.watching() > 0);
-                capture.stop();
-            }
+            Ok(_stream) => capture.stop(),
             Err(err) => {
                 assert!(err.to_string().contains("doctor") || err.to_string().contains("input"));
             }

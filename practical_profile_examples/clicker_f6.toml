@@ -1,0 +1,10 @@
+# autoclick
+
+[defaults]
+emergency_stop = "ctrl shift e"
+
+[binds.F6]
+loop = "inf"
+gap = "50ms"
+seq = ["mouse1"]
+

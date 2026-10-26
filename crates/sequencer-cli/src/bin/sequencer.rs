@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use sequencer_cli::clap;
 
 fn main() -> ExitCode {
-    // Global setup belongs here, never in the library: a second subscriber in one process
+    // Global setup belongs here, never in the library: a second logger in one process
     // fails, and an embedder must be free to install their own. The flags are sniffed
     // rather than parsed because logging has to be up before clap reports anything.
     #[cfg(feature = "logging")]

@@ -23,7 +23,7 @@ xtest = ["dep:x11rb", "dep:evdev"]
 [dependencies]
 sequencer-core = { workspace = true }
 thiserror = { workspace = true, features = ["std"] }
-tracing = { workspace = true, features = ["std"] }
+log = { workspace = true }
 # Sleeps natively up to the platform's accuracy, then spins out the remainder.
 spin_sleep = { workspace = true }
 

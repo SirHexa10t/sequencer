@@ -81,9 +81,8 @@ impl CaptureStream {
 
 /// A monotonically increasing timestamp source shared by capture threads and the runner.
 ///
-/// Capture threads stamp events on the same timeline the engine's deadlines live on,
-/// which is what lets the click cadence phase-lock to the physical press. Cloning shares
-/// the zero point.
+/// Capture threads stamp events on the same timeline the run's clock keeps its deadlines
+/// on, so a stamp and a deadline are directly comparable. Cloning shares the zero point.
 #[derive(Debug, Clone)]
 pub struct Epoch(Arc<std::time::Instant>);
 

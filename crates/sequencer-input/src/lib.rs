@@ -1,9 +1,9 @@
 //! Platform input: watching real devices, and synthesising events into them.
 //!
-//! Everything in this workspace that talks to an operating system lives here. The engine
-//! in `sequencer-core` has no path to any of it in its dependency graph, which is what
-//! makes "the engine is testable without a display server" a fact about the build rather
-//! than a promise in a comment.
+//! Everything in this workspace that talks to an operating system lives here.
+//! `sequencer-core` has no path to any of it in its dependency graph, which is what makes
+//! "the core is testable without a display server" a fact about the build rather than a
+//! promise in a comment.
 //!
 //! Two Linux backends, chosen per session by the caller:
 //!

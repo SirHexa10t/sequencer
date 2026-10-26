@@ -18,10 +18,10 @@
 //! version cannot break your build:
 //!
 //! ```no_run
-//! use sequencer_cli::{ClickerArgs, Command};
+//! use sequencer_cli::{Command, DetectKeyArgs};
 //!
-//! let args = ClickerArgs { cps: 12.5, toggle: true, ..ClickerArgs::new() };
-//! let code = Command::Clicker(args).run();
+//! let args = DetectKeyArgs { no_sudo: true, ..DetectKeyArgs::new() };
+//! let code = Command::DetectKey(args).run();
 //! ```
 //!
 //! Nesting the whole subcommand set inside your own parser works too, because
@@ -50,9 +50,9 @@
 //! # Rules this library follows so it is safe to embed
 //!
 //! It never calls `process::exit`, never calls `clap::Error::exit`, never reads
-//! `std::env::args` for you, and never installs global state — no tracing subscriber, no
-//! signal handler. [`init_logging`] exists for a `main` that wants one. Installing two
-//! subscribers in one process is a panic, and it should not be this crate's decision.
+//! `std::env::args` for you, and never installs global state — no logger, no signal
+//! handler. [`init_logging`] exists for a `main` that wants one. A process gets exactly
+//! one logger, and which one should not be this crate's decision.
 //!
 //! Exit codes are `u8` rather than `ExitCode` so a caller can inspect and remap them.
 
@@ -62,16 +62,12 @@
 
 // The subcommand bodies take the clap argument structs, so they live behind the same
 // gate -- and so does the binds format, whose parser is serde+toml, which `cli` brings.
-// What remains without `cli` is the plumbing: `runtime` (the pumps and the run summary)
-// and `Deps`, for an embedder that wires the crates below to a loop of its own.
-#[cfg(feature = "cli")]
-mod backend;
+// What remains without `cli` is the plumbing: `runtime` (the pumps) and `Deps`, for an
+// embedder that wires the crates below to a loop of its own.
 #[cfg(feature = "cli")]
 pub mod bench;
 #[cfg(feature = "cli")]
 mod binds;
-#[cfg(feature = "cli")]
-pub mod clicker;
 #[cfg(feature = "cli")]
 mod detect_key;
 #[cfg(feature = "cli")]
@@ -87,7 +83,7 @@ pub use profile::applied_profiles;
 
 #[cfg(feature = "cli")]
 mod elevate;
-// Colour for the clicker's banner; there is no banner without the command line.
+// Colour for the profile commands' output; there is none without the command line.
 #[cfg(feature = "cli")]
 mod style;
 #[cfg(feature = "cli")]
@@ -96,6 +92,9 @@ pub use elevate::run_with_sudo_prompt;
 #[cfg(feature = "cli")]
 mod args;
 mod error;
+// The stderr logger a `main` may install; the library itself never does.
+#[cfg(feature = "logging")]
+mod logging;
 
 /// Re-exported so a consumer cannot end up on a different clap major than this crate.
 ///
@@ -113,9 +112,9 @@ pub use crate::args::{
     BenchArgs, Cli, Command, DetectKeyArgs, DoctorArgs, GlobalArgs, ProfileApplyArgs,
     ProfileCheckArgs, ProfileUnapplyArgs,
 };
-#[cfg(feature = "cli")]
-pub use crate::clicker::{ClickerArgs, MouseButton};
 pub use crate::error::Error;
+#[cfg(feature = "logging")]
+pub use crate::logging::{LoggingAlreadyInitialized, init_logging};
 #[cfg(feature = "cli")]
 pub use crate::write_script::WriteScriptArgs;
 
@@ -303,7 +302,6 @@ pub fn try_run_command(command: &Command) -> Result<u8> {
 #[cfg(feature = "cli")]
 pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
     match command {
-        Command::Clicker(args) => clicker::clicker(args, deps),
         Command::WriteScript(args) => write_script::write_script(args, deps),
         Command::Bench(args) => bench::bench(args, deps),
         Command::Doctor(args) => doctor::doctor(args, deps),
@@ -333,43 +331,3 @@ pub fn caught_interrupt() -> Option<i32> {
         None
     }
 }
-
-/// Installs a `tracing` subscriber.
-///
-/// The library never calls this; `main` does. Doing it twice in one process fails, which
-/// is exactly why it is not done for you.
-///
-/// # Errors
-///
-/// If a global subscriber is already installed.
-#[cfg(feature = "logging")]
-pub fn init_logging(verbose: u8, quiet: bool) -> Result<(), LoggingAlreadyInitialized> {
-    use tracing::Level;
-
-    // A plain level, not a filter-directive string. `tracing-subscriber`'s `env-filter`
-    // would pull a whole regex engine in to parse per-module directives nobody is going
-    // to write for a clicker.
-    let level = if quiet {
-        Level::ERROR
-    } else {
-        match verbose {
-            0 => Level::WARN,
-            1 => Level::INFO,
-            2 => Level::DEBUG,
-            _ => Level::TRACE,
-        }
-    };
-
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init()
-        .map_err(|_| LoggingAlreadyInitialized)
-}
-
-/// Returned when a `tracing` subscriber is already installed.
-#[cfg(feature = "logging")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("a tracing subscriber is already installed in this process")]
-pub struct LoggingAlreadyInitialized;

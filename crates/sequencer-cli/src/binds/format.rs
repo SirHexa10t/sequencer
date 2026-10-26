@@ -69,13 +69,12 @@ impl Profile {
     /// Every check a profile must pass that is about the *set* of binds rather than any
     /// one of them: no stop chord doubling as a trigger, no two spellings sharing a grab,
     /// no circle of binds feeding each other. Called by [`parse`] once a file's binds are
-    /// lowered, and by the clicker with a bind it built in memory — one validator, so a
-    /// profile with no file behind it is held to exactly a file's standard.
+    /// lowered.
     ///
     /// # Errors
     ///
     /// The refusal, in the format's own words.
-    pub(crate) fn assemble(
+    fn assemble(
         binds: Vec<Bind>,
         program: Option<Vec<String>>,
         kb_lang: Option<Vec<String>>,
@@ -1706,27 +1705,6 @@ mod tests {
         );
     }
 
-    /// The set-level checks are one function, so a profile built in memory (the
-    /// clicker's) is held to a file's standard: a stop chord that is also a trigger is
-    /// refused there too.
-    #[test]
-    fn assemble_holds_a_built_profile_to_a_files_checks() {
-        let bind = Bind {
-            trigger_text: "F9".to_owned(),
-            trigger: vec![Key::F9],
-            action: Action::Seq(vec![Step::Tap(vec![Holdable::Key(Key::A)])]),
-            tap: DEFAULT_TAP,
-            gap: DEFAULT_GAP,
-            loops: Loops::Infinite,
-            only_while_pressed: true,
-        };
-        let err = Profile::assemble(vec![bind.clone()], None, None, vec![vec![Key::F9]])
-            .expect_err("F9 cannot both run the bind and stop the run");
-        assert!(err.contains("emergency_stop"), "{err}");
-        let ok = Profile::assemble(vec![bind], None, None, vec![vec![Key::F8]]).expect("valid");
-        assert_eq!(ok.binds.len(), 1);
-    }
-
     /// `bind = "NOP"` swallows the trigger and emits nothing — so it presses no keys,
     /// can close no circle, and (having no sequence) takes no `loop`.
     #[test]
@@ -1912,5 +1890,19 @@ mod tests {
         let err = parse_err("[binds.F6]\nseq = [\"nosuchkey\"]");
         assert!(err.contains("nosuchkey"), "{err}");
         assert!(err.contains("step 1"), "{err}");
+    }
+
+    /// A file that is not valid TOML at all still says where: the line number and the
+    /// offending line quoted back. That report comes from the TOML crate, not from us,
+    /// and the parser underneath it was replaced once already (toml 0.8 to 1.1), so this
+    /// pins the part a person needs rather than the caret layout, which may move.
+    #[test]
+    fn a_syntax_error_points_at_its_line() {
+        let err = parse_err("[binds.F6]\nbind = \"a\n");
+        assert!(err.contains("line 2"), "{err}");
+        assert!(
+            err.contains("bind = \"a"),
+            "the offending line is quoted: {err}"
+        );
     }
 }

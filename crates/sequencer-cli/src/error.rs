@@ -1,7 +1,6 @@
 //! What can go wrong, and what exit code it means.
 
 use sequencer_core::SinkError;
-use sequencer_core::time::ConfigError;
 
 use crate::exit;
 
@@ -9,10 +8,6 @@ use crate::exit;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The settings do not describe a runnable profile.
-    #[error(transparent)]
-    Config(#[from] ConfigError),
-
     /// The capture side failed.
     #[cfg(all(feature = "evdev", target_os = "linux"))]
     #[error(transparent)]
@@ -22,14 +17,6 @@ pub enum Error {
     #[cfg(all(feature = "evdev", target_os = "linux"))]
     #[error(transparent)]
     Bench(#[from] sequencer_input::linux::BenchError),
-
-    /// An X11 hotkey could not be grabbed.
-    ///
-    /// A usage error, not a runtime one: the fix is a different `--activate` or `--quit`
-    /// key, which is the user's command line rather than their machine.
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    #[error(transparent)]
-    Grab(#[from] sequencer_input::x11::GrabError),
 
     /// The injection side failed.
     #[error(transparent)]
@@ -77,12 +64,9 @@ impl Error {
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
         match self {
-            // Bad settings are the user's command line being wrong, which is a usage
-            // error even when the parser accepted each flag on its own.
-            Self::Config(_) | Self::Profile { .. } => exit::USAGE,
-            // The offending key came from the command line, and the fix is to change it.
-            #[cfg(all(feature = "xtest", target_os = "linux"))]
-            Self::Grab(_) => exit::USAGE,
+            // A profile that cannot run is the user's input being wrong, which is a usage
+            // error even when the file itself was read fine.
+            Self::Profile { .. } => exit::USAGE,
             #[cfg(all(feature = "evdev", target_os = "linux"))]
             Self::Capture(_) | Self::Bench(_) => exit::FAILURE,
             Self::Sink(_)
@@ -100,9 +84,6 @@ mod tests {
 
     #[test]
     fn bad_settings_are_a_usage_error() {
-        let err = Error::Config(ConfigError::CpsOutOfRange(0.0));
-        assert_eq!(err.exit_code(), exit::USAGE);
-
         let err = Error::Profile {
             path: "binds.toml".into(),
             detail: "nope".into(),

@@ -39,9 +39,14 @@ pub(super) fn config_dir() -> Result<PathBuf> {
         })
 }
 
+/// The subdirectory of the config dir holding the applied-profile symlinks.
+const ACTIVE_DIR: &str = "active";
+/// The file a stopping manager leaves in the config dir while it tears down.
+const STOPPING_MARKER: &str = "manager.stopping";
+
 /// Where the applied-profile symlinks live.
 pub(super) fn active_dir() -> Result<PathBuf> {
-    Ok(config_dir()?.join("active"))
+    Ok(config_dir()?.join(ACTIVE_DIR))
 }
 
 /// The manager's PID file, next to the set it manages.
@@ -206,7 +211,7 @@ fn scan(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
                 set.insert(name, target);
             }
             Err(_) => {
-                tracing::warn!(link = %name, "dangling profile link ignored");
+                log::warn!("dangling profile link ignored link={name}");
             }
         }
     }
@@ -222,6 +227,12 @@ fn scan(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
 /// next; that apply would have reported success onto cleanup that wiped its work.
 pub(super) fn clear_active_named(names: &BTreeSet<String>) -> Result<usize> {
     Ok(clear(&active_dir()?, names))
+}
+
+/// [`clear_active_named`] for the set under `config` — the directory a manager
+/// resolved when it started, so its teardown never re-reads the environment.
+pub(super) fn clear_active_in(config: &Path, names: &BTreeSet<String>) -> usize {
+    clear(&config.join(ACTIVE_DIR), names)
 }
 
 /// [`clear_active_named`] with the directory explicit, for tests.
@@ -245,7 +256,7 @@ fn clear(dir: &Path, names: &BTreeSet<String>) -> usize {
                 removed += 1;
             }
         } else {
-            tracing::warn!(path = %path.display(), "not a link; left in place");
+            log::warn!("not a link; left in place path={}", path.display());
         }
     }
     removed
@@ -316,7 +327,7 @@ pub(super) fn acquire_lock() -> Result<Custody> {
 /// inode a waiting process locked is always the inode the next process opens — the
 /// delete-while-another-holds-it race that a "remove the lock on the way out" protocol
 /// invites cannot happen here.
-fn acquire_lock_at(path: &Path) -> Result<Custody> {
+pub(super) fn acquire_lock_at(path: &Path) -> Result<Custody> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -372,20 +383,20 @@ fn lock_holder(path: &Path) -> Option<u32> {
 
 /// Where a stopping manager says so.
 fn stopping_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("manager.stopping"))
+    Ok(config_dir()?.join(STOPPING_MARKER))
 }
 
-/// Marks the set as being torn down, until the returned guard drops.
+/// Marks the set under `config` as being torn down, until the returned guard drops.
 ///
 /// A stopping manager un-enforces what it held, which means removing links. An apply
 /// that lands in the middle of that would have its own fresh link swept up by cleanup
 /// that had already decided what to remove. So the teardown announces itself, and
 /// [`stopping_manager`] lets an apply wait for it to finish instead of racing it.
-pub(super) fn mark_stopping() -> Option<Stopping> {
-    mark_stopping_at(stopping_path().ok()?)
+pub(super) fn mark_stopping_in(config: &Path) -> Option<Stopping> {
+    mark_stopping_at(config.join(STOPPING_MARKER))
 }
 
-/// [`mark_stopping`] with the path explicit, for tests.
+/// [`mark_stopping_in`] with the marker's path explicit, for tests.
 fn mark_stopping_at(path: PathBuf) -> Option<Stopping> {
     std::fs::write(&path, std::process::id().to_string()).ok()?;
     Some(Stopping { path })
@@ -419,20 +430,23 @@ pub(super) fn clear_stopping() -> Result<()> {
     Ok(())
 }
 
+/// A fresh, empty directory for one test: unique per process and thread, so the
+/// state tests and the manager's can run in parallel without sharing a set.
+#[cfg(test)]
+pub(super) fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sequencer-manager-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "sequencer-manager-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// The directory is the set: linking adds, relinking the same file REPLACES the
     /// link (the fresh stamp is the manager's reload cue), a different file under the

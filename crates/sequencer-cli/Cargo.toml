@@ -1,6 +1,6 @@
 [package]
 name = "sequencer-cli"
-description = "Autoclicker and hotkey-binding-profile interpreter: library and `sequencer` binary"
+description = "Hotkey-binding-profile interpreter: library and `sequencer` binary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,25 +10,27 @@ repository.workspace = true
 [features]
 default = ["cli", "logging", "evdev", "xtest"]
 # The clap surface: Cli, Command, the *Args types, and run/try_run. Turn it off to embed
-# just the engine wiring with no clap in your dependency graph.
+# just the run plumbing (the event pumps and `Deps`) with no clap in your dependency
+# graph.
 # `nix` rides along for detect-key's terminal raw mode (termios); serde+toml parse
 # apply-profile's binds files.
 cli = ["dep:clap", "dep:nix", "dep:serde", "dep:toml", "dep:toml_edit", "dep:signal-hook"]
-# init_logging(). Off for embedders that own the global tracing subscriber themselves.
-logging = ["dep:tracing-subscriber"]
-# The Linux input backend. On by default so `cargo build` produces a working clicker;
-# inert on other platforms. `nix` rides along for session mode's privilege drop.
+# init_logging(): the stderr logger behind -q/-v/-vv. Off for embedders that install
+# their own `log` logger. It pulls in no dependency, only the printer's own code.
+logging = []
+# The Linux device backend: detect-key's exact mode and bench. On by default; inert on
+# other platforms. `nix` rides along for session mode's privilege drop.
 evdev = ["sequencer-input/evdev", "dep:nix"]
-# The X11 backend. On by default: on an X11 session it makes the whole run need no device
-# access and so no password, which is the difference between a tool you set up and one you
-# just run.
+# The X11 backend, which profile-apply runs on. On by default: it needs no device access
+# and so no password, which is the difference between a tool you set up and one you just
+# run.
 xtest = ["sequencer-input/xtest"]
 
 [dependencies]
 sequencer-core = { workspace = true }
 sequencer-input = { workspace = true }
 thiserror = { workspace = true, features = ["std"] }
-tracing = { workspace = true, features = ["std", "attributes"] }
+log = { workspace = true }
 clap = { workspace = true, optional = true, features = [
     "std",
     "derive",
@@ -39,9 +41,11 @@ clap = { workspace = true, optional = true, features = [
     "color",
     "wrap_help",
 ] }
-tracing-subscriber = { workspace = true, optional = true, features = ["fmt", "ansi"] }
-serde = { workspace = true, optional = true, features = ["derive"] }
-toml = { workspace = true, optional = true, features = ["parse"] }
+# `std` is declared, not inherited: the derived untagged enums need serde's `alloc`
+# half, and nothing else switches it on — `toml` and `toml_edit` depend on `serde_core`,
+# not on `serde`. (`toml` 0.8 used to turn it on from the side; the upgrade proved it.)
+serde = { workspace = true, optional = true, features = ["derive", "std"] }
+toml = { workspace = true, optional = true, features = ["parse", "serde"] }
 toml_edit = { workspace = true, optional = true, features = ["parse", "display"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -60,8 +64,6 @@ nix = { workspace = true, optional = true, features = [
 ] }
 
 [dev-dependencies]
-assert_cmd = { workspace = true }
-predicates = { workspace = true }
 # The live suite sends real SIGINT to the manager it spawns, and checks that a quit
 # manager's advisory lock is free (`fs`).
 nix = { workspace = true, features = ["signal", "fs"] }

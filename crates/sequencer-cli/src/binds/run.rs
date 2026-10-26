@@ -291,25 +291,23 @@ impl<'a> Executor<'a> {
                             if let Some(lift) = pumps.lift
                                 && lift(&targets, held, lift_primary, tap)
                             {
-                                tracing::info!(
-                                    trigger = %key,
-                                    "mirror tap fired between lifted modifiers"
+                                log::info!(
+                                    "mirror tap fired between lifted modifiers trigger={key}"
                                 );
                                 return Ok(None);
                             }
                             // No lifter (headless seams) or it could not fire:
                             // recoloured through the real sink — better than never.
                         }
-                        tracing::info!(
-                            trigger = %key,
-                            target = %targets
+                        log::info!(
+                            "mirror tap trigger={key} target={}",
+                            targets
                                 .iter()
                                 .map(|target| {
                                     sequencer_core::input::INPUT_MAP.display_name(*target)
                                 })
                                 .collect::<Vec<_>>()
-                                .join(" "),
-                            "mirror tap"
+                                .join(" ")
                         );
                         self.tap_chord(&targets, tap)?;
                     }
@@ -578,7 +576,7 @@ impl<'a> Executor<'a> {
                     // Any other event mid-sequence is dropped: two sequences cannot
                     // run at once in this executor, and queueing them for later has
                     // surprised every macro tool that tried it.
-                    tracing::debug!("input during a sequence ignored");
+                    log::debug!("input during a sequence ignored");
                 }
                 Wake::Deadline => {
                     if self.clock.now() >= deadline {
@@ -625,7 +623,7 @@ impl<'a> Executor<'a> {
                     {
                         return Ok(Heard::Emergency);
                     }
-                    tracing::debug!("input while a tap waits for the hand ignored");
+                    log::debug!("input while a tap waits for the hand ignored");
                 }
                 Wake::Deadline => {}
                 Wake::Interrupted => {
@@ -666,7 +664,7 @@ impl<'a> Executor<'a> {
                     {
                         return Ok(Heard::StopBind);
                     }
-                    tracing::debug!("input during a sequence ignored");
+                    log::debug!("input during a sequence ignored");
                 }
                 Wake::Deadline => return Ok(Heard::Nothing),
                 Wake::Interrupted => {
@@ -973,8 +971,8 @@ mod tests {
 
     /// The briefest tap: the probe already says "up" the first time it is asked, during
     /// the first tap's own hold. Exactly one repetition happens, and it still completes
-    /// its release — the original clicker complaint, "tapping too briefly does
-    /// nothing", answered: a tap is one click.
+    /// its release — the original complaint, "tapping too briefly does nothing",
+    /// answered: a tap is one repetition.
     #[test]
     fn the_briefest_tap_is_exactly_one_repetition() {
         let (actions, ended_at) = run_events_probed(

@@ -1,4 +1,4 @@
-//! XTEST injection — the same clicks, delivered *above* libinput.
+//! XTEST injection — synthetic input delivered *above* libinput.
 //!
 //! The evdev/uinput backend writes to `/dev/uinput`, below the kernel input stack, so its
 //! events pass through libinput before any application sees them. On at least one X11
@@ -7,10 +7,10 @@
 //! kernel perfectly, verified by reading the device node back, and are lost above it).
 //!
 //! XTEST injects into the X server's own event queue through the `XTestFakeInput` request,
-//! which is where a tool like `xdotool` — or any pynput-based autoclicker — puts its events.
+//! which is where a tool like `xdotool` — or anything built on pynput — puts its events.
 //! That is past libinput entirely, so the ceiling does not apply. The cost is that it only
 //! reaches X11: a Wayland session, or the bare console, still needs the uinput backend. This
-//! is a *second* sink, chosen at runtime when `$DISPLAY` is set, never a replacement.
+//! is a *second* sink beside that one, never a replacement.
 //!
 //! Keycodes: on Linux an X keycode is the evdev code plus 8, a fixed convention of the X
 //! server's evdev handling. So this reuses the Linux backend's [`crate::linux::keymap`] for
@@ -154,7 +154,7 @@ impl InputSink for XTestSink {
         // Visible with `-v`: the exact X keycode leaving this process. When a key seems
         // to do nothing, this is the line that separates "we never sent it" from "we
         // sent it and the desktop ignored it" — two very different bugs.
-        tracing::debug!(action = ?emit.action, "XTEST inject");
+        log::debug!("XTEST inject action={:?}", emit.action);
         match emit.action {
             EmitAction::KeyDown(key) => {
                 let detail = x_keycode(key).ok_or(SinkError::UnmappableKey(key))?;
@@ -350,7 +350,7 @@ impl LiftedTap {
     /// "XTEST inject" marker too, so `-v` (and the live suite's injection counter)
     /// sees every synthetic event regardless of which path fired it.
     fn fake(&self, event_type: u8, detail: u8) -> bool {
-        tracing::debug!(event_type, detail, "XTEST inject (lifted tap)");
+        log::debug!("XTEST inject (lifted tap) event_type={event_type} detail={detail}");
         self.conn
             .xtest_fake_input(event_type, detail, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
             .is_ok()

@@ -1,6 +1,6 @@
 [package]
 name = "sequencer-core"
-description = "Sans-IO engine for autoclicking and hotkey-binding-profile sequencing"
+description = "The sequencer domain with no I/O in it: keys, input events, actions, time and a replayable RNG"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

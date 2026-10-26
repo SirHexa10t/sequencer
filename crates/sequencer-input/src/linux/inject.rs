@@ -63,7 +63,7 @@ impl UinputSink {
         // not classify as a pointer, so it routes the button events nowhere: the kernel
         // accepts every write, a read-back (`bench`) counts every one of them, and not a
         // single click reaches an application. Two unused axes are the whole difference
-        // between that and a working clicker.
+        // between that and clicks that land.
         let mut axes = AttributeSet::<RelativeAxisCode>::new();
         axes.insert(RelativeAxisCode::REL_X);
         axes.insert(RelativeAxisCode::REL_Y);
@@ -167,7 +167,7 @@ impl InputSink for UinputSink {
     fn release_all(&mut self) {
         // Best effort by contract: this runs from a drop guard, including while
         // unwinding from a panic, so it swallows errors rather than risking a second one.
-        // Reverse order, mirroring the engine's own ledger.
+        // Reverse order, mirroring the executor's own ledger.
         let held = std::mem::take(&mut self.held);
         for code in held.into_iter().rev() {
             self.pending

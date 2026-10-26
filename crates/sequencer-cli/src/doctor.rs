@@ -4,8 +4,14 @@ use sequencer_input::probe::{CheckResult, Step as FixStep};
 use sequencer_input::{Requirement, SessionInfo};
 
 use crate::args::DoctorArgs;
-use crate::backend;
 use crate::{Deps, Result, exit};
+
+/// Whether this build has an input backend at all. Without one, every command that
+/// touches input refuses.
+const AVAILABLE: bool = cfg!(all(
+    any(feature = "evdev", feature = "xtest"),
+    target_os = "linux"
+));
 
 /// Every requirement the device backend needs, in report order.
 ///
@@ -29,7 +35,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     let info = SessionInfo::detect();
     // Probed once and reused: every call opens a fresh X connection, and two calls could
     // in principle straddle a session ending and have the report contradict itself.
-    let on_x11 = x11_handles_the_run();
+    let on_x11 = x11_usable();
 
     writeln!(
         deps.out,
@@ -39,7 +45,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         std::env::consts::ARCH
     )?;
     writeln!(deps.out, "session: {}", info.session)?;
-    writeln!(deps.out, "backend: {}", backend_pair(on_x11))?;
+    writeln!(deps.out, "backend: {}", profile_backend(on_x11))?;
     // Above the requirement checks on purpose: several of the paths below return early,
     // and a stuck modifier is worth reporting even on a machine that fails those.
     keyboard::write(deps)?;
@@ -56,7 +62,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     }
     writeln!(deps.out)?;
 
-    if !backend::AVAILABLE {
+    if !AVAILABLE {
         writeln!(
             deps.out,
             "[fail] no input backend: this build has none for {}. Only Linux is supported.",
@@ -87,8 +93,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         if REQUIREMENTS.is_empty() && !on_x11 {
             writeln!(
                 deps.out,
-                "[fail] no X server answered, and this build has only the X11 backend. \
-                 Rebuild with the `evdev` feature to run outside X."
+                "[fail] no X server answered, and this build has only the X11 backend."
             )?;
             return Ok(exit::FAILURE);
         }
@@ -98,9 +103,9 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     if on_x11 {
         writeln!(
             deps.out,
-            "\nNone of that is needed here: this is an X11 session, so clicks go through \
-             XTEST and hotkeys through key grabs, and neither opens a device. The checks \
-             above matter only if you later run without X."
+            "\nProfiles need none of that: on X11 their output goes through XTEST and their \
+             triggers through key grabs, and neither opens a device. The checks above are \
+             for `detect-key` and `bench`, which read the devices."
         )?;
         return Ok(exit::OK);
     }
@@ -114,21 +119,25 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     }
 }
 
-/// Which backend pair a run would choose, for `doctor` to report.
-const fn backend_pair(on_x11: bool) -> &'static str {
+/// What `profile-apply` runs on, for `doctor` to report. The manager has only the X11
+/// pair, so without it there is nothing to name.
+const fn profile_backend(on_x11: bool) -> &'static str {
     if on_x11 {
-        "X11 — XTEST for clicks, key grabs for hotkeys (no device access, no sudo)"
+        "X11 — XTEST for output, key grabs for triggers (no device access, no sudo)"
+    } else if cfg!(feature = "xtest") {
+        "none — profiles need an X server, and none answered"
     } else {
-        "uinput device for clicks, evdev for hotkeys"
+        "none — profiles need the X11 backend, which this build leaves out"
     }
 }
 
-/// Whether the X11 pair will handle the whole run, making the device checks informational.
+/// Whether an X server answers, which is what profiles need — making the device checks
+/// informational for them.
 ///
-/// Asks the same question `platform::open_pair` will — [`sequencer_input::x11::is_usable`],
-/// which connects rather than reading `$DISPLAY` — so the report cannot promise one backend
-/// and the run pick the other.
-fn x11_handles_the_run() -> bool {
+/// Asks the question the manager asks before it starts —
+/// [`sequencer_input::x11::is_usable`], which connects rather than reading `$DISPLAY` — so
+/// the report cannot promise profiles a session the manager would refuse.
+fn x11_usable() -> bool {
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
         sequencer_input::x11::is_usable()

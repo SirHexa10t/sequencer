@@ -25,9 +25,12 @@ pub use map::{Category, INPUT_MAP, InputEntry, InputMap};
 ///
 /// [`EventOrigin::Synthetic`] carries AutoHotkey's send-level idea: with a binding's input
 /// level and an emitted event's level both defaulting to zero, and a binding only firing
-/// on synthetic events *strictly above* its level, the engine cannot retrigger itself.
+/// on synthetic events *strictly above* its level, a binding cannot retrigger itself.
 /// The safe behaviour falls out of the arithmetic instead of needing a special case, and
-/// deliberate remap cascades stay possible later by raising the level.
+/// deliberate remap cascades stay possible later by raising the level. Nothing reads the
+/// origin today: the core engine that applied this rule retired (2026-09-29), and the
+/// binds format guards against self-retriggering instead, by refusing any profile whose
+/// output would keep re-pressing its own triggers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EventOrigin {
     /// Real hardware — or an event the backend could not attribute, since failing safe
@@ -190,10 +193,12 @@ pub enum EventKind {
 /// One thing the user did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InputEvent {
-    /// The backend's hardware timestamp if it has one, otherwise arrival time.
+    /// The backend's hardware timestamp if it has one, otherwise arrival time, on the
+    /// run's shared timeline.
     ///
-    /// Repeat cadence phase-locks to this rather than to when the runner got around to
-    /// processing it, so an event delivered late does not shift the whole click train.
+    /// Nothing reads it today. The retired core engine phase-locked repeat cadence to it;
+    /// the binds executor paces from when it handles a press instead, so an event
+    /// delivered late starts its repetitions late rather than catching up.
     pub at: Timestamp,
     /// Whether this came from hardware or from an injector.
     pub origin: EventOrigin,

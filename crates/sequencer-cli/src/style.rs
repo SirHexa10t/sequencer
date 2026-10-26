@@ -1,7 +1,7 @@
 //! The one place this crate decides what a highlighted word looks like.
 //!
-//! Only the words that carry the decision are highlighted — the keys of a banner, the
-//! verb of a state change, the phrase of a refusal. Colouring the surrounding prose too
+//! Only the words that carry the decision are highlighted — a key or a state, the verb
+//! of a state change, the phrase of a refusal. Colouring the surrounding prose too
 //! would make them stop standing out. Three colours, three meanings: blue for state and
 //! keys, red for "this did not happen", orange for "this is how you stop something".
 //!
@@ -13,10 +13,18 @@ use std::io::IsTerminal as _;
 use std::sync::OnceLock;
 
 /// Bold blue.
+#[cfg_attr(
+    not(feature = "xtest"),
+    allow(dead_code, reason = "only the X11 apply path prints a blue state word")
+)]
 const HIGHLIGHT: &str = "\u{1b}[1;34m";
 /// Bold red.
 const ALARM: &str = "\u{1b}[1;31m";
 /// Bold orange — 256-colour 208; the basic palette has no orange.
+#[cfg_attr(
+    not(feature = "xtest"),
+    allow(dead_code, reason = "only the X11 manager's stop hint is orange")
+)]
 const STOPPER: &str = "\u{1b}[1;38;5;208m";
 const RESET: &str = "\u{1b}[0m";
 
@@ -27,7 +35,7 @@ fn colours(no_color_set: bool, stdout_is_terminal: bool) -> bool {
 }
 
 /// [`colours`] asked about this run, resolved once: the answer cannot change mid-run,
-/// and re-checking per word would mean an `isatty` syscall per banner field.
+/// and re-checking per word would mean an `isatty` syscall per highlighted word.
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -39,6 +47,10 @@ fn enabled() -> bool {
 }
 
 /// `text` in bold blue, or unchanged when colour is off.
+#[cfg_attr(
+    not(feature = "xtest"),
+    allow(dead_code, reason = "only the X11 apply path prints a blue state word")
+)]
 pub(crate) fn key(text: &str) -> String {
     paint(HIGHLIGHT, text)
 }
@@ -49,6 +61,10 @@ pub(crate) fn alarm(text: &str) -> String {
 }
 
 /// `text` in bold orange — the word or chord that stops something.
+#[cfg_attr(
+    not(feature = "xtest"),
+    allow(dead_code, reason = "only the X11 manager's stop hint is orange")
+)]
 pub(crate) fn stopper(text: &str) -> String {
     paint(STOPPER, text)
 }

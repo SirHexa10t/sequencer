@@ -1,4 +1,4 @@
-//! Time, as the engine sees it.
+//! Time, as the sans-IO core sees it.
 //!
 //! Nothing here reads a clock. [`Timestamp`] is a plain number the runner hands in, which
 //! is what lets every timing test run against a virtual clock in microseconds instead of
@@ -10,7 +10,7 @@ pub use core::time::Duration;
 
 /// Monotonic nanoseconds since an opaque epoch chosen by the runner.
 ///
-/// Deliberately not `std::time::Instant`: the engine must not know about the OS. Every
+/// Deliberately not `std::time::Instant`: the core must not know about the OS. Every
 /// operation saturates, so a clock that jumps backwards or a duration that overflows
 /// produces a clamped value rather than a panic.
 ///
@@ -63,7 +63,7 @@ impl Timestamp {
 /// A [`Duration`] as whole nanoseconds, clamped into a `u64`.
 ///
 /// `Duration` counts nanoseconds in a `u128` and so can describe spans no monotonic clock
-/// will ever reach. Clamping keeps the engine's arithmetic in `u64` without a fallible
+/// will ever reach. Clamping keeps the timing arithmetic in `u64` without a fallible
 /// conversion at every call site.
 pub(crate) fn clamp_nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -92,8 +92,9 @@ fn round_to_u64(x: f64) -> u64 {
 /// A strictly positive repetition period.
 ///
 /// The [`NonZeroU64`] is load-bearing rather than decorative: it makes `cps = 0`
-/// unrepresentable, so the catch-up arithmetic in the engine cannot divide by zero and
-/// there is no "period of zero means infinite loop" case to defend against downstream.
+/// unrepresentable, so a repetition can never be scheduled with no time before the next
+/// one, and there is no "period of zero means infinite loop" case to defend against
+/// downstream.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Period(NonZeroU64);
 
@@ -110,10 +111,11 @@ impl Period {
     /// Converts a rate in clicks (or key presses) per second into a period.
     ///
     /// There is deliberately no upper limit on the rate. A request faster than the
-    /// machine can deliver degrades gracefully — the engine drops the slots it cannot
-    /// reach and reports them — so an artificial ceiling here would only cap the
-    /// achievable rate below what the hardware allows. Rates faster than one per
-    /// nanosecond clamp to a 1 ns period, the resolution of the timeline itself.
+    /// machine can deliver degrades gracefully — each repetition waits its gap after the
+    /// last, so a slow machine simply runs slower and the exit report says the rate it
+    /// really sent — so an artificial ceiling here would only cap the achievable rate
+    /// below what the hardware allows. Rates faster than one per nanosecond clamp to a
+    /// 1 ns period, the resolution of the timeline itself.
     ///
     /// # Errors
     ///
@@ -147,7 +149,8 @@ impl Period {
     }
 }
 
-/// Injected time. The only capability the engine needs from the outside world to be driven.
+/// Injected time: how the executor and the run loops tell the time and wait for it, so a
+/// test can drive them on a virtual clock.
 pub trait Clock {
     /// The current time on this clock.
     fn now(&self) -> Timestamp;

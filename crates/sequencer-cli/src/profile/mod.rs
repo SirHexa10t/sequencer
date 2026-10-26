@@ -3,8 +3,8 @@
 //! The pieces live beside this file, one concern each: [`check`] reports on files
 //! without applying them, [`state`] owns the on-disk active set, and the manager module
 //! runs the live multi-profile loop. What a binds file may *mean*, and how one is executed,
-//! is the crate-wide [`crate::binds`] spine — shared with the clicker. This file is the
-//! command surface stitching them together, plus the picker that makes unapplying humane.
+//! is the crate-wide [`crate::binds`] spine. This file is the command surface stitching
+//! them together, plus the picker that makes unapplying humane.
 
 // The state layer is symlinks and PID files — Unix machinery; without the X11 feature
 // only unapply's half of it runs, so the apply half is allowed to sit idle.
@@ -28,7 +28,9 @@ pub(crate) use manager::caught_interrupt;
 
 pub(crate) use check::profile_check;
 
-use crate::binds::format::{self, Profile, parse};
+use crate::binds::format::parse;
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+use crate::binds::format::{self, Profile};
 use crate::binds::run;
 
 /// The applied set right now: each profile's name in the set and the file its link
@@ -416,7 +418,8 @@ fn announce(
         state::Applied::Linked(link) => {
             writeln!(
                 out,
-                "applied: {} ({} binds)",
+                "{}: {} ({} binds)",
+                crate::style::key("applied"),
                 link.display(),
                 profile.binds.len()
             )?;

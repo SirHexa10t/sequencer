@@ -8,7 +8,7 @@
 //! command line.
 //!
 //! **The `*Args` structs are not `#[non_exhaustive]`.** They are built with
-//! `ClickerArgs { cps: 30.0, ..ClickerArgs::new() }`, and `#[non_exhaustive]` forbids that
+//! `BenchArgs { seconds: 5.0, ..BenchArgs::new() }`, and `#[non_exhaustive]` forbids that
 //! syntax across crate boundaries. The `new()` constructor already provides the
 //! forward-compatibility that attribute is usually reached for. The *enums* are
 //! `#[non_exhaustive]`, where it is correct.
@@ -17,9 +17,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::clicker::args::{ClickerArgs, parse_cps};
 use crate::write_script::WriteScriptArgs;
-use sequencer_core::input::Key;
+use sequencer_core::time::Period;
 
 /// Synthetic input for Linux.
 #[derive(Parser, Debug)]
@@ -34,8 +33,8 @@ use sequencer_core::input::Key;
 pub struct Cli {
     /// What to run.
     ///
-    /// Required rather than defaulting to `clicker`: more modes are coming, and a tool
-    /// where one of them is silently implied gets harder to read as they arrive.
+    /// Required rather than defaulted: more modes are coming, and a tool where one of
+    /// them is silently implied gets harder to read as they arrive.
     #[command(subcommand)]
     pub command: Command,
 }
@@ -53,9 +52,7 @@ impl From<Command> for Cli {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum Command {
-    /// Hold or toggle a key to click, or to repeat a key press.
-    Clicker(ClickerArgs),
-    /// Measure how many clicks per second this machine can actually deliver.
+    /// Measure how fast synthetic input actually gets through this machine.
     Bench(BenchArgs),
     /// Report what this machine can and cannot do, and how to fix what it cannot.
     Doctor(DoctorArgs),
@@ -76,7 +73,6 @@ impl Command {
     #[must_use]
     pub const fn global(&self) -> &GlobalArgs {
         match self {
-            Self::Clicker(args) => &args.global,
             Self::Bench(args) => &args.global,
             Self::Doctor(args) => &args.global,
             Self::DetectKey(args) => &args.global,
@@ -89,7 +85,7 @@ impl Command {
 
     /// Runs this against the real backend, reporting its own diagnostics.
     ///
-    /// The one-liner for a wrapping CLI: `sequencer_cli::Command::Clicker(args).run()`.
+    /// The one-liner for a wrapping CLI: `sequencer_cli::Command::DetectKey(args).run()`.
     #[must_use]
     pub fn run(self) -> u8 {
         crate::run_command(&self)
@@ -325,6 +321,15 @@ impl Default for ProfileUnapplyArgs {
 
 /// Rejects a bad rate at parse time, so `--cps 0` is a clean usage error rather than a
 /// division by zero much later.
+fn parse_cps(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    Period::from_cps(value).map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+/// Rejects a duration that is not a positive number of seconds, at parse time too.
 fn parse_seconds(raw: &str) -> Result<f64, String> {
     let value: f64 = raw
         .parse()
@@ -335,16 +340,11 @@ fn parse_seconds(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-pub(crate) fn parse_key(raw: &str) -> Result<Key, String> {
-    raw.parse::<Key>().map_err(|err| err.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
 
     use super::*;
-    use crate::clicker::ClickerArgs;
 
     /// The one-line test that is easy to forget. It runs clap's own consistency checks --
     /// duplicate argument ids, defaults that fail their own parser -- and without it
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn a_subcommand_is_required() {
         // No implied default: with more modes coming, `sequencer --cps 20` silently
-        // meaning "clicker" would get harder to read, not easier.
+        // meaning one of them would get harder to read, not easier.
         assert!(Cli::try_parse_from(["sequencer"]).is_err());
         assert!(Cli::try_parse_from(["sequencer", "--cps", "30"]).is_err());
     }
@@ -380,6 +380,14 @@ mod tests {
         };
         assert_eq!(args.cps, Some(500.0));
         assert!((args.seconds - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_impossible_rate_is_a_usage_error_not_a_runtime_surprise() {
+        for bad in ["0", "-5", "nan", "inf"] {
+            let result = Cli::try_parse_from(["sequencer", "bench", "--cps", bad]);
+            assert!(result.is_err(), "--cps {bad} should have been rejected");
+        }
     }
 
     #[test]
@@ -404,7 +412,7 @@ mod tests {
 
     #[test]
     fn verbose_and_quiet_are_mutually_exclusive() {
-        assert!(Cli::try_parse_from(["sequencer", "clicker", "-v", "-q"]).is_err());
+        assert!(Cli::try_parse_from(["sequencer", "doctor", "-v", "-q"]).is_err());
     }
 
     #[test]
@@ -413,7 +421,6 @@ mod tests {
         // count is asserted too. A subcommand added without a row here would otherwise slip
         // through silently, which is exactly what happened when `write-script` arrived.
         let commands = [
-            Command::Clicker(ClickerArgs::new()),
             Command::Bench(BenchArgs::new()),
             Command::Doctor(DoctorArgs::new()),
             Command::DetectKey(DetectKeyArgs::new()),

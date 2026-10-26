@@ -5,8 +5,8 @@
 //! - **Devices** (the default): read `/dev/input`, which is the only *exact* answer —
 //!   every key reports as itself, modifiers alone and media keys and mouse buttons
 //!   included, and kpmultiply is never mistaken for the `*` it types. Needs read access,
-//!   so it may borrow sudo for the run the same way the clicker does (and sheds it once
-//!   the devices are open — this mode never writes anything). The terminal is silenced
+//!   so it may borrow sudo for the run — session mode — and shed it once the devices are
+//!   open (this mode never writes anything). The terminal is silenced
 //!   while it runs, so presses do not also type into the shell; Ctrl+C quits, recognised
 //!   as a chord off the devices themselves, which is the one path nothing between this
 //!   process and the keyboard can swallow.
@@ -432,9 +432,9 @@ mod platform {
         // (piped stdin) there is nothing to silence, and the quit chord off the devices
         // is the way out either way.
         let silencer = tty::Silencer::enable();
-        tracing::debug!(
-            silenced = silencer.is_some(),
-            "detect-key: terminal state before reading devices"
+        log::debug!(
+            "detect-key: terminal state before reading devices silenced={}",
+            silencer.is_some()
         );
         let mut focus = super::SessionPoll::new();
         focus.report(out)?;

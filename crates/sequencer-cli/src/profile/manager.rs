@@ -7,9 +7,9 @@
 //! shared queue and the loop *blocks* on it, waking the moment a key arrives.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use sequencer_core::emit::Holdable;
+use sequencer_core::emit::{Holdable, InputSink};
 use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
@@ -229,8 +229,8 @@ fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
 /// Runs the active set until it empties out, Ctrl+C (or SIGTERM), or a fatal error.
 ///
 /// Everything user-visible goes through `out`, line per event: profiles appearing,
-/// leaving, activating, going dormant, being refused. The lock lives exactly as
-/// long as this frame.
+/// leaving, activating, going dormant, being refused. The lock lives until the
+/// loop's [`Enforcement`] lets it go, which every exit reaches — a panic included.
 pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8> {
     if !sequencer_input::x11::is_usable() {
         return Err(Error::NotImplemented(
@@ -241,17 +241,18 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
     }
     let epoch = Epoch::start();
     let clock = SystemClock::from_epoch(epoch.instant());
-    let mut sink = XTestSink::open()?;
+    // Everything the loop must let go of on its way out, whichever way out it takes.
+    let mut enforcement = Enforcement::new(
+        &clock,
+        XTestSink::open()?,
+        super::state::config_dir()?,
+        lock,
+    );
     let mut rng = Rng::new(wall_seed());
     // Every grab — each profile's, and the emergency union — feeds this one queue,
     // so the loop below can block on all of them at once.
     let (queue, stream) = sequencer_input::CaptureStream::channel(256);
     let mut pump = CapturePump::new(stream, &clock);
-    let mut slots: BTreeMap<String, Slot> = BTreeMap::new();
-    // Refused links, with the stamp they were refused at: a re-apply replaces the
-    // link, and the changed stamp is what earns a retry.
-    let mut failed: BTreeMap<String, Option<std::time::SystemTime>> = BTreeMap::new();
-    let mut emergency: Option<(BTreeSet<Vec<Key>>, GrabCapture)> = None;
     let mut focus: Option<FocusWatcher> = None;
     let mut layout: Option<LayoutWatcher> = None;
     // One live connection for "is that key still down?" — the deferred-tap question.
@@ -281,11 +282,11 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                 out,
                 &epoch,
                 &queue,
-                &mut sink,
+                &mut enforcement.sink,
                 &clock,
-                &mut slots,
-                &mut failed,
-                &mut emergency,
+                &mut enforcement.slots,
+                &mut enforcement.failed,
+                &mut enforcement.emergency,
                 &mut focus,
                 &mut layout,
                 scanned_dir,
@@ -299,7 +300,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
             // Confirmed over two scans, so no momentary gap in the directory can pass
             // for that.
             if scanned_dir {
-                if slots.is_empty() {
+                if enforcement.slots.is_empty() {
                     empty_scans += 1;
                     if empty_scans >= EMPTY_SCANS_TO_STOP {
                         break Ok("no profiles left");
@@ -317,11 +318,11 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                 if let Err(err) = dispatch(
                     out,
                     event,
-                    &mut sink,
+                    &mut enforcement.sink,
                     &clock,
                     &mut rng,
                     &mut pump,
-                    &mut slots,
+                    &mut enforcement.slots,
                     probe.as_ref(),
                     lifter.as_ref(),
                     focus.as_ref(),
@@ -335,21 +336,33 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
         }
     };
 
-    let cleared = stop_enforcing(&mut sink, &clock, &mut slots, &failed, &mut emergency, lock);
+    let cleared = enforcement.stop();
     let reason = outcome?;
     if !lost_terminal() {
-        // A caught Ctrl+C already echoed `^C` and left the cursor mid-line; start clean.
-        let lead = if reason == "interrupted" { "\n" } else { "" };
-        writeln!(
-            out,
-            "{lead}stopped ({reason}); {cleared} profile(s) unapplied — nothing is enforced now"
-        )?;
-        if let Some(note) = stuck_modifier_note(probe.as_ref()) {
-            writeln!(out, "{note}")?;
-        }
-        out.flush()?;
+        report_stopped(out, reason, cleared, probe.as_ref())?;
     }
     Ok(exit::OK)
+}
+
+/// The manager's last words: why it stopped, how many profiles that unapplied, and
+/// whether a modifier is still physically held down.
+fn report_stopped(
+    out: &mut dyn std::io::Write,
+    reason: &str,
+    cleared: usize,
+    probe: Option<&sequencer_input::KeyProbe>,
+) -> Result<()> {
+    // A caught Ctrl+C already echoed `^C` and left the cursor mid-line; start clean.
+    let lead = if reason == "interrupted" { "\n" } else { "" };
+    writeln!(
+        out,
+        "{lead}stopped ({reason}); {cleared} profile(s) unapplied — nothing is enforced now"
+    )?;
+    if let Some(note) = stuck_modifier_note(probe) {
+        writeln!(out, "{note}")?;
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Routes one event: an emergency press stops exactly the slots that named that
@@ -509,7 +522,7 @@ fn stuck_modifier_note(probe: Option<&sequencer_input::KeyProbe>) -> Option<Stri
 /// released, its link removed from the set. The manager itself keeps going.
 fn stop_slot(
     out: &mut dyn std::io::Write,
-    sink: &mut dyn sequencer_core::emit::InputSink,
+    sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     name: &str,
@@ -547,40 +560,92 @@ fn lost_terminal() -> bool {
     nix::unistd::tcgetpgrp(fd).is_ok_and(|owner| owner != nix::unistd::getpgrp())
 }
 
-/// The stop sequence, in the order the rest of the world needs it, returning how many
-/// links were removed.
+/// What the manager is enforcing, and the promise to let all of it go.
 ///
-/// The order is the whole point. Announcing first means an apply that lands mid-stop
-/// waits instead of having its fresh link swept up by cleanup that already decided what
-/// to remove. Clearing only what this manager enforced leaves such a link alone even
-/// so. And the lock is released *before* the marker, because an apply the marker
-/// releases must find the lock free — otherwise it reports onto a manager that no
-/// longer exists and nothing enforces its profiles.
-fn stop_enforcing(
-    sink: &mut XTestSink,
-    clock: &SystemClock,
-    slots: &mut BTreeMap<String, Slot>,
-    failed: &BTreeMap<String, Option<std::time::SystemTime>>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
-    lock: LockGuard,
-) -> usize {
-    // Named before teardown empties the slots.
-    let enforced: BTreeSet<String> = slots
-        .keys()
-        .cloned()
-        .chain(failed.keys().cloned())
-        .collect();
-    let stopping = super::state::mark_stopping();
-    teardown(sink, clock, slots, emergency);
-    let cleared = super::state::clear_active_named(&enforced).unwrap_or(0);
-    drop(lock);
-    drop(stopping);
-    cleared
+/// Owns the sink, the slots, the emergency grab and the lock rather than leaving them
+/// as loop locals, because ownership is what puts them within reach of `drop` — and
+/// `drop` is what runs when the loop panics. Ctrl+C and an empty set end the loop
+/// normally and call [`Enforcement::stop`] themselves; a panic unwinds through the same
+/// method, so a bug in dispatch leaves no key stuck down, no grab held, no link that
+/// says a profile is enforced, and no lock that says a manager is alive. The
+/// executor's `ReleaseGuard` is this promise one layer down, and like it, this depends
+/// on the release profile keeping `panic = "unwind"`.
+///
+/// Generic over the sink so the promise is testable without an X server.
+struct Enforcement<'a, S: InputSink> {
+    clock: &'a SystemClock,
+    sink: S,
+    slots: BTreeMap<String, Slot>,
+    /// Refused links, with the stamp they were refused at: a re-apply replaces the
+    /// link, and the changed stamp is what earns a retry.
+    failed: BTreeMap<String, Option<std::time::SystemTime>>,
+    emergency: Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
+    /// The configuration directory, resolved once at start: the set's links and the
+    /// stopping marker live under it, and a teardown must not depend on re-reading
+    /// the environment.
+    config: PathBuf,
+    /// `None` once stopped — the lock going is the last act, so its absence is the
+    /// record that everything else already went.
+    lock: Option<LockGuard>,
+}
+
+impl<'a, S: InputSink> Enforcement<'a, S> {
+    /// Nothing enforced yet: the loop's first reconcile fills the slots.
+    fn new(clock: &'a SystemClock, sink: S, config: PathBuf, lock: LockGuard) -> Self {
+        Self {
+            clock,
+            sink,
+            slots: BTreeMap::new(),
+            failed: BTreeMap::new(),
+            emergency: None,
+            config,
+            lock: Some(lock),
+        }
+    }
+
+    /// The stop sequence, in the order the rest of the world needs it, returning how
+    /// many links were removed. Stopping twice does nothing the second time.
+    ///
+    /// The order is the whole point. Announcing first means an apply that lands
+    /// mid-stop waits instead of having its fresh link swept up by cleanup that already
+    /// decided what to remove. Clearing only what this manager enforced leaves such a
+    /// link alone even so. And the lock is released *before* the marker, because an
+    /// apply the marker releases must find the lock free — otherwise it reports onto a
+    /// manager that no longer exists and nothing enforces its profiles.
+    fn stop(&mut self) -> usize {
+        let Some(lock) = self.lock.take() else {
+            return 0;
+        };
+        // Named before teardown empties the slots.
+        let enforced: BTreeSet<String> = self
+            .slots
+            .keys()
+            .chain(self.failed.keys())
+            .cloned()
+            .collect();
+        let stopping = super::state::mark_stopping_in(&self.config);
+        teardown(
+            &mut self.sink,
+            self.clock,
+            &mut self.slots,
+            &mut self.emergency,
+        );
+        let cleared = super::state::clear_active_in(&self.config, &enforced);
+        drop(lock);
+        drop(stopping);
+        cleared
+    }
+}
+
+impl<S: InputSink> Drop for Enforcement<'_, S> {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Lets every slot go of what it held, whatever ended the run.
 fn teardown(
-    sink: &mut XTestSink,
+    sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
@@ -594,7 +659,7 @@ fn teardown(
     if let Some((_, mut capture)) = emergency.take() {
         capture.stop();
     }
-    sequencer_core::emit::InputSink::release_all(sink);
+    sink.release_all();
 }
 
 /// One maintenance pass: reconcile the directory, the focus, the emergency grab
@@ -607,7 +672,7 @@ fn rescan(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
     queue: &sequencer_input::EventQueue,
-    sink: &mut dyn sequencer_core::emit::InputSink,
+    sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
@@ -716,7 +781,7 @@ fn reconcile_activation(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
     queue: &sequencer_input::EventQueue,
-    sink: &mut dyn sequencer_core::emit::InputSink,
+    sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     focus: Option<&FocusWatcher>,
@@ -827,7 +892,7 @@ fn reconcile_activation(
 fn reconcile_set(
     out: &mut dyn std::io::Write,
     clock: &SystemClock,
-    sink: &mut dyn sequencer_core::emit::InputSink,
+    sink: &mut dyn InputSink,
     slots: &mut BTreeMap<String, Slot>,
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
 ) -> Result<()> {
@@ -1118,5 +1183,118 @@ mod tests {
         let p = profile("[binds.\"ctrl w\"]\nbind = \"q\"");
         assert_eq!(label_of(&p, (Key::W, Mods::CTRL)), "[binds.\"ctrl w\"]");
         assert_eq!(label_of(&p, (Key::Q, Mods::NONE)), "");
+    }
+
+    /// A loaded slot as `reconcile_set` builds it, with `held` as the run left it.
+    fn slot(profile: Profile, held: Vec<Holdable>) -> Slot {
+        Slot {
+            profile,
+            held,
+            capture: None,
+            grabbed: BTreeSet::new(),
+            yielded: BTreeMap::new(),
+            stamp: None,
+            want: false,
+            blocked: false,
+        }
+    }
+
+    /// A set under a scratch config dir: one applied link, and the lock taken the way
+    /// a manager takes it. Returns the dir and the lock.
+    fn applied_set(tag: &str, name: &str) -> (PathBuf, LockGuard) {
+        let config = super::super::state::temp_dir(tag);
+        let active = config.join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        std::os::unix::fs::symlink(config.join(name), active.join(name)).unwrap();
+        let super::super::state::Custody::Ours(lock) =
+            super::super::state::acquire_lock_at(&config.join("manager.pid")).unwrap()
+        else {
+            panic!("a fresh dir has no manager")
+        };
+        (config, lock)
+    }
+
+    /// The guard fires on a panic. A slot is mid-mirror, holding `a` down, when the
+    /// loop unwinds; the sink still sees `a` come up and one `release_all`, the link
+    /// goes, the stopping marker is gone, and the lock is free for the next manager —
+    /// the same end state Ctrl+C leaves.
+    #[test]
+    fn a_panic_in_the_loop_still_lets_everything_go() {
+        let (config, lock) = applied_set("panic", "p.toml");
+        let clock = SystemClock::new();
+        let watcher = sequencer_input::MockInjector::new();
+        let mut enforcement = Enforcement::new(&clock, watcher.clone(), config.clone(), lock);
+        enforcement.slots.insert(
+            "p.toml".to_owned(),
+            slot(
+                profile("[binds.f1]\nbind = \"a\""),
+                vec![Holdable::Key(Key::A)],
+            ),
+        );
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owned_by_the_loop = enforcement;
+            panic!("a bug in dispatch");
+        }));
+        assert!(unwound.is_err(), "the panic propagates");
+
+        assert_eq!(
+            watcher
+                .recorded()
+                .iter()
+                .map(|e| e.action)
+                .collect::<Vec<_>>(),
+            vec![sequencer_core::emit::EmitAction::KeyUp(Key::A)],
+            "the mirrored key came up"
+        );
+        assert_eq!(
+            watcher.release_all_calls(),
+            1,
+            "and the sink let go of the rest"
+        );
+        assert!(
+            config
+                .join("active")
+                .join("p.toml")
+                .symlink_metadata()
+                .is_err(),
+            "the link no longer says p.toml is enforced"
+        );
+        assert!(
+            !config.join("manager.stopping").exists(),
+            "the stopping marker is gone"
+        );
+        assert!(
+            matches!(
+                super::super::state::acquire_lock_at(&config.join("manager.pid")).unwrap(),
+                super::super::state::Custody::Ours(_)
+            ),
+            "the lock is free"
+        );
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    /// An explicit stop leaves nothing for the drop: the count comes back once, and
+    /// the sink is released once.
+    #[test]
+    fn stopping_twice_lets_go_once() {
+        let (config, lock) = applied_set("twice", "p.toml");
+        let clock = SystemClock::new();
+        let watcher = sequencer_input::MockInjector::new();
+        let mut enforcement = Enforcement::new(&clock, watcher.clone(), config.clone(), lock);
+        enforcement.slots.insert(
+            "p.toml".to_owned(),
+            slot(profile("[binds.f1]\nbind = \"a\""), Vec::new()),
+        );
+
+        assert_eq!(enforcement.stop(), 1, "one link cleared");
+        assert_eq!(enforcement.stop(), 0, "nothing left to clear");
+        drop(enforcement);
+        assert_eq!(
+            watcher.release_all_calls(),
+            1,
+            "released once, not per stop"
+        );
+        let _ = std::fs::remove_dir_all(config);
     }
 }

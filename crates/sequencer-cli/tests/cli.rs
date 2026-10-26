@@ -12,21 +12,38 @@
 // Test code: unwrapping is how a test reports a failure.
 #![allow(clippy::unwrap_used)]
 
-use assert_cmd::Command as ProcessCommand;
-use predicates::prelude::*;
+use std::process::{ExitStatus, Stdio};
 
 use sequencer_cli::runtime::ScriptedPump;
-use sequencer_cli::{
-    ClickerArgs, Command, Deps, DetectKeyArgs, DoctorArgs, ProfileApplyArgs, dispatch, exit,
-};
+use sequencer_cli::{Command, Deps, DetectKeyArgs, DoctorArgs, ProfileApplyArgs, dispatch, exit};
 use sequencer_core::emit::EmitAction;
 use sequencer_core::input::{Button, EventKind, InputEvent, Key};
 use sequencer_core::testutil::VirtualClock;
 use sequencer_core::time::Timestamp;
 use sequencer_input::MockInjector;
 
-fn bin() -> ProcessCommand {
-    ProcessCommand::cargo_bin("sequencer").expect("binary should build")
+/// How one run of the real binary ended, and what it printed on each stream.
+struct Finished {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs the binary cargo built for this test target to completion, stdin closed.
+///
+/// Plain `std::process`, the same way the live suite's harness does it: exit codes and
+/// stream contents are all these checks need.
+fn run(args: &[&str]) -> Finished {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sequencer"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+    Finished {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }
 
 fn press(key: Key) -> (Timestamp, InputEvent) {
@@ -37,161 +54,6 @@ fn press(key: Key) -> (Timestamp, InputEvent) {
 }
 
 // -------------------------------------------------------------------------- in-process
-
-#[test]
-fn clicking_through_dispatch_reaches_the_injected_sink() {
-    let mut out = Vec::new();
-    let clock = VirtualClock::new();
-    let mut sink = MockInjector::new();
-    let watcher = sink.clone();
-    let mut pump = ScriptedPump::new([(
-        Timestamp::ZERO,
-        InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::F9)),
-    )]);
-
-    let mut deps = Deps::new(&mut out, &clock);
-    deps.sink = Some(&mut sink);
-    deps.pump = Some(&mut pump);
-
-    let code = dispatch(&Command::Clicker(ClickerArgs::new()), &mut deps).expect("should run");
-
-    assert_eq!(code, exit::OK);
-    let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
-    assert_eq!(
-        actions,
-        vec![
-            EmitAction::ButtonDown(Button::Left),
-            EmitAction::ButtonUp(Button::Left)
-        ]
-    );
-    assert_eq!(
-        watcher.release_all_calls(),
-        1,
-        "the drop guard must release"
-    );
-}
-
-/// The exit report's two promises: the sent line carries its own caveat — this process
-/// counts what it hands to the backend and cannot see what arrives — and the run closes
-/// with a stopwatch line, because the user chose when to stop and may want to know how
-/// long that was.
-#[test]
-fn the_exit_report_caveats_sent_and_ends_with_a_stopwatch() {
-    let mut out = Vec::new();
-    let clock = VirtualClock::new();
-    let mut sink = MockInjector::new();
-    let mut pump = ScriptedPump::new([(
-        Timestamp::ZERO,
-        InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::F9)),
-    )]);
-
-    let mut deps = Deps::new(&mut out, &clock);
-    deps.sink = Some(&mut sink);
-    deps.pump = Some(&mut pump);
-    dispatch(&Command::Clicker(ClickerArgs::new()), &mut deps).expect("should run");
-
-    let report = String::from_utf8(out).expect("the report is text");
-    assert!(
-        report.contains("sent") && report.contains("not all may arrive"),
-        "the sent line must say the count is what was sent, not what arrived: {report}"
-    );
-    assert!(
-        report.lines().last().unwrap().starts_with("ran "),
-        "the last line is the stopwatch: {report}"
-    );
-}
-
-/// Drives the clicker through `dispatch` with a scripted trigger stream and returns what
-/// reached the sink, plus the exit report.
-fn click_with(
-    args: ClickerArgs,
-    events: Vec<(Timestamp, InputEvent)>,
-) -> (Vec<EmitAction>, String) {
-    let mut out = Vec::new();
-    let clock = VirtualClock::new();
-    let mut sink = MockInjector::new();
-    let watcher = sink.clone();
-    let mut pump = ScriptedPump::new(events);
-    let mut deps = Deps::new(&mut out, &clock);
-    deps.sink = Some(&mut sink);
-    deps.pump = Some(&mut pump);
-    let code = dispatch(&Command::Clicker(args), &mut deps).expect("should run");
-    assert_eq!(code, exit::OK);
-    let actions = watcher.recorded().iter().map(|e| e.action).collect();
-    (actions, String::from_utf8(out).expect("the report is text"))
-}
-
-fn release(key: Key) -> (Timestamp, InputEvent) {
-    (
-        Timestamp::ZERO,
-        InputEvent::physical(Timestamp::ZERO, EventKind::KeyUp(key)),
-    )
-}
-
-/// HOLD, the default: press starts, release stops — a tap is exactly one click, and the
-/// report counts it. (The original complaint, "tapping too briefly does nothing".)
-#[test]
-fn a_tap_in_hold_mode_is_one_click() {
-    let (actions, report) = click_with(ClickerArgs::new(), vec![press(Key::F9), release(Key::F9)]);
-    assert_eq!(
-        actions,
-        vec![
-            EmitAction::ButtonDown(Button::Left),
-            EmitAction::ButtonUp(Button::Left)
-        ]
-    );
-    assert!(report.contains("sent 1 repetitions"), "{report}");
-}
-
-/// TOGGLE: press starts, the next press stops. Nothing about a release is involved —
-/// which is what makes it work on X11, where a grab never delivers one.
-#[test]
-fn a_second_press_in_toggle_mode_stops_the_clicking() {
-    let args = ClickerArgs {
-        toggle: true,
-        ..ClickerArgs::new()
-    };
-    let (actions, report) = click_with(args, vec![press(Key::F9), press(Key::F9)]);
-    assert_eq!(
-        actions,
-        vec![
-            EmitAction::ButtonDown(Button::Left),
-            EmitAction::ButtonUp(Button::Left)
-        ],
-        "one repetition ran between the two presses, then it stopped"
-    );
-    assert!(report.contains("sent 1 repetitions"), "{report}");
-}
-
-/// The quit key ends the run before anything is sent, and the run still reports.
-#[test]
-fn the_quit_key_ends_the_run() {
-    let (actions, report) = click_with(ClickerArgs::new(), vec![press(Key::F8)]);
-    assert!(actions.is_empty(), "{actions:?}");
-    assert!(report.contains("sent 0 repetitions"), "{report}");
-}
-
-/// The keys are the user's to choose, and they land where the flags say.
-#[test]
-fn custom_activation_and_quit_keys_are_honoured() {
-    let args = ClickerArgs {
-        activate: Key::F7,
-        quit: Key::Escape,
-        ..ClickerArgs::new()
-    };
-    // F9 is nobody's key now: ignored. F7 starts; Escape quits mid-hold.
-    let (actions, _) = click_with(
-        args,
-        vec![press(Key::F9), press(Key::F7), press(Key::Escape)],
-    );
-    assert_eq!(
-        actions,
-        vec![
-            EmitAction::ButtonDown(Button::Left),
-            EmitAction::ButtonUp(Button::Left)
-        ]
-    );
-}
 
 /// detect-key's contract: every press prints its bindable name exactly once, releases
 /// print nothing, and mouse buttons use the binds spelling (`mouse1`), not `left` —
@@ -243,36 +105,6 @@ fn detect_key_names_each_press_once_and_nothing_else() {
 }
 
 #[test]
-fn a_key_binding_reaches_the_sink_as_a_key_press() {
-    let mut out = Vec::new();
-    let clock = VirtualClock::new();
-    let mut sink = MockInjector::new();
-    let watcher = sink.clone();
-    let mut pump = ScriptedPump::new([(
-        Timestamp::ZERO,
-        InputEvent::physical(Timestamp::ZERO, EventKind::KeyDown(Key::F9)),
-    )]);
-
-    let mut deps = Deps::new(&mut out, &clock);
-    deps.sink = Some(&mut sink);
-    deps.pump = Some(&mut pump);
-
-    let args = ClickerArgs {
-        kb_key: Some(Key::F),
-        ..ClickerArgs::new()
-    };
-    dispatch(&Command::Clicker(args), &mut deps).expect("should run");
-
-    let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
-    // The key goes down, and shutdown releases it because the hold has not elapsed.
-    assert_eq!(actions.first(), Some(&EmitAction::KeyDown(Key::F)));
-    assert!(
-        actions.contains(&EmitAction::KeyUp(Key::F)),
-        "the key must come back up: {actions:?}"
-    );
-}
-
-#[test]
 fn doctor_reports_the_session_and_never_panics() {
     let mut out = Vec::new();
     let clock = VirtualClock::new();
@@ -312,89 +144,33 @@ fn doctor_explains_the_cost_of_the_access_it_asks_for() {
 
 #[test]
 fn help_and_version_succeed() {
-    bin().arg("--help").assert().success();
-    bin().arg("--version").assert().success();
+    let help = run(&["--help"]);
+    assert!(help.status.success(), "{}", help.stderr);
+    let version = run(&["--version"]);
+    assert!(version.status.success(), "{}", version.stderr);
 }
 
 #[test]
 fn a_bare_invocation_shows_help_rather_than_guessing() {
-    // No implied subcommand: with more modes coming, silently running the clicker would
+    // No implied subcommand: with more modes coming, silently running one of them would
     // be a surprise rather than a convenience.
-    bin()
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Usage").and(predicate::str::contains("clicker")));
+    let bare = run(&[]);
+    assert!(!bare.status.success());
+    assert!(bare.stderr.contains("Usage"), "{}", bare.stderr);
+    assert!(bare.stderr.contains("profile-apply"), "{}", bare.stderr);
 }
 
 #[test]
 fn a_bad_rate_is_a_usage_error() {
     for bad in ["0", "-5", "banana"] {
-        bin()
-            .args(["clicker", "--cps", bad])
-            .assert()
-            .failure()
-            .code(i32::from(exit::USAGE));
+        let refused = run(&["bench", "--cps", bad]);
+        assert_eq!(
+            refused.status.code(),
+            Some(i32::from(exit::USAGE)),
+            "--cps {bad}: {}",
+            refused.stderr
+        );
     }
-}
-
-#[test]
-fn an_unknown_key_names_itself_in_the_error() {
-    bin()
-        .args(["clicker", "--activate", "nosuchkey"])
-        .assert()
-        .failure()
-        .code(i32::from(exit::USAGE))
-        .stderr(predicate::str::contains("nosuchkey"));
-}
-
-#[test]
-fn the_prototypes_flags_still_work() {
-    // `--toggle --cps 30 --key_press f` is a command line someone may have in their shell
-    // history from the Python version. In-process with an injected pair, so the flags are
-    // proven to take EFFECT — the emitted action is a key press, not the default click —
-    // rather than merely to parse.
-    use sequencer_cli::clap::Parser as _;
-    let cli = sequencer_cli::Cli::try_parse_from([
-        "sequencer",
-        "clicker",
-        "--toggle",
-        "--cps",
-        "30",
-        "--key_press",
-        "f",
-    ])
-    .expect("the prototype's flags should parse");
-
-    let mut out = Vec::new();
-    let clock = VirtualClock::new();
-    let mut sink = MockInjector::new();
-    let watcher = sink.clone();
-    // Toggle latches on at the release, and the engine phase-locks to the event's own
-    // timestamp — so both edges sit at zero, where the virtual clock already is. The
-    // pump then ends and shutdown releases whatever the toggle began.
-    let mut pump = ScriptedPump::new([
-        press(Key::F9),
-        (
-            Timestamp::ZERO,
-            InputEvent::physical(Timestamp::ZERO, EventKind::KeyUp(Key::F9)),
-        ),
-    ]);
-    let mut deps = Deps::new(&mut out, &clock);
-    deps.sink = Some(&mut sink);
-    deps.pump = Some(&mut pump);
-    dispatch(&cli.command, &mut deps).expect("should run");
-
-    let actions: Vec<EmitAction> = watcher.recorded().iter().map(|e| e.action).collect();
-    assert!(
-        actions.contains(&EmitAction::KeyDown(Key::F)),
-        "--key_press f must emit key presses: {actions:?}"
-    );
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, EmitAction::ButtonDown(_))),
-        "no default clicks once --key_press takes effect: {actions:?}"
-    );
 }
 
 /// The shipped template is a runnable profile: profile-apply accepts it and its PgUp
@@ -433,6 +209,11 @@ fn profile_apply_accepts_the_shipped_template() {
         ],
         "the template's PgUp mirror must fire"
     );
+    assert_eq!(
+        watcher.release_all_calls(),
+        1,
+        "the drop guard must release"
+    );
 }
 
 #[test]
@@ -442,57 +223,34 @@ fn an_invalid_profile_is_a_usage_error_that_names_the_problem() {
     let file = dir.join("dangling-hold.toml");
     std::fs::write(&file, "[binds.F6]\nseq = [\"PRESS ctrl\"]\n").expect("write profile");
 
-    bin()
-        .arg("profile-apply")
-        .arg(&file)
-        .assert()
-        .failure()
-        .code(i32::from(exit::USAGE))
-        .stderr(predicate::str::contains("never RELEASEd"));
+    let refused = run(&[
+        "profile-apply",
+        file.to_str().expect("the temp path is UTF-8"),
+    ]);
+    assert_eq!(
+        refused.status.code(),
+        Some(i32::from(exit::USAGE)),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("never RELEASEd"),
+        "{}",
+        refused.stderr
+    );
 
     std::fs::remove_file(&file).ok();
 }
 
 #[test]
 fn a_missing_profile_fails_without_a_backtrace() {
-    bin()
-        .args(["profile-apply", "/nonexistent/binds.toml"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error:"));
-}
-
-#[test]
-fn clicking_without_device_access_fails_with_something_actionable() {
-    // Only meaningful where NO backend is available: on a machine that is set up,
-    // `clicker` would block waiting for the trigger key rather than return. That is also
-    // exactly the case whose error message needs to be good. Both backends count — a
-    // usable X11 session serves the clicker by key grab, so it would block there too
-    // (and grab the developer's real F9 while doing it).
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    if sequencer_cli::input::x11::is_usable() {
-        eprintln!("skipping: X11 serves the clicker here, so it would block on its trigger");
-        return;
-    }
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/uinput")
-        .is_ok()
-    {
-        eprintln!("skipping: this machine can open /dev/uinput, so clicker would block");
-        return;
-    }
-    bin()
-        .args(["clicker"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("doctor"));
+    let missing = run(&["profile-apply", "/nonexistent/binds.toml"]);
+    assert!(!missing.status.success());
+    assert!(missing.stderr.contains("error:"), "{}", missing.stderr);
 }
 
 #[test]
 fn doctor_runs_on_a_headless_machine() {
-    bin()
-        .arg("doctor")
-        .assert()
-        .stdout(predicate::str::contains("session:"));
+    let report = run(&["doctor"]);
+    assert!(report.stdout.contains("session:"), "{}", report.stdout);
 }
