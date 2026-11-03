@@ -91,9 +91,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         }
     }
 
-    for requirement in &unmet {
-        write_remediation(*requirement, deps)?;
-    }
+    write_remediations(&unmet, deps)?;
 
     if unmet.is_empty() {
         if REQUIREMENTS.is_empty() && !on_x11 {
@@ -107,12 +105,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         return Ok(exit::OK);
     }
     if on_x11 {
-        writeln!(
-            deps.out,
-            "\nProfiles need none of that: on X11 their output goes through XTEST and their \
-             triggers through key grabs, and neither opens a device. The checks above are \
-             for `detect-key` and `bench`, which read the devices."
-        )?;
+        writeln!(deps.out, "\n{}", devices_spared(wayland))?;
         return Ok(exit::OK);
     }
     {
@@ -122,6 +115,20 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
              the terminal, not the devices."
         )?;
         Ok(exit::FAILURE)
+    }
+}
+
+/// Why the device checks don't hold profiles back where an X server answers. Xwayland is
+/// named only when it is the server: said on plain X11, it would be wrong.
+const fn devices_spared(wayland: bool) -> &'static str {
+    if wayland {
+        "Profiles need none of that: their output goes through XTEST and their triggers \
+         through key grabs, both through the X server (here, Xwayland), and neither opens a \
+         device. The checks above are for `detect-key` and `bench`, which read the devices."
+    } else {
+        "Profiles need none of that: on X11 their output goes through XTEST and their \
+         triggers through key grabs, and neither opens a device. The checks above are for \
+         `detect-key` and `bench`, which read the devices."
     }
 }
 
@@ -546,7 +553,21 @@ mod keyboard {
     }
 }
 
-fn write_remediation(requirement: Requirement, deps: &mut Deps<'_>) -> Result<()> {
+/// Each unmet requirement's fix, in report order. A caution several fixes share — the cost
+/// of joining the `input` group — is said once, with the first fix that needs it.
+fn write_remediations(unmet: &[Requirement], deps: &mut Deps<'_>) -> Result<()> {
+    let mut cautioned: Vec<&'static str> = Vec::new();
+    for &requirement in unmet {
+        write_remediation(requirement, &mut cautioned, deps)?;
+    }
+    Ok(())
+}
+
+fn write_remediation(
+    requirement: Requirement,
+    cautioned: &mut Vec<&'static str>,
+    deps: &mut Deps<'_>,
+) -> Result<()> {
     let fix = requirement.remediation();
     writeln!(deps.out, "\n{}", fix.title)?;
     writeln!(deps.out, "  {}", fix.why)?;
@@ -562,8 +583,55 @@ fn write_remediation(requirement: Requirement, deps: &mut Deps<'_>) -> Result<()
             FixStep::Manual(text) => writeln!(deps.out, "      {text}")?,
         }
     }
-    if let Some(caution) = fix.caution {
+    if let Some(caution) = fix.caution
+        && !cautioned.contains(&caution)
+    {
         writeln!(deps.out, "  NOTE: {caution}")?;
+        cautioned.push(caution);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sequencer_core::testutil::VirtualClock;
+
+    use super::*;
+
+    fn remediations(unmet: &[Requirement]) -> String {
+        let clock = VirtualClock::new();
+        let mut out = Vec::new();
+        let mut deps = Deps::new(&mut out, &clock);
+        write_remediations(unmet, &mut deps).expect("writes to a Vec");
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    /// Two fixes asking for the `input` group carry the same warning, said once and in
+    /// full: no "see above" pointing at a warning that may not be there.
+    #[test]
+    fn a_shared_caution_is_said_once_with_the_first_fix_that_needs_it() {
+        let both = remediations(&[Requirement::UinputNodeWritable, Requirement::EvdevReadable]);
+        assert_eq!(both.matches("NOTE:").count(), 1, "{both}");
+        let note = both.find("NOTE:").unwrap();
+        assert!(
+            note < both
+                .find(Requirement::EvdevReadable.remediation().title)
+                .unwrap(),
+            "the warning comes with the first fix: {both}"
+        );
+
+        // Shown alone, the keyboard fix says it all itself.
+        let alone = remediations(&[Requirement::EvdevReadable]);
+        assert!(
+            alone.contains("NOTE:") && alone.contains("keylogging"),
+            "{alone}"
+        );
+    }
+
+    /// Xwayland is named only where it is the X server.
+    #[test]
+    fn only_a_wayland_session_is_told_about_xwayland() {
+        assert!(devices_spared(true).contains("Xwayland"));
+        assert!(!devices_spared(false).contains("Xwayland"));
+    }
 }

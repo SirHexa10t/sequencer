@@ -101,6 +101,28 @@ throughout, this run's T3 answers it.)
   sudo), and nothing new for the Wayland window or after Alt+Shift switched the layout —
   Xwayland's view, as in D1.
 
+## The run of 2026-11-03 — after the first fixes
+
+sequencer 0.7.0, the checkout's build. T7, T8 and D1 run twice, with the same results; D2
+once, with extra clicks and scrolls to move between windows.
+
+- **T7** (`program = "*kdialog*"`): `xxx` in **both** kinds of window — the Wayland one too,
+  where the gate used to stay dormant.
+- **T8** (`kb_lang = "us"`): `xx` in both — the bind held back under `il`, where it used to
+  fire. The Wayland run's log shows the profile go dormant on the switch to `il` and come
+  back on the switch to `us`.
+- **D1** (`detect-key --no-sudo`): `focus:` names the X11 window `kdialog`, the Wayland one
+  `org.kde.kdialog` and the terminal `org.kde.konsole`; `lang:` follows the switch to `il`
+  and back, in each window.
+- **D2** (`sudo -- sequencer detect-key`): the same `focus:` and `lang:` lines through sudo,
+  which drops the session's variables — so the Xwayland test and the bus found at
+  `/run/user/<uid>/bus` both work. Every key named, sides included, and
+  `org.kde.plasmashell` when Meta opened the launcher.
+- **doctor**: `backend: X11 through Xwayland`, the note quoting KDE's setting in force
+  (the default), `focus: KWin`, `layout: KDE's keyboard service`, and the keyboard check
+  failing on the two keyboard devices by name — the mouse's keyboard interface among them,
+  which reports a full keyboard's keys.
+
 ## Diagnosis so far
 
 Confirmed:
@@ -167,21 +189,24 @@ items marked *live check* still need a run on the KDE machine.
 
 1. **Fixed (2026-10-27):** the device check now needs every keyboard readable (found
    through sysfs, by udev's keyboard rule), so `doctor` fails and `detect-key` asks for
-   sudo when the keyboard is unreadable; a capture with no keyboard says so. *Live check.*
-2. **Fixed (2026-10-27):** `doctor` says when profiles run through Xwayland and what
-   native Wayland apps then miss, naming KDE's own setting; the manager says so once at
-   start. *Live check.*
-3. **Fixed (2026-10-27):** `kb_lang` and `detect-key`'s `lang:` line ask KDE's keyboard
-   service in a Wayland session, and follow every switch. *Live check* (T8, D1, D2).
+   sudo when the keyboard is unreadable; a capture with no keyboard says so. `doctor`'s
+   failure confirmed live (2026-11-03); the sudo prompt of a plain `detect-key` not yet
+   seen.
+2. **Fixed (2026-10-27), confirmed live (2026-11-03):** `doctor` says when profiles run
+   through Xwayland and what native Wayland apps then miss, naming KDE's own setting; the
+   manager says so once at start.
+3. **Fixed (2026-10-27), confirmed live (2026-11-03):** `kb_lang` and `detect-key`'s
+   `lang:` line ask KDE's keyboard service in a Wayland session, and follow every switch
+   (T8, D1, D2).
 4. **Fixed (2026-10-27):** the README spells the unapply command `profile-unapply`.
 5. Modifier changes need time through Xwayland: chord outputs lose their modifier, and
    the lift of a held one comes too late (T3–T5, T10).
 6. Character-key triggers (letters, digits, symbols, Shift+letter) never fire while a
    Wayland window has focus: KDE passes only what its Xwayland setting allows (T2, T4).
 7. Binds can't block keys in Wayland windows: the app gets the key too (T6).
-8. **Fixed (2026-10-27):** the program gate and `detect-key`'s `focus:` line ask KWin in
-   a Wayland session, through a script loaded for the run, and see Wayland windows by
-   their app id. *Live check* (T7, D1, D2).
+8. **Fixed (2026-10-27), confirmed live (2026-11-03):** the program gate and
+   `detect-key`'s `focus:` line ask KWin in a Wayland session, through a script loaded
+   for the run, and see Wayland windows by their app id (T7, D1, D2).
 9. Output depends on KDE's one-time "remote control" permission; refused, it's dropped
    with no error, and sequencer can't tell (T1).
 10. Mouse-button triggers can't fire in Wayland windows (KWin's source; untested).

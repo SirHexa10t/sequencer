@@ -148,6 +148,14 @@ pub struct Remediation {
     pub caution: Option<&'static str>,
 }
 
+/// What joining the `input` group costs, said by every fix that asks for it. One text for
+/// all of them, so a report showing several can say it once and lose nothing.
+const INPUT_GROUP_CAUTION: &str = "Membership of the 'input' group lets ANY program you run \
+     read EVERY input device on this machine. That is full keylogging capability, \
+     including passwords typed into any application. sequencer needs it because it reads \
+     and writes input devices directly, which is what makes it work the same on X11, \
+     Wayland and the console.";
+
 /// Something the environment has to provide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -219,13 +227,7 @@ impl Requirement {
                             .into(),
                     ),
                 ],
-                caution: Some(
-                    "Membership of the 'input' group lets ANY program you run read EVERY \
-                     input device on this machine. That is full keylogging capability, \
-                     including passwords typed into any application. sequencer needs it \
-                     because it reads and writes input devices directly, which is what \
-                     makes it work the same on X11, Wayland and the console.",
-                ),
+                caution: Some(INPUT_GROUP_CAUTION),
             },
             Self::EvdevReadable => Remediation {
                 title: "A keyboard in /dev/input is not readable",
@@ -235,10 +237,7 @@ impl Requirement {
                     Step::Shell("sudo usermod -aG input \"$USER\"".into()),
                     Step::Manual("Log out and back in.".into()),
                 ],
-                caution: Some(
-                    "See the warning about the 'input' group above: it grants keylogging \
-                     capability to everything you run.",
-                ),
+                caution: Some(INPUT_GROUP_CAUTION),
             },
         }
     }
@@ -402,13 +401,17 @@ mod tests {
     #[test]
     fn the_privilege_warning_is_attached_to_the_privileged_requirements() {
         // Asking a user to join the `input` group without telling them it grants
-        // keylogging capability would not be an honest trade.
+        // keylogging capability would not be an honest trade. Each fix says it in full,
+        // since either may be the only one a report shows.
         for requirement in [Requirement::UinputNodeWritable, Requirement::EvdevReadable] {
-            assert!(
-                requirement.remediation().caution.is_some(),
+            let caution = requirement.remediation().caution;
+            assert_eq!(
+                caution,
+                Some(INPUT_GROUP_CAUTION),
                 "{requirement:?} must carry the input-group warning"
             );
         }
+        assert!(INPUT_GROUP_CAUTION.contains("keylogging"));
     }
 
     /// What the kernel prints for an AT keyboard, a mouse, a power button and a game pad:
