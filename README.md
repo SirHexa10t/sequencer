@@ -220,7 +220,7 @@ because profiles do not touch the devices. From a container with no input device
 X server, up to the first of its three fixes:
 
 ```
-sequencer 0.7.0  (linux x86_64)
+sequencer 0.7.1  (linux x86_64)
 session: Linux virtual terminal
 backend: none — profiles need an X server, and none answered
 
@@ -381,7 +381,8 @@ is runnable.
 
 On KDE, `sequencer_cli::input::kde` also answers what Xwayland can't: `windows()` lists
 every window KWin manages, Wayland ones included, and `close()` asks windows to close — each
-through a script KWin runs once and sequencer unloads after.
+through a script KWin runs once and sequencer unloads after. `invoke_kwin_shortcut()` runs
+one of KWin's own global shortcuts by name ("Increase Opacity"), as its keys would.
 
 The library never calls `process::exit`, never installs a logger or signal handler, and
 never reads `std::env::args` for you. It logs through the `log` facade, so whatever logger
@@ -414,7 +415,7 @@ taps, holds, waits, loops, chance.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 291 tests, all headless
+cargo test --workspace --all-features    # 294 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features

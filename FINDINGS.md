@@ -187,11 +187,10 @@ What the 06:08, 06:25 and 06:28 runs add:
 The numbering used since the first round of fixes. "Fixed" means in the code, with tests;
 items marked *live check* still need a run on the KDE machine.
 
-1. **Fixed (2026-10-27):** the device check now needs every keyboard readable (found
-   through sysfs, by udev's keyboard rule), so `doctor` fails and `detect-key` asks for
-   sudo when the keyboard is unreadable; a capture with no keyboard says so. `doctor`'s
-   failure confirmed live (2026-11-03); the sudo prompt of a plain `detect-key` not yet
-   seen.
+1. **Fixed (2026-10-27), confirmed live (2026-11-03):** the device check now needs every
+   keyboard readable (found through sysfs, by udev's keyboard rule), so `doctor` fails and
+   `detect-key` asks for sudo when the keyboard is unreadable; a capture with no keyboard
+   says so. Both `doctor`'s failure and a plain `detect-key`'s sudo prompt seen live.
 2. **Fixed (2026-10-27), confirmed live (2026-11-03):** `doctor` says when profiles run
    through Xwayland and what native Wayland apps then miss, naming KDE's own setting; the
    manager says so once at start.

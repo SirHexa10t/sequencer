@@ -513,7 +513,8 @@ mod tests {
         std::fs::write(dir.join("a.toml"), "").unwrap();
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("nested/deep.toml"), "").unwrap();
-        let file = temp_store("expand-file").join("gaming.toml");
+        let loose = temp_store("expand-file");
+        let file = loose.join("gaming.toml");
         std::fs::write(&file, "").unwrap();
 
         let files = expand_profile_args(&[file.clone(), dir.clone()]).unwrap();
@@ -523,6 +524,8 @@ mod tests {
             "files as written, then the directory's direct .tomls in name order — \
              nested/deep.toml stays out (non-recursive on purpose)"
         );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(loose);
     }
 
     /// The picker takes numbers, names (with or without .toml), paths, or `all` — and

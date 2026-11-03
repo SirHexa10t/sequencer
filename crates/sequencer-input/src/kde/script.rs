@@ -303,8 +303,11 @@ pub(super) mod fake {
                 Some("loadScript") => {
                     let file = PathBuf::from(message.body[0].as_str().unwrap());
                     let text = std::fs::read_to_string(file).unwrap();
-                    // Every script names its owner in its first string literal.
-                    self.owner = Some(text.split('"').nth(1).unwrap().to_owned());
+                    // Reports go where the script's `callDBus` sends them: its first argument.
+                    self.owner = text
+                        .split_once("callDBus(\"")
+                        .and_then(|(_, rest)| rest.split('"').next())
+                        .map(str::to_owned);
                     let plugin = message.body[1].as_str().unwrap();
                     self.purpose = plugin.split('-').nth(1).unwrap().to_owned();
                     self.wanted = text

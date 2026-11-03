@@ -218,7 +218,7 @@ fn profile_apply_accepts_the_shipped_template() {
 
 #[test]
 fn an_invalid_profile_is_a_usage_error_that_names_the_problem() {
-    let dir = std::env::temp_dir().join("sequencer-cli-tests");
+    let dir = std::env::temp_dir().join(format!("sequencer-cli-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let file = dir.join("dangling-hold.toml");
     std::fs::write(&file, "[binds.F6]\nseq = [\"PRESS ctrl\"]\n").expect("write profile");
@@ -239,7 +239,7 @@ fn an_invalid_profile_is_a_usage_error_that_names_the_problem() {
         refused.stderr
     );
 
-    std::fs::remove_file(&file).ok();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use super::KWinError;
 use super::script::{FIRST_REPORT, Script, is_report, js_string, kwin_owner, report_call};
 use crate::dbus::{Connection, Message, Value};
 
@@ -35,27 +36,6 @@ pub struct KWinWindow {
     pub class: String,
 }
 
-/// Why KWin could not be asked.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum KWinError {
-    /// There is no session bus to reach KWin on.
-    #[error("no session bus: {0}")]
-    Bus(String),
-    /// KWin is not running in this session.
-    #[error("KWin is not running in this session")]
-    NotRunning,
-    /// KWin would not load or run sequencer's script, or it never reported back.
-    #[error("KWin did not run sequencer's script: {0}")]
-    Script(&'static str),
-}
-
-impl From<crate::dbus::Error> for KWinError {
-    fn from(err: crate::dbus::Error) -> Self {
-        Self::Bus(err.to_string())
-    }
-}
-
 /// Every window KWin manages but its special ones, in KWin's order.
 ///
 /// # Errors
@@ -69,6 +49,12 @@ pub fn windows() -> Result<Vec<KWinWindow>, KWinError> {
 /// Asks each window `ids` names to close, as its titlebar's close button does. The app
 /// decides what that means — it may ask about unsaved work first — so call [`windows`]
 /// afterwards to see what is still open. An id KWin no longer knows is passed over.
+///
+/// One kind of window is not asked: an X11 window that takes no close request (no
+/// `WM_DELETE_WINDOW` among its `WM_PROTOCOLS`). KWin ends its client instead — SIGTERM
+/// to the whole process, and its X connection cut. KWin's scripting does not say which
+/// windows are X11, so a caller that must never end a process checks the X server's own
+/// window list first.
 ///
 /// # Errors
 ///
@@ -109,11 +95,11 @@ fn close_on(
 
 /// The listing script, reporting to `owner`: every window but the special ones (Plasma
 /// 6's `workspace.windowList()` and `specialWindow`), then `done`. A pid KWin doesn't
-/// know is -1.
+/// know is -1, or 0 for an X11 window: KWin asks the X server's X-Resource extension
+/// for those, and starts from 0.
 fn listing_script(owner: &str) -> String {
     format!(
         "// Loaded by sequencer to list KWin's windows for the process that loaded it.\n\
-         const owner = {owner};\n\
          const list = workspace.windowList();\n\
          for (let i = 0; i < list.length; i++) {{\n    \
              const window = list[i];\n    \
@@ -124,7 +110,6 @@ fn listing_script(owner: &str) -> String {
                  String(window.captionNormal), String(window.resourceClass));\n\
          }}\n\
          {done});\n",
-        owner = js_string(owner),
         call = report_call(owner, WINDOW),
         done = report_call(owner, DONE),
     )
@@ -140,7 +125,6 @@ fn closing_script(owner: &str, ids: &[String]) -> String {
         .join(", ");
     format!(
         "// Loaded by sequencer to close the windows the process that loaded it named.\n\
-         const owner = {owner};\n\
          const wanted = [{wanted}];\n\
          const list = workspace.windowList();\n\
          for (let i = 0; i < list.length; i++) {{\n    \
@@ -149,7 +133,6 @@ fn closing_script(owner: &str, ids: &[String]) -> String {
              }}\n\
          }}\n\
          {done});\n",
-        owner = js_string(owner),
         done = report_call(owner, DONE),
     )
 }
@@ -206,14 +189,17 @@ fn gather(listener: &mut Connection, kwin: &str, reports: &mut Vec<Message>) -> 
     }
 }
 
-/// A window report: id, pid (-1 when KWin does not know it), title, class.
+/// A window report: id, pid (-1 or 0 when KWin does not know it), title, class.
 fn window_from(report: &Message) -> Option<KWinWindow> {
     let [Value::Str(id), pid, Value::Str(title), Value::Str(class)] = report.body.as_slice() else {
         return None;
     };
     Some(KWinWindow {
         id: id.clone(),
-        pid: pid.as_i32().and_then(|pid| u32::try_from(pid).ok()),
+        pid: pid
+            .as_i32()
+            .filter(|&pid| pid > 0)
+            .and_then(|pid| u32::try_from(pid).ok()),
         title: title.clone(),
         class: class.clone(),
     })
@@ -237,8 +223,8 @@ mod tests {
         })
     }
 
-    /// What KWin reports comes back as windows, a pid KWin doesn't know as `None` — and
-    /// the script is unloaded, its file gone.
+    /// What KWin reports comes back as windows, a pid KWin doesn't know — its -1, or the
+    /// 0 an X11 window starts from — as `None`; and the script is unloaded, its file gone.
     #[test]
     fn the_list_is_what_kwin_reports() {
         let Some(bus) = TestBus::start() else {
@@ -248,6 +234,7 @@ mod tests {
         kwin.windows = vec![
             ("{0001}", 4242, "~ : bash — Konsole", "org.kde.konsole"),
             ("{0002}", -1, "Untitled", "kdialog"),
+            ("{0003}", 0, "xeyes", "XEyes"),
         ];
         let dir = ScriptsDir::new();
         let listed = asking(&mut kwin, || {
@@ -268,6 +255,12 @@ mod tests {
                     pid: None,
                     title: "Untitled".into(),
                     class: "kdialog".into(),
+                },
+                KWinWindow {
+                    id: "{0003}".into(),
+                    pid: None,
+                    title: "xeyes".into(),
+                    class: "XEyes".into(),
                 },
             ]
         );
@@ -379,13 +372,16 @@ mod tests {
         assert!(matches!(err, KWinError::NotRunning), "{err:?}");
     }
 
-    /// The listing script names its owner first, skips special windows, reports each
+    /// The listing script reports to its owner, skips special windows, reports each
     /// window's id, pid, raw title and class, and ends with `done`.
     #[test]
     fn the_listing_script_reports_every_managed_window_then_done() {
         let text = listing_script(":1.42");
         assert!(
-            text.starts_with("// ") && text.contains(r#"const owner = ":1.42";"#),
+            text.starts_with("// ")
+                && text.contains(
+                    r#"callDBus(":1.42", "/org/sequencer/KWin", "org.sequencer.KWin", "window","#
+                ),
             "{text}"
         );
         assert!(text.contains("workspace.windowList()"), "{text}");
@@ -398,7 +394,8 @@ mod tests {
         assert!(text.trim_end().ends_with(r#""done");"#), "{text}");
     }
 
-    /// The closing script names exactly the ids given, escaped, and ends with `done`.
+    /// The closing script names exactly the ids given, escaped, and ends by telling its
+    /// owner it is `done`.
     #[test]
     fn the_closing_script_closes_exactly_the_ids_given() {
         let text = closing_script(":1.42", &["{0001}".to_owned(), r#"odd"id"#.to_owned()]);
@@ -407,6 +404,11 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("list[i].closeWindow();"), "{text}");
-        assert!(text.trim_end().ends_with(r#""done");"#), "{text}");
+        assert!(
+            text.trim_end().ends_with(
+                r#"callDBus(":1.42", "/org/sequencer/KWin", "org.sequencer.KWin", "done");"#
+            ),
+            "{text}"
+        );
     }
 }
