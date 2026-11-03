@@ -258,6 +258,10 @@ fn pressed_name(kind: EventKind) -> Option<String> {
     }
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux terminal reader decodes bytes")
+)]
 mod decode;
 mod tty;
 
@@ -279,6 +283,10 @@ struct SessionPoll {
 }
 
 impl SessionPoll {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux readers watch the session")
+    )]
     fn new() -> Self {
         let focus = Focus::open();
         Self {

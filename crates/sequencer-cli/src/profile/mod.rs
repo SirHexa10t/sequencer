@@ -374,6 +374,10 @@ fn linked_name(path: &std::path::Path) -> String {
 }
 
 /// Turns picker input into set names: numbers, names, or `all`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux unapply picks from the set")
+)]
 fn parse_selection(input: &str, names: &[String]) -> std::result::Result<Vec<String>, String> {
     let mut chosen = Vec::new();
     for token in input.split_whitespace() {
@@ -398,6 +402,10 @@ fn parse_selection(input: &str, names: &[String]) -> std::result::Result<Vec<Str
 }
 
 /// Resolves user-given names (with or without `.toml`, or full paths) to set names.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux unapply picks from the set")
+)]
 fn resolve_names(given: &[String], names: &[String]) -> std::result::Result<Vec<String>, String> {
     given
         .iter()

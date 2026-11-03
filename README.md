@@ -379,6 +379,10 @@ To offer the same per-run sudo flow the binary has, call
 second argument is how *your* command line spells the doctor command, so the advice printed
 is runnable.
 
+On KDE, `sequencer_cli::input::kde` also answers what Xwayland can't: `windows()` lists
+every window KWin manages, Wayland ones included, and `close()` asks windows to close — each
+through a script KWin runs once and sequencer unloads after.
+
 The library never calls `process::exit`, never installs a logger or signal handler, and
 never reads `std::env::args` for you. It logs through the `log` facade, so whatever logger
 your program installs receives its messages; `init_logging` is the binary's own.
@@ -410,7 +414,7 @@ taps, holds, waits, loops, chance.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 277 tests, all headless
+cargo test --workspace --all-features    # 291 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
