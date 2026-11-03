@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 /// Bold blue.
 #[cfg_attr(
-    not(feature = "xtest"),
+    not(all(feature = "xtest", target_os = "linux")),
     allow(dead_code, reason = "only the X11 apply path prints a blue state word")
 )]
 const HIGHLIGHT: &str = "\u{1b}[1;34m";
@@ -22,7 +22,7 @@ const HIGHLIGHT: &str = "\u{1b}[1;34m";
 const ALARM: &str = "\u{1b}[1;31m";
 /// Bold orange — 256-colour 208; the basic palette has no orange.
 #[cfg_attr(
-    not(feature = "xtest"),
+    not(all(feature = "xtest", target_os = "linux")),
     allow(dead_code, reason = "only the X11 manager's stop hint is orange")
 )]
 const STOPPER: &str = "\u{1b}[1;38;5;208m";
@@ -48,7 +48,7 @@ fn enabled() -> bool {
 
 /// `text` in bold blue, or unchanged when colour is off.
 #[cfg_attr(
-    not(feature = "xtest"),
+    not(all(feature = "xtest", target_os = "linux")),
     allow(dead_code, reason = "only the X11 apply path prints a blue state word")
 )]
 pub(crate) fn key(text: &str) -> String {
@@ -62,7 +62,7 @@ pub(crate) fn alarm(text: &str) -> String {
 
 /// `text` in bold orange — the word or chord that stops something.
 #[cfg_attr(
-    not(feature = "xtest"),
+    not(all(feature = "xtest", target_os = "linux")),
     allow(dead_code, reason = "only the X11 manager's stop hint is orange")
 )]
 pub(crate) fn stopper(text: &str) -> String {

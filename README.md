@@ -6,7 +6,29 @@ Read `example_profile.toml`. It specifies and demonstrates everything.
 
 ## autokey macro profiling
 
-Yet to write
+A profile is a TOML file of key bindings, and `sequencer profile-apply` enforces it until
+you stop it. A binding either remaps a key or chord to another, or runs a sequence — taps,
+holds, waits, loops and random choices — when its trigger is pressed. Bound keys are
+consumed, so the application sees only what the key was bound to. Profiles stack, each can
+be limited to certain programs or keyboard layouts, and each can name its own emergency
+stop key.
+
+```toml
+[defaults]
+emergency_stop = "ctrl shift e"   # unapplies this profile
+
+[binds.PgUp]
+bind = "volume-up"                # remap: PgUp turns the volume up
+
+[binds.F6]
+loop = "inf"                      # press F6 to start, again to stop
+gap = "50ms"
+seq = ["mouse1"]                  # a left click every 50 ms
+```
+
+Profiles run on X11 for now. [Applying a binds profile](#applying-a-binds-profile) covers
+applying, stacking and stopping them; `example_profile.toml` documents every field and
+step.
 
 ## Features
 
@@ -189,20 +211,22 @@ indistinguishable from `8`.
 sequencer doctor
 ```
 
-Reports the session, what profiles run on, and each device requirement (`detect-key` and
-`bench` read the devices), with the exact fix for anything failing. Exit code `0` when the
+Reports the session and what profiles run on (in a Wayland session, also what native
+Wayland apps see of them), who answers which program has focus and which layout is active,
+and each device requirement (`detect-key` and `bench` read the devices), with the exact fix
+for anything failing. Exit code `0` when the
 checks pass, `1` otherwise — and on X11 that is `0` even with every device check failing,
 because profiles do not touch the devices. From a container with no input devices and no
-X server:
+X server, up to the first of its three fixes:
 
 ```
-sequencer 0.1.0  (linux x86_64)
+sequencer 0.7.0  (linux x86_64)
 session: Linux virtual terminal
 backend: none — profiles need an X server, and none answered
 
 [fail] uinput kernel module: /dev/uinput does not exist
 [fail] /dev/uinput writable: /dev/uinput: No such file or directory (os error 2)
-[fail] /dev/input readable: /dev/input cannot be listed
+[fail] /dev/input keyboards readable: /dev/input cannot be listed
 
 The uinput kernel module is not loaded
   Injecting input below the display server needs /dev/uinput, which the uinput module provides.
@@ -218,13 +242,13 @@ The uinput kernel module is not loaded
 ```sh
 sequencer profile-apply my-binds.toml     # first call becomes the manager
 sequencer profile-apply gaming.toml       # from any shell: adds to the running set
-sequencer unprofile-apply gaming          # removes; with no names, an interactive picker
+sequencer profile-unapply gaming          # removes; with no names, an interactive picker
 sequencer profile-check my-binds.toml     # validate without applying; --format tidies it
 ```
 
 Profiles stack dynamically. Each `profile-apply` validates the file and links it into
 `~/.config/sequencer/active/` — **the directory is the set**: `ls` shows what's applied,
-and removing a link (by hand or with `unprofile-apply`) takes it out of play within a
+and removing a link (by hand or with `profile-unapply`) takes it out of play within a
 moment. The first invocation finds no live manager, takes a PID lock and becomes one,
 managing everything in the directory; later invocations see the lock and just report.
 A crashed manager's stale lock is detected and replaced, and a manager whose set
@@ -253,7 +277,12 @@ With a gate set, the run watches it (~5×/s) and grabs or releases the profile's
 as the match comes and goes — a dormant profile eats no keys. `program` matches the
 window class and `kb_lang` the active layout's own name (`us`, `il`); `sequencer
 detect-key` prints both, as `focus:` and `lang:` lines, which is how you learn the
-spelling to write. Together they express things neither does alone: `kb_lang = "!us"`
+spelling to write. On X11 the X server answers both. In a Wayland session, where Xwayland
+sees only X11 windows and names only the first layout, KDE answers instead: KWin names the
+focused window — a Wayland app by its app id, such as `org.kde.konsole` — through a small
+script sequencer loads into it and unloads after, and KDE's keyboard service names the
+layout. Elsewhere Xwayland's partial view is all there is. Together the gates express
+things neither does alone: `kb_lang = "!us"`
 with a handful of `NOP` binds refuses to type in one program while the keyboard is on
 another language, and leaves those keys untouched everywhere else. The
 `emergency_stop` key keeps its own grab either way; pressing it unapplies exactly the
@@ -278,8 +307,12 @@ no grabs, so it is safe in an editor hook. `--format` rewrites sound files in pl
 keywords uppercased, chord modifiers first, operands column-aligned, RNG blocks indented
 — preserving every comment, and it is idempotent.
 
-X11 only for now: triggers are heard by key grab and output goes through XTEST, so it
-needs no device access and no password. Wayland arrives with the device backend.
+Profiles run on X11: triggers are heard by key grab and output goes through XTEST, so they
+need no device access and no password. In a Wayland session they run through Xwayland, and
+native Wayland apps see only part of them — while one has focus, a trigger fires only on
+the keys the compositor passes to X11 apps, and a bound key still reaches the app.
+`sequencer doctor` says what holds on the machine at hand; a backend that reaches Wayland
+apps directly is still to come.
 
 ### write-script
 
@@ -377,7 +410,7 @@ taps, holds, waits, loops, chance.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 242 tests, all headless
+cargo test --workspace --all-features    # 277 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
@@ -398,7 +431,9 @@ They refuse to start while a real manager is running, keep all state in temp
 directories, and the only key they synthesize at your desktop is Pause.
 
 Tests that need a real `/dev/uinput` skip themselves with a note when it is absent, so the
-suite is green in a container and exercises the device on a real machine.
+suite is green in a container and exercises the device on a real machine. Tests that need a
+D-Bus bus start a private `dbus-daemon` of their own and skip the same way when there is
+none; `SEQUENCER_TEST_BUS_DAEMON` names another bus daemon to use instead (busd works).
 
 CI runs the suite plus fmt, clippy and docs on Linux; cross-compiles for Windows and macOS,
 which is the proof `sequencer-core` is OS-free; checks every feature combination with
@@ -414,7 +449,8 @@ command that needs a device says so — but no backend for either is written.
 | Platform | Status |
 |---|---|
 | Linux — X11 | XTEST + key grabs; no setup |
-| Linux — Wayland, console | `detect-key` and `bench` (uinput + evdev; need device access); profiles are X11 only for now |
+| Linux — Wayland | profiles through Xwayland, with the limits `doctor` lists (on KDE the gates see every window and layout); `detect-key` and `bench` through the devices |
+| Linux — console | `detect-key` and `bench` (uinput + evdev; need device access) |
 | Windows | not written (`WH_KEYBOARD_LL` + `SendInput` would be the shape) |
 | macOS | not written (`CGEventTap` + `CGEventPost` would be the shape) |
 

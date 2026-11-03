@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SUDO-TEST.sh — thin launcher for the live test suite. All test logic lives in Rust:
-# crates/sequencer-cli/tests/live.rs (+ live/validation.rs, live/x11.rs, live/sudo.rs).
+# crates/sequencer-cli/tests/live/main.rs and the tier modules beside it.
 #
 # It caches a sudo ticket (device-backend tests only — decline and they skip), runs
 # the headless suite, then the live suite serially. The live tests refuse to start

@@ -34,13 +34,13 @@ program = "*"    # (default) optional: profile applies only while the focused pr
                  #     e.g.: `["*mpv*", "*celluloid*", "!*ampverse*"]`: media-players, with some filtering of an incidentally caught app name
                  #   A profile that activates on a focused program ECLIPSES global profiles' binds, when the binds (inputs) are the same
                  #   Run `sequencer detect-key` and focus (click on) your targeted program(s), to discover their name.
-                 #   An unreadable gate (no EWMH) keeps gated profiles DORMANT
+                 #   An unreadable gate keeps gated profiles DORMANT (`sequencer doctor` names who answers: X11, or KWin on KDE Wayland)
 kb_lang = "*"    # (default) optional: profile applies only while the active keyboard-layout matches
                  #   `!` / `*`: language NOT / wildcard, for a language / list of languages to apply-on
                  #     e.g.: `["*chrom*", "!*chroma*"]`: anything with "chrom", not "chroma" (chrome, chromium)
                  #   Layout NAMES, as your system spells them: "us", "il", "ru" (NOT "English"/"Hebrew"/"Russian")
                  #   Run `sequencer detect-key` and change your keyboard-input language to print the system's name for your language.
-                 #   An unreadable gate (no XKB) keeps gated profiles DORMANT
+                 #   An unreadable gate keeps gated profiles DORMANT (`sequencer doctor` names who answers: X11, or KDE on Wayland)
 emergency_stop = "F8"  # optional <key/chord>: gracefully unapplies THIS profile, releasing all of its own binds.
                        #   To stop all profiles: SIGTERM (Ctrl+C) on the manager's process.
                        #   Supports alternatives' list, like `program` field. Chords fire on the EXACT combination.

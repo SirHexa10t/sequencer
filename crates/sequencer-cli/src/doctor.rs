@@ -4,6 +4,7 @@ use sequencer_input::probe::{CheckResult, Step as FixStep};
 use sequencer_input::{Requirement, SessionInfo};
 
 use crate::args::DoctorArgs;
+use crate::session::{Focus, Layout, Source};
 use crate::{Deps, Result, exit};
 
 /// Whether this build has an input backend at all. Without one, every command that
@@ -36,6 +37,7 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     // Probed once and reused: every call opens a fresh X connection, and two calls could
     // in principle straddle a session ending and have the report contradict itself.
     let on_x11 = x11_usable();
+    let wayland = crate::session::wayland_session();
 
     writeln!(
         deps.out,
@@ -45,7 +47,11 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
         std::env::consts::ARCH
     )?;
     writeln!(deps.out, "session: {}", info.session)?;
-    writeln!(deps.out, "backend: {}", profile_backend(on_x11))?;
+    writeln!(deps.out, "backend: {}", profile_backend(on_x11, wayland))?;
+    if on_x11 && wayland {
+        xwayland::write(deps)?;
+    }
+    write_session_sources(on_x11, deps)?;
     // Above the requirement checks on purpose: several of the paths below return early,
     // and a stuck modifier is worth reporting even on a machine that fails those.
     keyboard::write(deps)?;
@@ -112,8 +118,8 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
     {
         writeln!(
             deps.out,
-            "\nUntil that is fixed, `sequencer detect-key` still works: it reads the \
-             terminal, not the devices."
+            "\nUntil that is fixed, `sequencer detect-key --no-sudo` still works: it reads \
+             the terminal, not the devices."
         )?;
         Ok(exit::FAILURE)
     }
@@ -121,8 +127,11 @@ pub fn doctor(args: &DoctorArgs, deps: &mut Deps<'_>) -> Result<u8> {
 
 /// What `profile-apply` runs on, for `doctor` to report. The manager has only the X11
 /// pair, so without it there is nothing to name.
-const fn profile_backend(on_x11: bool) -> &'static str {
-    if on_x11 {
+const fn profile_backend(on_x11: bool, wayland: bool) -> &'static str {
+    if on_x11 && wayland {
+        "X11 through Xwayland — XTEST for output, key grabs for triggers (no device access, \
+         no sudo)"
+    } else if on_x11 {
         "X11 — XTEST for output, key grabs for triggers (no device access, no sudo)"
     } else if cfg!(feature = "xtest") {
         "none — profiles need an X server, and none answered"
@@ -145,6 +154,166 @@ fn x11_usable() -> bool {
     #[cfg(not(all(feature = "xtest", target_os = "linux")))]
     {
         false
+    }
+}
+
+/// The `focus:` and `layout:` lines: who answers the profile gates' questions — and so
+/// `detect-key`'s `focus:` and `lang:` lines — and what that one can see. Silent where
+/// nothing answers and no profile could run, which is a console.
+fn write_session_sources(on_x11: bool, deps: &mut Deps<'_>) -> Result<()> {
+    let (focus, layout) = (Focus::source(), Layout::source());
+    if !on_x11 && focus.is_none() && layout.is_none() {
+        return Ok(());
+    }
+    let focus_text = match focus {
+        Some(Source::X11) => "the X server (EWMH), which sees every window",
+        Some(Source::Kde) => {
+            "KWin, which sees every window, Wayland and X11 (through a small script \
+             sequencer loads into KWin while it needs to know, and unloads after)"
+        }
+        Some(Source::Xwayland) => {
+            "Xwayland, which sees X11 windows only: with a Wayland app focused, \
+             program-gated profiles stay dormant"
+        }
+        None => "nothing answers here: program-gated profiles stay dormant",
+    };
+    let layout_text = match layout {
+        Some(Source::X11) => "the X server (XKB)",
+        Some(Source::Kde) => "KDE's keyboard service, which follows every switch",
+        Some(Source::Xwayland) => {
+            "Xwayland (XKB), which may name only the first layout and miss switches"
+        }
+        None => "nothing answers here: kb_lang-gated profiles stay dormant",
+    };
+    writeln!(deps.out, "focus: {focus_text}")?;
+    writeln!(deps.out, "layout: {layout_text}")?;
+    Ok(())
+}
+
+/// What native Wayland apps see of profiles that run through Xwayland — the gaps a user
+/// would otherwise discover one failed trigger at a time.
+///
+/// On KDE the note says exactly: KWin's own setting decides which keys reach X11 apps
+/// while another app has focus, and `kwinrc` records it. Elsewhere it can only say that
+/// the compositor decides.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+mod xwayland {
+    use sequencer_input::KWinFocus;
+    use sequencer_input::kde::{KeySharing, XwaylandSharing, xwayland_sharing};
+
+    use crate::{Deps, Result};
+
+    pub(super) fn write(deps: &mut Deps<'_>) -> Result<()> {
+        let kde = KWinFocus::available().then(xwayland_sharing);
+        for line in note(kde) {
+            writeln!(deps.out, "  {line}")?;
+        }
+        Ok(())
+    }
+
+    /// The note's lines, KDE's setting given when it is known. Pure, so the wording is
+    /// testable with no session.
+    fn note(kde: Option<XwaylandSharing>) -> Vec<String> {
+        let Some(sharing) = kde else {
+            return vec![
+                "Native Wayland apps see profiles only as far as the compositor lets X11 apps:"
+                    .to_owned(),
+                "- while one has focus, a trigger fires only on keys the compositor shares \
+                 with X11 apps"
+                    .to_owned(),
+                "- a bound key still reaches that app, so a bind adds to the key there \
+                 rather than replacing it"
+                    .to_owned(),
+                "- output goes through the compositor, which may ask permission first".to_owned(),
+            ];
+        };
+        let keys = match sharing.keys {
+            KeySharing::None => "no keys at all",
+            KeySharing::Modifiers => {
+                "only keys that type no character (F-keys, Escape, arrows, modifiers, media keys)"
+            }
+            KeySharing::Combinations => {
+                "keys that type no character, and any key pressed while Ctrl, Alt or Meta \
+                 is held"
+            }
+            KeySharing::All => "every key",
+        };
+        let mouse = if sharing.mouse {
+            "- mouse-button triggers fire there too"
+        } else {
+            "- mouse-button triggers do not fire there: KDE shares no mouse buttons"
+        };
+        vec![
+            "Native Wayland apps see profiles only as far as KDE lets X11 apps:".to_owned(),
+            format!(
+                "- while one has focus, a trigger fires only on what KDE shares with X11 \
+                 apps: {keys} (System Settings → Legacy X11 App Support)"
+            ),
+            mouse.to_owned(),
+            "- a bound key still reaches that app, so a bind adds to the key there rather \
+             than replacing it"
+                .to_owned(),
+            "- output asks KDE's permission once, to allow \"remote control\"".to_owned(),
+        ]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// KDE's default named in the user's words, with where to change it; the mouse,
+        /// the swallowing and the permission said once each.
+        #[test]
+        fn on_kde_the_note_names_the_setting_in_force() {
+            let text = note(Some(XwaylandSharing::default())).join("\n");
+            assert!(
+                text.contains("any key pressed while Ctrl, Alt or Meta is held")
+                    && text.contains("Legacy X11 App Support"),
+                "{text}"
+            );
+            assert!(text.contains("KDE shares no mouse buttons"), "{text}");
+            assert!(text.contains("still reaches that app"), "{text}");
+            assert!(text.contains("remote control"), "{text}");
+        }
+
+        #[test]
+        fn every_kde_setting_has_its_own_words() {
+            let mut seen = Vec::new();
+            for keys in [
+                KeySharing::None,
+                KeySharing::Modifiers,
+                KeySharing::Combinations,
+                KeySharing::All,
+            ] {
+                let line = note(Some(XwaylandSharing { keys, mouse: true }))[1].clone();
+                assert!(
+                    !seen.contains(&line),
+                    "two settings, one description: {line}"
+                );
+                seen.push(line);
+            }
+        }
+
+        /// Off KDE nothing records the policy, so the note claims none.
+        #[test]
+        fn elsewhere_the_note_claims_no_setting() {
+            let text = note(None).join("\n");
+            assert!(text.contains("the compositor shares"), "{text}");
+            assert!(!text.contains("KDE"), "{text}");
+        }
+    }
+}
+
+/// No X11 backend: nothing runs through Xwayland, so there is nothing to note.
+#[cfg(not(all(feature = "xtest", target_os = "linux")))]
+mod xwayland {
+    use crate::{Deps, Result};
+
+    // The Result is not unnecessary: it is the signature the real one has, so the call
+    // site stays free of `cfg`.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) const fn write(_deps: &mut Deps<'_>) -> Result<()> {
+        Ok(())
     }
 }
 

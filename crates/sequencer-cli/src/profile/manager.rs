@@ -20,8 +20,9 @@ use crate::binds::format::{
 };
 use crate::binds::run;
 use crate::runtime::{CapturePump, EventPump, Wake};
+use crate::session::{Focus, Layout};
 use crate::{Error, Result, exit};
-use sequencer_input::{Epoch, FocusWatcher, GrabCapture, LayoutWatcher, SystemClock, XTestSink};
+use sequencer_input::{Epoch, GrabCapture, SystemClock, XTestSink};
 
 /// Ctrl+C (and SIGTERM) set this; the loop notices within one heartbeat and stops
 /// through the normal teardown.
@@ -226,6 +227,26 @@ fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
         })
 }
 
+/// What the manager says as it starts: where the set lives and how to stop it, and —
+/// in a Wayland session, where the grabs and XTEST go through Xwayland — that native
+/// Wayland apps see only part of what it does, which is the compositor's choice.
+fn announce_start(out: &mut dyn std::io::Write) -> Result<()> {
+    writeln!(
+        out,
+        "managing {}; apply/unapply from any shell, Ctrl+C stops everything",
+        super::state::active_dir()?.display()
+    )?;
+    if crate::session::wayland_session() {
+        writeln!(
+            out,
+            "note: this is a Wayland session, so profiles run through Xwayland and native \
+             Wayland apps see only part of them; `sequencer doctor` says which part"
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// Runs the active set until it empties out, Ctrl+C (or SIGTERM), or a fatal error.
 ///
 /// Everything user-visible goes through `out`, line per event: profiles appearing,
@@ -253,8 +274,8 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
     // so the loop below can block on all of them at once.
     let (queue, stream) = sequencer_input::CaptureStream::channel(256);
     let mut pump = CapturePump::new(stream, &clock);
-    let mut focus: Option<FocusWatcher> = None;
-    let mut layout: Option<LayoutWatcher> = None;
+    let mut focus: Option<Focus> = None;
+    let mut layout: Option<Layout> = None;
     // One live connection for "is that key still down?" — the deferred-tap question.
     let probe = sequencer_input::KeyProbe::open();
     // Contaminated mirrors tap between lifted modifiers — this owns that path;
@@ -263,12 +284,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
     let mut passes: u32 = 0;
     let mut empty_scans: u32 = 0;
 
-    writeln!(
-        out,
-        "managing {}; apply/unapply from any shell, Ctrl+C stops everything",
-        super::state::active_dir()?.display()
-    )?;
-    out.flush()?;
+    announce_start(out)?;
 
     catch_interrupts();
     let mut next_maintenance = clock.now();
@@ -387,8 +403,8 @@ fn dispatch(
     slots: &mut BTreeMap<String, Slot>,
     probe: Option<&sequencer_input::KeyProbe>,
     lifter: Option<&sequencer_input::LiftedTap>,
-    focus: Option<&FocusWatcher>,
-    layout: Option<&LayoutWatcher>,
+    focus: Option<&Focus>,
+    layout: Option<&Layout>,
 ) -> Result<()> {
     let (sequencer_core::input::EventKind::KeyDown(key)
     | sequencer_core::input::EventKind::KeyUp(key)) = event.kind
@@ -423,12 +439,12 @@ fn dispatch(
         let class = gates
             .0
             .is_some()
-            .then(|| focus.and_then(FocusWatcher::focused_class))
+            .then(|| focus.and_then(Focus::program))
             .flatten();
         let lang = gates
             .1
             .is_some()
-            .then(|| layout.and_then(LayoutWatcher::current))
+            .then(|| layout.and_then(Layout::current))
             .flatten();
         licensed(
             gates.0.as_deref(),
@@ -677,8 +693,8 @@ fn rescan(
     slots: &mut BTreeMap<String, Slot>,
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
     emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
-    focus: &mut Option<FocusWatcher>,
-    layout: &mut Option<LayoutWatcher>,
+    focus: &mut Option<Focus>,
+    layout: &mut Option<Layout>,
     rescan_dir: bool,
 ) -> Result<()> {
     if rescan_dir {
@@ -737,30 +753,32 @@ fn reconcile_emergency(
 }
 
 /// Opens each watcher the first time a profile gated on it appears — focus for
-/// `program`, XKB for `kb_lang`. A session that cannot answer is said out loud once,
-/// because the profiles waiting on that answer will never activate.
+/// `program`, the layout for `kb_lang`, from whoever answers here ([`crate::session`]).
+/// A session that cannot answer is said out loud once, because the profiles waiting on
+/// that answer will never activate.
 fn ensure_watchers(
     out: &mut dyn std::io::Write,
     slots: &BTreeMap<String, Slot>,
-    focus: &mut Option<FocusWatcher>,
-    layout: &mut Option<LayoutWatcher>,
+    focus: &mut Option<Focus>,
+    layout: &mut Option<Layout>,
 ) -> Result<()> {
     if focus.is_none() && slots.values().any(|slot| slot.profile.program.is_some()) {
-        *focus = FocusWatcher::open();
+        *focus = Focus::open();
         if focus.is_none() {
             writeln!(
                 out,
-                "focus is unreadable (no EWMH?): program-gated profiles stay dormant"
+                "nothing here says which program has focus, so program-gated profiles stay \
+                 dormant; `sequencer doctor` says what it found"
             )?;
         }
     }
     if layout.is_none() && slots.values().any(|slot| slot.profile.kb_lang.is_some()) {
-        *layout = LayoutWatcher::open();
+        *layout = Layout::open();
         if layout.is_none() {
             writeln!(
                 out,
-                "the keyboard layout is unreadable (no XKB?): kb_lang-gated profiles \
-                 stay dormant"
+                "nothing here says which keyboard layout is active, so kb_lang-gated \
+                 profiles stay dormant; `sequencer doctor` says what it found"
             )?;
         }
     }
@@ -784,11 +802,11 @@ fn reconcile_activation(
     sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
-    focus: Option<&FocusWatcher>,
-    layout: Option<&LayoutWatcher>,
+    focus: Option<&Focus>,
+    layout: Option<&Layout>,
 ) -> Result<()> {
-    let class = focus.and_then(FocusWatcher::focused_class);
-    let lang = layout.and_then(LayoutWatcher::current);
+    let class = focus.and_then(Focus::program);
+    let lang = layout.and_then(Layout::current);
     refresh_wants(slots, class.as_deref(), lang.as_deref());
 
     // The claim pass. Stops are seeded for every slot, dormant ones included — the

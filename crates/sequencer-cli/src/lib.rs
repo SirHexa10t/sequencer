@@ -76,6 +76,8 @@ pub mod doctor;
 mod profile;
 pub mod runtime;
 #[cfg(feature = "cli")]
+mod session;
+#[cfg(feature = "cli")]
 pub mod write_script;
 
 #[cfg(feature = "cli")]
@@ -307,7 +309,7 @@ pub fn dispatch(command: &Command, deps: &mut Deps<'_>) -> Result<u8> {
         Command::Doctor(args) => doctor::doctor(args, deps),
         Command::DetectKey(args) => detect_key::detect_key(args, deps),
         Command::ProfileApply(args) => profile::profile_apply(args, deps),
-        Command::ProfileUnapply(args) => profile::unprofile_apply(args, deps),
+        Command::ProfileUnapply(args) => profile::profile_unapply(args, deps),
         Command::ProfileCheck(args) => profile::profile_check(args, deps),
     }
 }

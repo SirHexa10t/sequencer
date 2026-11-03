@@ -160,6 +160,39 @@ What the 06:08, 06:25 and 06:28 runs add:
    clears a held modifier comes too late for the first output (T3, T4) — or, in a Wayland
    window, every time.
 
+## Status — what full Wayland support still needs
+
+The numbering used since the first round of fixes. "Fixed" means in the code, with tests;
+items marked *live check* still need a run on the KDE machine.
+
+1. **Fixed (2026-10-27):** the device check now needs every keyboard readable (found
+   through sysfs, by udev's keyboard rule), so `doctor` fails and `detect-key` asks for
+   sudo when the keyboard is unreadable; a capture with no keyboard says so. *Live check.*
+2. **Fixed (2026-10-27):** `doctor` says when profiles run through Xwayland and what
+   native Wayland apps then miss, naming KDE's own setting; the manager says so once at
+   start. *Live check.*
+3. **Fixed (2026-10-27):** `kb_lang` and `detect-key`'s `lang:` line ask KDE's keyboard
+   service in a Wayland session, and follow every switch. *Live check* (T8, D1, D2).
+4. **Fixed (2026-10-27):** the README spells the unapply command `profile-unapply`.
+5. Modifier changes need time through Xwayland: chord outputs lose their modifier, and
+   the lift of a held one comes too late (T3–T5, T10).
+6. Character-key triggers (letters, digits, symbols, Shift+letter) never fire while a
+   Wayland window has focus: KDE passes only what its Xwayland setting allows (T2, T4).
+7. Binds can't block keys in Wayland windows: the app gets the key too (T6).
+8. **Fixed (2026-10-27):** the program gate and `detect-key`'s `focus:` line ask KWin in
+   a Wayland session, through a script loaded for the run, and see Wayland windows by
+   their app id. *Live check* (T7, D1, D2).
+9. Output depends on KDE's one-time "remote control" permission; refused, it's dropped
+   with no error, and sequencer can't tell (T1).
+10. Mouse-button triggers can't fire in Wayland windows (KWin's source; untested).
+11. `doctor`'s `keyboard:` line and the manager's stuck-modifier warning read Xwayland's
+    keyboard state, which may not match KWin's (code; untested).
+12. Other compositors (GNOME, Sway, Hyprland) are untested; whether "full" means KDE only
+    is still to decide.
+13. No automated tests of any Wayland path.
+14. The README describes the Xwayland limits now; it needs the full story once the route
+    for 5–7 and 9–11 is settled.
+
 ## Open questions
 
 - The design for Wayland: keep the X11 backend and document its limits; a device backend for

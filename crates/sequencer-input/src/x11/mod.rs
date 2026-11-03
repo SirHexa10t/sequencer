@@ -41,3 +41,19 @@ pub fn is_usable() -> bool {
     }
     XTestSink::open().is_ok()
 }
+
+/// Whether the X server is Xwayland: an X11 server inside a Wayland session, which sees
+/// only its own windows and its first layout.
+///
+/// Asks the server, which announces itself with an `XWAYLAND` extension, rather than
+/// the environment: sudo keeps `$DISPLAY` but drops `$WAYLAND_DISPLAY`, so from the
+/// variables alone a Wayland session run through sudo looks like plain X11.
+#[must_use]
+pub fn is_xwayland() -> bool {
+    use x11rb::connection::RequestConnection as _;
+    x11rb::connect(None).is_ok_and(|(connection, _)| {
+        connection
+            .extension_information("XWAYLAND")
+            .is_ok_and(|extension| extension.is_some())
+    })
+}

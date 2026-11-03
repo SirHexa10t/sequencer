@@ -28,6 +28,10 @@
 
 pub mod capture;
 pub mod clock;
+#[cfg(target_os = "linux")]
+mod dbus;
+#[cfg(target_os = "linux")]
+pub mod kde;
 #[cfg(all(any(feature = "evdev", feature = "xtest"), target_os = "linux"))]
 pub mod linux;
 pub mod mock;
@@ -37,6 +41,8 @@ pub mod x11;
 
 pub use crate::capture::{CaptureStream, Epoch, EventQueue};
 pub use crate::clock::SystemClock;
+#[cfg(target_os = "linux")]
+pub use crate::kde::{KWinFocus, KdeLayout};
 #[cfg(all(feature = "evdev", target_os = "linux"))]
 pub use crate::linux::{EvdevCapture, UinputSink};
 pub use crate::mock::MockInjector;

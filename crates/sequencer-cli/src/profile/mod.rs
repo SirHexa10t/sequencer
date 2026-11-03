@@ -256,7 +256,7 @@ fn await_stopping_manager(deps: &mut Deps<'_>) -> Result<()> {
 ///
 /// If a given name matches nothing, or the picker is asked for without a terminal.
 #[cfg(target_os = "linux")]
-pub(crate) fn unprofile_apply(args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) -> Result<u8> {
+pub(crate) fn profile_unapply(args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) -> Result<u8> {
     let set = state::scan_active()?;
     if set.is_empty() {
         writeln!(deps.out, "nothing is applied.")?;
@@ -316,7 +316,7 @@ pub(crate) fn unprofile_apply(args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) ->
 ///
 /// Always: the state layer is Linux-only, like everything else here.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn unprofile_apply(_args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) -> Result<u8> {
+pub(crate) fn profile_unapply(_args: &ProfileUnapplyArgs, deps: &mut Deps<'_>) -> Result<u8> {
     writeln!(deps.out, "nothing is applied.")?;
     Ok(exit::OK)
 }

@@ -13,6 +13,12 @@
 //! cargo test -p sequencer-cli --test live -- --ignored --test-threads=1 --nocapture
 //! ```
 
+// Each hardware tier uses its own share of the harness, so a build that compiles either
+// tier out leaves part of it idle; the full build uses all of it.
+#[cfg_attr(
+    not(all(feature = "xtest", feature = "evdev", target_os = "linux")),
+    allow(dead_code, reason = "each hardware tier uses its own share")
+)]
 mod harness;
 mod validation;
 

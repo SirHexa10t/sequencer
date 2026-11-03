@@ -24,6 +24,7 @@
 
 use crate::args::DetectKeyArgs;
 use crate::runtime::{EventPump, Wake};
+use crate::session::{Focus, Layout, Window};
 use crate::{Deps, Result, exit};
 use sequencer_core::input::{Category, EventKind, INPUT_MAP, Key};
 
@@ -115,8 +116,9 @@ fn reference() -> String {
         "\nKeys that have no char to go by are named: backspace, enter, the modifiers (ctl, shift...), the arrows (up, down..), space (separator for chord members).\n",
     );
     text.push_str(
-        "\nOn X11, the focused program prints as `focus: <name>` and the keyboard layout as\
-        \n`lang: <name>`, each whenever it changes — the spellings `program` and `kb_lang` match.\n",
+        "\nWhere the session can tell (X11, or KDE on Wayland), the focused program prints as\
+        \n`focus: <name>` and the keyboard layout as `lang: <name>`, each whenever it changes —\
+        \nthe spellings `program` and `kb_lang` match.\n",
     );
     text
 }
@@ -264,53 +266,35 @@ mod tty;
 /// Keys print constantly; these only on a switch, which is what makes them all
 /// readable in one stream.
 ///
-/// Best-effort by design: on Wayland or without the `xtest` feature there is nothing to
-/// ask, and the run simply reports keys alone (the intro says both are X11-only).
+/// Best-effort by design: where nothing can say which program has focus or which layout
+/// is active ([`crate::session`]), the run simply reports keys alone.
 struct SessionPoll {
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    watcher: Option<sequencer_input::FocusWatcher>,
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    layout: Option<sequencer_input::LayoutWatcher>,
+    focus: Option<Focus>,
+    layout: Option<Layout>,
     last: Option<String>,
     last_lang: Option<String>,
     /// The window that had focus when the run began — the terminal it was started
     /// from, since starting it is the last thing that happened there.
-    home: Option<u32>,
+    home: Option<Window>,
 }
 
 impl SessionPoll {
     fn new() -> Self {
-        #[cfg(all(feature = "xtest", target_os = "linux"))]
-        let watcher = sequencer_input::FocusWatcher::open();
+        let focus = Focus::open();
         Self {
-            home: {
-                #[cfg(all(feature = "xtest", target_os = "linux"))]
-                {
-                    watcher
-                        .as_ref()
-                        .and_then(sequencer_input::FocusWatcher::focused_window)
-                }
-                #[cfg(not(all(feature = "xtest", target_os = "linux")))]
-                {
-                    None
-                }
-            },
-            #[cfg(all(feature = "xtest", target_os = "linux"))]
-            watcher,
-            #[cfg(all(feature = "xtest", target_os = "linux"))]
-            layout: sequencer_input::LayoutWatcher::open(),
+            home: focus.as_ref().and_then(Focus::window),
+            focus,
+            layout: Layout::open(),
             last: None,
             last_lang: None,
         }
     }
 
-    /// A poll that never asks. For injected runs: no session to report on, and no
-    /// reason for a unit test to open an X connection.
-    fn silent() -> Self {
+    /// A poll that never asks. For injected runs and unit tests: no session to report
+    /// on, and no reason for a test to reach into the user's desktop.
+    const fn silent() -> Self {
         Self {
-            #[cfg(all(feature = "xtest", target_os = "linux"))]
-            watcher: None,
-            #[cfg(all(feature = "xtest", target_os = "linux"))]
+            focus: None,
             layout: None,
             last: None,
             last_lang: None,
@@ -324,23 +308,8 @@ impl SessionPoll {
     /// without this, a Ctrl+C meant for another window would end the run too. See
     /// [`still_home`] for why an unreadable answer counts as yes.
     fn at_home(&self) -> bool {
-        still_home(self.home, self.focused_window())
-    }
-
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    fn focused_window(&self) -> Option<u32> {
-        self.watcher
-            .as_ref()
-            .and_then(sequencer_input::FocusWatcher::focused_window)
-    }
-
-    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
-    #[allow(
-        clippy::unused_self,
-        reason = "the stub keeps both builds on one call shape"
-    )]
-    fn focused_window(&self) -> Option<u32> {
-        None
+        let now = self.focus.as_ref().and_then(Focus::window);
+        still_home(self.home.as_ref(), now.as_ref())
     }
 
     /// Asks for the focus and the layout, and prints each if it changed.
@@ -349,14 +318,14 @@ impl SessionPoll {
     /// unnamed state must not re-announce its neighbour afterwards, and a layout that
     /// cannot be named is not a layout change.
     fn report(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
-        if let Some(class) = self.current()
+        if let Some(class) = self.focus.as_ref().and_then(Focus::program)
             && self.last.as_deref() != Some(class.as_str())
         {
             writeln!(out, "focus: {class}")?;
             out.flush()?;
             self.last = Some(class);
         }
-        if let Some(lang) = self.language()
+        if let Some(lang) = self.layout.as_ref().and_then(Layout::current)
             && self.last_lang.as_deref() != Some(lang.as_str())
         {
             writeln!(out, "lang: {lang}")?;
@@ -365,45 +334,16 @@ impl SessionPoll {
         }
         Ok(())
     }
-
-    /// The active keyboard layout's name, as `kb_lang` matches it.
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    fn language(&self) -> Option<String> {
-        self.layout.as_ref()?.current()
-    }
-
-    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
-    #[allow(
-        clippy::unused_self,
-        reason = "the stub keeps both builds on one call shape"
-    )]
-    fn language(&self) -> Option<String> {
-        None
-    }
-
-    #[cfg(all(feature = "xtest", target_os = "linux"))]
-    fn current(&self) -> Option<String> {
-        self.watcher.as_ref()?.focused_class()
-    }
-
-    #[cfg(not(all(feature = "xtest", target_os = "linux")))]
-    #[allow(
-        clippy::unused_self,
-        reason = "the stub keeps both builds on one call shape"
-    )]
-    fn current(&self) -> Option<String> {
-        None
-    }
 }
 
 /// Whether focus is still where the run began, given the window it began in and the one
 /// focused now.
 ///
-/// Unknown counts as yes, in both directions: with no window to compare against (no
-/// EWMH, no X, a launcher rather than a terminal) or no readable answer now, the quit
+/// Unknown counts as yes, in both directions: with no window to compare against (nothing
+/// that can tell, a launcher rather than a terminal) or no readable answer now, the quit
 /// chord must still work. A quit that cannot be reached is a worse bug than one that can
 /// be reached from the wrong window — which is how this started.
-const fn still_home(home: Option<u32>, now: Option<u32>) -> bool {
+fn still_home<W: PartialEq>(home: Option<&W>, now: Option<&W>) -> bool {
     match (home, now) {
         (Some(home), Some(now)) => home == now,
         _ => true,
@@ -521,7 +461,7 @@ mod tests {
             &mut pump,
             &clock,
             &|| true,
-            &mut SessionPoll::new(),
+            &mut SessionPoll::silent(),
             &mut out,
         )
         .expect("the loop reports its own exit");
@@ -555,16 +495,16 @@ mod tests {
     #[test]
     fn the_quit_chord_belongs_to_the_window_the_run_started_in() {
         assert!(
-            still_home(Some(7), Some(7)),
+            still_home(Some(&7), Some(&7)),
             "same window: this run's Ctrl+C"
         );
         assert!(
-            !still_home(Some(7), Some(9)),
+            !still_home(Some(&7), Some(&9)),
             "another window has focus: not this run's Ctrl+C"
         );
-        assert!(still_home(None, Some(9)), "nothing to compare against");
-        assert!(still_home(Some(7), None), "no readable answer now");
-        assert!(still_home(None, None));
+        assert!(still_home(None, Some(&9)), "nothing to compare against");
+        assert!(still_home(Some(&7), None), "no readable answer now");
+        assert!(still_home::<u32>(None, None));
     }
 
     /// Ctrl+C off the DEVICES ends the run — the path the terminal cannot swallow.
@@ -589,7 +529,7 @@ mod tests {
             &clock,
             // The terminal never sees it: this is the device path alone.
             &|| false,
-            &mut SessionPoll::new(),
+            &mut SessionPoll::silent(),
             &mut out,
         )
         .expect("the chord ends the run cleanly");
@@ -624,7 +564,7 @@ mod tests {
             &mut pump,
             &clock,
             &|| false,
-            &mut SessionPoll::new(),
+            &mut SessionPoll::silent(),
             &mut out,
         )
         .expect("the script runs out and the stream closes");
@@ -648,7 +588,7 @@ mod tests {
             &mut pump,
             &clock,
             &|| false,
-            &mut SessionPoll::new(),
+            &mut SessionPoll::silent(),
             &mut out,
         )
         .expect("a closed stream is a clean exit");
