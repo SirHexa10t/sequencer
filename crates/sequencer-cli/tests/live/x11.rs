@@ -6,8 +6,8 @@
 //! field) and every injected *target* is Pause, which every desktop ignores.
 
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use sequencer_cli::core::emit::{Emit, EmitAction, InputSink as _};
@@ -15,7 +15,7 @@ use sequencer_cli::core::input::Key;
 use sequencer_cli::core::time::Timestamp;
 use sequencer_cli::input::XTestSink;
 
-use crate::harness::{self, TempConfig};
+use crate::harness::{self, Manager, TempConfig};
 
 /// Whether the X tests can run here at all; refuses outright (rather than skipping)
 /// when a real manager is live, because its grabs would fight the tests'.
@@ -24,31 +24,13 @@ fn ready() -> bool {
         eprintln!("skip: no usable X11 session (DISPLAY unset or unreachable)");
         return false;
     }
-    if let Some(pid) = live_real_manager() {
+    if let Some(pid) = harness::live_real_manager() {
         panic!(
             "a sequencer manager is already running (PID {pid}); quit it first — \
              Ctrl+C in its terminal, or unapply its profiles — then re-run"
         );
     }
     true
-}
-
-/// The PID in the *real* config's lock file, if that process is alive.
-fn live_real_manager() -> Option<u32> {
-    let config = std::env::var_os("SEQUENCER_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME").map(|base| PathBuf::from(base).join("sequencer"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/sequencer"))
-        })?;
-    let pid: u32 = std::fs::read_to_string(config.join("manager.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Path::new(&format!("/proc/{pid}")).exists().then_some(pid)
 }
 
 /// Presses a chord the way a hand would — mods down, key down, all up in reverse —
@@ -69,8 +51,14 @@ fn release_keys(keys: &[Key]) {
     inject(keys.iter().rev().map(|&key| EmitAction::KeyUp(key)));
 }
 
+/// Sends `actions` through XTEST — on one connection, kept for the whole run: in a Wayland
+/// session KDE asks before letting a connection's keys through, so a connection per tap
+/// could ask per tap.
 fn inject(actions: impl Iterator<Item = EmitAction>) {
-    let mut sink = XTestSink::open().expect("XTEST is usable (ready() said so)");
+    static SINK: Mutex<Option<XTestSink>> = Mutex::new(None);
+    let mut kept = SINK.lock().unwrap_or_else(PoisonError::into_inner);
+    let sink =
+        kept.get_or_insert_with(|| XTestSink::open().expect("XTEST is usable (ready() said so)"));
     for action in actions {
         sink.emit(&Emit {
             at: Timestamp::ZERO,
@@ -80,6 +68,12 @@ fn inject(actions: impl Iterator<Item = EmitAction>) {
         .expect("inject");
         std::thread::sleep(Duration::from_millis(15));
     }
+}
+
+/// Whether this is a Wayland session — the X server is Xwayland — asked of the server once.
+fn on_xwayland() -> bool {
+    static ON_XWAYLAND: OnceLock<bool> = OnceLock::new();
+    *ON_XWAYLAND.get_or_init(sequencer_cli::input::x11::is_xwayland)
 }
 
 /// The injection count once it has stopped moving — a snapshot taken mid-tap would
@@ -100,6 +94,10 @@ fn settled_injections(log: &Path) -> usize {
 }
 
 /// Polls until the log's injection count exceeds `above`, up to `secs`.
+///
+/// It only waits. Never send a trigger again to coax a wait along: a trigger the manager's
+/// grab doesn't catch goes to whatever has focus, and a loop that re-sent one each second
+/// typed F9 into the terminal running the tests, again and again (2026-11-03).
 fn injections_grow(log: &Path, above: usize, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -109,95 +107,6 @@ fn injections_grow(log: &Path, above: usize, secs: u64) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
-}
-
-/// A manager child on the temp config, `-vv` logs and stdout merged into one file.
-/// Dropping it kills anything still running — a leaked manager holds real grabs.
-struct Manager {
-    child: std::process::Child,
-    log: PathBuf,
-}
-
-impl Manager {
-    /// `profile-apply` on `profiles`, considered started once it says it is managing.
-    fn start(config: &TempConfig, profiles: &[&Path]) -> Self {
-        let log = config.dir().join("child.log");
-        let out = std::fs::File::create(&log).expect("log file");
-        let err = out.try_clone().expect("log file handle");
-        let child = Command::new(harness::bin())
-            .args(["profile-apply", "-vv"])
-            .args(profiles)
-            .env("SEQUENCER_CONFIG_DIR", config.dir())
-            .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
-            .stdout(out)
-            .stderr(err)
-            .spawn()
-            .expect("child spawns");
-        let spawned = Self { child, log };
-        assert!(
-            harness::await_line(&spawned.log, "managing", 10),
-            "child never said \"managing\": {}",
-            harness::read(&spawned.log)
-        );
-        spawned
-    }
-
-    fn log(&self) -> &Path {
-        &self.log
-    }
-
-    fn alive(&mut self) -> bool {
-        self.child.try_wait().expect("child state").is_none()
-    }
-
-    fn interrupt(&self) {
-        let pid = i32::try_from(self.child.id()).expect("pid fits");
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGINT,
-        )
-        .expect("SIGINT lands");
-    }
-
-    /// Waits up to `secs` for the child to end on its own.
-    fn ended_within(&mut self, secs: u64) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        while Instant::now() < deadline {
-            if let Some(status) = self.child.try_wait().expect("child state") {
-                return Some(status);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        None
-    }
-}
-
-impl Drop for Manager {
-    fn drop(&mut self) {
-        // This runs on assertion failures too, so: graceful SIGINT first — the
-        // manager's own teardown releases held keys, drops every grab and clears
-        // its state, leaving nothing listening behind a red test — then SIGKILL
-        // only if that is ignored. And never panic: this Drop runs during panics.
-        if !matches!(self.child.try_wait(), Ok(None)) {
-            return;
-        }
-        if let Ok(pid) = i32::try_from(self.child.id()) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGINT,
-            );
-        }
-        for _ in 0..40 {
-            if !matches!(self.child.try_wait(), Ok(None)) {
-                let _ = self.child.wait();
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 // The second bind shares its primary key with the profile's own emergency chord on
@@ -268,6 +177,17 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     if !ready() {
         return;
     }
+    // Under KDE Wayland its keys reach the X server through KWin, with the terminal
+    // focused, and KDE's first-use effects — a permission prompt per injecting client, the
+    // pointer sent to a corner — sent them elsewhere, three runs out of three (developer's
+    // call, 2026-11-03). The window tier's routing check covers that path instead, with
+    // keys only into boxes of its own.
+    if on_xwayland() {
+        eprintln!(
+            "skip: a Wayland session — windows::injected_keys_reach_an_x11_grab_and_the_focused_window covers XTEST here"
+        );
+        return;
+    }
     let config = TempConfig::new();
     let p1 = config.profile("p1.toml", MIRROR);
     let p2 = config.profile("p2.toml", LOOPER);
@@ -303,7 +223,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     tap_chord(&[Key::F9]);
     assert!(
         injections_grow(manager.log(), before, 3),
-        "the bare F9 bind fires on a bare press"
+        "the bare F9 bind fires on a bare press (in a Wayland session: did KDE's prompt go unanswered?)"
     );
 
     let p2_arg = p2.to_str().expect("utf-8 temp path");

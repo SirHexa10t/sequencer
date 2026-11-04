@@ -409,7 +409,19 @@ mod tests {
         }
         // At 250ms apart over 0.3s, at least one sample is due.
         let mut observer = Counting { samples: 0 };
-        let result = run(Some(200.0), 0.3, &mut observer).expect("bench should run");
+        let result = match run(Some(200.0), 0.3, &mut observer) {
+            // A machine can grant /dev/uinput without /dev/input — a uaccess rule rather than
+            // the input group — and then the bench can't read back the device it made, which
+            // is the whole measurement. The live sudo tier runs it with access.
+            Err(BenchError::DevNodes(err)) if err.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping: /dev/uinput is writable here but /dev/input is not, so the \
+                     bench can't read its own device back"
+                );
+                return;
+            }
+            result => result.expect("bench should run"),
+        };
         assert!(
             observer.samples > 0,
             "the run reported no live progress at all"

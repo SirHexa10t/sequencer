@@ -16,6 +16,8 @@
 mod state;
 
 #[cfg(all(feature = "xtest", target_os = "linux"))]
+mod backend;
+#[cfg(all(feature = "xtest", target_os = "linux"))]
 mod manager;
 
 use crate::args::{ProfileApplyArgs, ProfileUnapplyArgs};
@@ -51,6 +53,13 @@ pub fn applied_profiles() -> Vec<(String, std::path::PathBuf)> {
     }
 }
 
+/// Whether a profile manager runs now, asked without competing for its lock: what decides
+/// whether a `profile-apply` will be the manager, or hand its profiles to one.
+#[cfg(all(feature = "xtest", target_os = "linux"))]
+pub(crate) fn manager_running() -> bool {
+    state::current_manager().ok().flatten().is_some()
+}
+
 /// `sequencer profile-apply`.
 ///
 /// Validates every file, links each into the active set — re-linking an applied one,
@@ -84,6 +93,9 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
 
     #[cfg(all(feature = "xtest", target_os = "linux"))]
     {
+        // Session mode's sudo run opens the devices before anything else and is the user
+        // again at once, so nothing of theirs — a link, the lock — is ever written as root.
+        let devices = backend::open_privileged()?;
         refuse_circles_across_the_set(&files, &parsed)?;
 
         // A manager on its way out is about to remove the links it was enforcing, and
@@ -138,7 +150,7 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
                             .map(|name| name.to_string_lossy().into_owned()),
                     })
                     .collect();
-                let outcome = manager::manage(deps.out, lock);
+                let outcome = manager::manage(deps.out, lock, devices);
                 if outcome.is_err() {
                     // The manager never got going (or died on an error), so nothing is
                     // enforcing the links this call just made. Only those: anything
@@ -153,15 +165,16 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
     #[cfg(not(all(feature = "xtest", target_os = "linux")))]
     {
         Err(Error::NotImplemented(
-            "profile-apply runs on X11 only for now, and this build has no X11 backend.".to_owned(),
+            "profile-apply needs the X11 backend, which this build leaves out.".to_owned(),
         ))
     }
 }
 
 /// Refuses the whole apply if the set it would create contains a feedback circle.
 ///
-/// Injections pass through grabs like real presses, and EVERY profile's grabs hear
-/// them — so a circle can span files. The whole future set is checked before anything
+/// Injections pass through grabs like real presses (on X11 today; on the device backend
+/// once its chaining is built, for parity), and EVERY profile's grabs hear them — so a
+/// circle can span files. The whole future set is checked before anything
 /// links: this batch, plus what is already applied (minus the versions this batch
 /// replaces). The manager re-checks at load, for links made by hand.
 #[cfg(all(feature = "xtest", target_os = "linux"))]

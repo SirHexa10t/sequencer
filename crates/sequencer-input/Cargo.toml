@@ -11,11 +11,15 @@ repository.workspace = true
 default = []
 # The device backend: reads /dev/input for capture, writes /dev/uinput for injection.
 # The only one that reaches Wayland and the console. Inert off-Linux: target-gated below.
-evdev = ["dep:evdev"]
+evdev = ["dep:evdev", "dep:rustix"]
 # The X11 backend: XTEST out, passive key grabs in. Needs no device access at all, which
 # is what makes an X11 run require no setup. Shares `linux::keymap`, so it pulls `evdev`
 # in for the tables even though it opens no device.
 xtest = ["dep:x11rb", "dep:evdev"]
+# The live suite's rig (`linux::rig`): a keyboard made through /dev/uinput to type on, and
+# a watch on what sequencer's virtual keyboard sends. Test machinery: only the live suite's
+# helper binary turns it on.
+live-tests = ["evdev"]
 # Reserved so the feature names are stable:
 #   windows -- WH_KEYBOARD_LL hooks + SendInput
 #   macos   -- CGEventTap + CGEventPost
@@ -30,6 +34,7 @@ spin_sleep = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { workspace = true, optional = true }
 x11rb = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "sequencer-cli"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "clap",
  "log",
@@ -298,17 +298,18 @@ dependencies = [
 
 [[package]]
 name = "sequencer-core"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "sequencer-input"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "evdev",
  "log",
+ "rustix",
  "sequencer-core",
  "spin_sleep",
  "thiserror",

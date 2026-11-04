@@ -1,7 +1,8 @@
 //! The live multi-profile manager: one loop owning the sink, the focus watcher, the
 //! emergency grab and every profile in the active set, rescanned live.
 //!
-//! X11-only for now, like the rest of the run path. The on-disk set it manages lives
+//! It runs on whichever backend [`super::backend`] opens at start: the input devices where
+//! it can, X11's key grabs where it must. The on-disk set it manages lives
 //! in [`super::state`]; the per-profile execution it dispatches lives in
 //! [`crate::binds::run`]. Hotkeys never wait on the maintenance cadence: every grab feeds one
 //! shared queue and the loop *blocks* on it, waking the moment a key arrives.
@@ -14,6 +15,7 @@ use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
+use super::backend::{self, Backend, Fallback, Grab};
 use super::state::{LockGuard, scan_active};
 use crate::binds::format::{
     Profile, chord_mods, parse, patterns_apply, primary_key, trigger_cycle,
@@ -21,8 +23,8 @@ use crate::binds::format::{
 use crate::binds::run;
 use crate::runtime::{CapturePump, EventPump, Wake};
 use crate::session::{Focus, Layout};
-use crate::{Error, Result, exit};
-use sequencer_input::{Epoch, GrabCapture, SystemClock, XTestSink};
+use crate::{Result, exit};
+use sequencer_input::{Epoch, SystemClock};
 
 /// Ctrl+C (and SIGTERM) set this; the loop notices within one heartbeat and stops
 /// through the normal teardown.
@@ -83,7 +85,7 @@ const EMPTY_SCANS_TO_STOP: u32 = 2;
 struct Slot {
     profile: Profile,
     held: Vec<Holdable>,
-    capture: Option<GrabCapture>,
+    capture: Option<Grab>,
     /// The grab signatures this slot's capture holds right now — the routing truth:
     /// an event belongs to whoever GRABBED it, never to whoever declares it, which
     /// is what lets a yielded bind's events arrive at its claimant instead.
@@ -227,24 +229,74 @@ fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
         })
 }
 
-/// What the manager says as it starts: where the set lives and how to stop it, and —
-/// in a Wayland session, where the grabs and XTEST go through Xwayland — that native
-/// Wayland apps see only part of what it does, which is the compositor's choice.
-fn announce_start(out: &mut dyn std::io::Write) -> Result<()> {
+/// What the manager says as it starts: where the set lives and how to stop it, what it
+/// runs on — and, when the devices couldn't be used, why, and in a Wayland session that
+/// native Wayland apps then see only part of a profile, through Xwayland.
+fn announce_start(
+    out: &mut dyn std::io::Write,
+    backend: &Backend,
+    fallback: &Fallback,
+) -> Result<()> {
     writeln!(
         out,
         "managing {}; apply/unapply from any shell, Ctrl+C stops everything",
         super::state::active_dir()?.display()
     )?;
-    if crate::session::wayland_session() {
+    if let Some((held, keyboard)) = backend.holding() {
+        for line in holding_lines(held, keyboard) {
+            writeln!(out, "{line}")?;
+        }
+    } else if crate::session::wayland_session() {
+        let why = fallback
+            .as_ref()
+            .map(|why| format!(" ({why})"))
+            .unwrap_or_default();
         writeln!(
             out,
-            "note: this is a Wayland session, so profiles run through Xwayland and native \
-             Wayland apps see only part of them; `sequencer doctor` says which part"
+            "note: this is a Wayland session and the input devices aren't usable{why}, so \
+             profiles run through Xwayland and native Wayland apps see only part of them; \
+             `sequencer doctor` says which part"
         )?;
     }
     out.flush()?;
     Ok(())
+}
+
+/// What a manager on the devices says it holds: each device by name — one keyboard is often
+/// several devices of one name, said once with how many — and, when none is a keyboard, that
+/// nothing typed will reach a profile.
+fn holding_lines(held: &[String], keyboard: bool) -> Vec<String> {
+    let mut lines = vec![format!(
+        "holding: {}; if this manager stops answering, they are given back within a few seconds",
+        counted(held)
+    )];
+    if !keyboard {
+        lines.push(
+            "warning: no keyboard is among them, so no profile hears what is typed; \
+             `sequencer doctor` lists each device and what a manager does with it"
+                .to_owned(),
+        );
+    }
+    lines
+}
+
+/// `names` in order, each said once, with how many there are where there are several.
+fn counted(names: &[String]) -> String {
+    let mut tally: Vec<(&str, usize)> = Vec::new();
+    for name in names {
+        match tally.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
+            Some((_, count)) => *count += 1,
+            None => tally.push((name, 1)),
+        }
+    }
+    tally
+        .iter()
+        .map(|(name, count)| match count {
+            1 => (*name).to_owned(),
+            _ => format!("{name} ×{count}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Runs the active set until it empties out, Ctrl+C (or SIGTERM), or a fatal error.
@@ -252,39 +304,45 @@ fn announce_start(out: &mut dyn std::io::Write) -> Result<()> {
 /// Everything user-visible goes through `out`, line per event: profiles appearing,
 /// leaving, activating, going dormant, being refused. The lock lives until the
 /// loop's [`Enforcement`] lets it go, which every exit reaches — a panic included.
-pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8> {
-    if !sequencer_input::x11::is_usable() {
-        return Err(Error::NotImplemented(
-            "the profile manager needs an X11 session for now: it hears triggers by \
-             key grab and injects through XTEST."
-                .to_owned(),
-        ));
-    }
+pub(super) fn manage(
+    out: &mut dyn std::io::Write,
+    lock: LockGuard,
+    devices: backend::Preopened,
+) -> Result<u8> {
     let epoch = Epoch::start();
     let clock = SystemClock::from_epoch(epoch.instant());
-    // Everything the loop must let go of on its way out, whichever way out it takes.
-    let mut enforcement = Enforcement::new(
-        &clock,
-        XTestSink::open()?,
-        super::state::config_dir()?,
-        lock,
-    );
-    let mut rng = Rng::new(wall_seed());
     // Every grab — each profile's, and the emergency union — feeds this one queue,
     // so the loop below can block on all of them at once.
     let (queue, stream) = sequencer_input::CaptureStream::channel(256);
+    // The devices where they open, X11 grabs where they don't. Declared before what it
+    // feeds, so it is the last thing let go of — a panic included. Its X11 form also
+    // answers "is that key still down?" and taps between lifted modifiers.
+    let (mut backend, sink, fallback) = backend::open(&epoch, &queue, devices)?;
+    // Everything the loop must let go of on its way out, whichever way out it takes.
+    let mut enforcement = Enforcement::new(&clock, sink, super::state::config_dir()?, lock);
+    let mut rng = Rng::new(wall_seed());
+    // A grab's supervisor gives the keyboards back when the beats stop; a beat it no
+    // longer hears ends the run, and says why.
+    let given_back = std::cell::Cell::new(false);
+    #[cfg_attr(
+        not(feature = "evdev"),
+        allow(unused_mut, reason = "only a device grab beats")
+    )]
     let mut pump = CapturePump::new(stream, &clock);
+    #[cfg(feature = "evdev")]
+    if backend.is_devices() {
+        pump = pump.beating(sequencer_input::linux::supervise::BEAT_EVERY, || {
+            let heard = backend.beat();
+            given_back.set(!heard);
+            heard
+        });
+    }
     let mut focus: Option<Focus> = None;
     let mut layout: Option<Layout> = None;
-    // One live connection for "is that key still down?" — the deferred-tap question.
-    let probe = sequencer_input::KeyProbe::open();
-    // Contaminated mirrors tap between lifted modifiers — this owns that path;
-    // without it they fall back to plain (recolourable) injection.
-    let lifter = sequencer_input::LiftedTap::open();
     let mut passes: u32 = 0;
     let mut empty_scans: u32 = 0;
 
-    announce_start(out)?;
+    announce_start(out, &backend, &fallback)?;
 
     catch_interrupts();
     let mut next_maintenance = clock.now();
@@ -298,6 +356,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                 out,
                 &epoch,
                 &queue,
+                &backend,
                 &mut enforcement.sink,
                 &clock,
                 &mut enforcement.slots,
@@ -339,8 +398,7 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                     &mut rng,
                     &mut pump,
                     &mut enforcement.slots,
-                    probe.as_ref(),
-                    lifter.as_ref(),
+                    &backend,
                     focus.as_ref(),
                     layout.as_ref(),
                 ) {
@@ -348,14 +406,22 @@ pub(super) fn manage(out: &mut dyn std::io::Write, lock: LockGuard) -> Result<u8
                 }
             }
             Wake::Deadline => {}
+            Wake::Interrupted if given_back.get() => {
+                break Ok(
+                    "the supervisor gave the keyboards back while this manager was not answering",
+                );
+            }
             Wake::Interrupted => break Ok("event sources closed"),
         }
     };
 
     let cleared = enforcement.stop();
+    let stuck = backend.stuck();
+    drop(pump);
+    backend.stop();
     let reason = outcome?;
     if !lost_terminal() {
-        report_stopped(out, reason, cleared, probe.as_ref())?;
+        report_stopped(out, reason, cleared, &stuck)?;
     }
     Ok(exit::OK)
 }
@@ -366,7 +432,7 @@ fn report_stopped(
     out: &mut dyn std::io::Write,
     reason: &str,
     cleared: usize,
-    probe: Option<&sequencer_input::KeyProbe>,
+    stuck: &[Mods],
 ) -> Result<()> {
     // A caught Ctrl+C already echoed `^C` and left the cursor mid-line; start clean.
     let lead = if reason == "interrupted" { "\n" } else { "" };
@@ -374,7 +440,7 @@ fn report_stopped(
         out,
         "{lead}stopped ({reason}); {cleared} profile(s) unapplied — nothing is enforced now"
     )?;
-    if let Some(note) = stuck_modifier_note(probe) {
+    if let Some(note) = stuck_modifier_note(stuck) {
         writeln!(out, "{note}")?;
     }
     out.flush()?;
@@ -396,13 +462,12 @@ fn report_stopped(
 fn dispatch(
     out: &mut dyn std::io::Write,
     event: sequencer_core::input::InputEvent,
-    sink: &mut XTestSink,
+    sink: &mut dyn InputSink,
     clock: &SystemClock,
     rng: &mut Rng,
     pump: &mut CapturePump<'_>,
     slots: &mut BTreeMap<String, Slot>,
-    probe: Option<&sequencer_input::KeyProbe>,
-    lifter: Option<&sequencer_input::LiftedTap>,
+    backend: &Backend,
     focus: Option<&Focus>,
     layout: Option<&Layout>,
 ) -> Result<()> {
@@ -453,21 +518,20 @@ fn dispatch(
             lang.as_deref(),
         )
     };
-    // A deferred tap asks the server whether the trigger's modifiers are still
-    // physically down; with no probe the answer is "no" and taps fire immediately.
-    let mods_down_fn =
-        move |mods: Mods| probe.is_some_and(|probe| probe.any_down(&mods.watch_keys()));
-    // Same server, single key: the wait a tap owes when its target re-presses the
+    // A deferred tap asks the backend whether the trigger's modifiers are still
+    // physically down; with no X probe the answer is "no" and taps fire immediately.
+    let mods_down_fn = move |mods: Mods| backend.any_down(&mods.watch_keys());
+    // The same question, single key: the wait a tap owes when its target re-presses the
     // trigger's own key.
-    let key_down_fn = move |key: Key| probe.is_some_and(|probe| probe.any_down(&[key]));
+    let key_down_fn = move |key: Key| backend.any_down(&[key]);
     // A tap whose trigger holds classes its target does not name fires between
     // lifted modifiers: the standing keys come up, the tap lands clean, and the
-    // hand's keys go back down — one backend call on one connection.
+    // hand's keys go back down — one backend call, one connection or one device.
     let lift_fn = move |targets: &[Holdable],
                         held: Mods,
                         primary: Option<Key>,
                         hold: sequencer_core::time::Duration| {
-        lifter.is_some_and(|lifter| lifter.tap(targets, held, primary, hold))
+        backend.tap_lifted(targets, held, primary, hold)
     };
     let stops = slot.stop_chords();
     let mut pumps = run::Pumps {
@@ -518,8 +582,7 @@ fn licensed(
 ///
 /// Worth saying precisely because the ledger already ran: whatever is left is not ours
 /// to release, and the user's next chord would silently carry it.
-fn stuck_modifier_note(probe: Option<&sequencer_input::KeyProbe>) -> Option<String> {
-    let stuck = probe?.snapshot()?.stuck();
+fn stuck_modifier_note(stuck: &[Mods]) -> Option<String> {
     if stuck.is_empty() {
         return None;
     }
@@ -595,7 +658,7 @@ struct Enforcement<'a, S: InputSink> {
     /// Refused links, with the stamp they were refused at: a re-apply replaces the
     /// link, and the changed stamp is what earns a retry.
     failed: BTreeMap<String, Option<std::time::SystemTime>>,
-    emergency: Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
+    emergency: Option<(BTreeSet<Vec<Key>>, Grab)>,
     /// The configuration directory, resolved once at start: the set's links and the
     /// stopping marker live under it, and a teardown must not depend on re-reading
     /// the environment.
@@ -664,7 +727,7 @@ fn teardown(
     sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
+    emergency: &mut Option<(BTreeSet<Vec<Key>>, Grab)>,
 ) {
     for (_, mut slot) in std::mem::take(slots) {
         if let Some(mut capture) = slot.capture.take() {
@@ -688,11 +751,12 @@ fn rescan(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
     queue: &sequencer_input::EventQueue,
+    backend: &Backend,
     sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
+    emergency: &mut Option<(BTreeSet<Vec<Key>>, Grab)>,
     focus: &mut Option<Focus>,
     layout: &mut Option<Layout>,
     rescan_dir: bool,
@@ -700,12 +764,13 @@ fn rescan(
     if rescan_dir {
         reconcile_set(out, clock, sink, slots, failed)?;
     }
-    reconcile_emergency(out, epoch, queue, slots, emergency);
+    reconcile_emergency(out, epoch, queue, backend, slots, emergency);
     ensure_watchers(out, slots, focus, layout)?;
     reconcile_activation(
         out,
         epoch,
         queue,
+        backend,
         sink,
         clock,
         slots,
@@ -724,8 +789,9 @@ fn reconcile_emergency(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
     queue: &sequencer_input::EventQueue,
+    backend: &Backend,
     slots: &BTreeMap<String, Slot>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, GrabCapture)>,
+    emergency: &mut Option<(BTreeSet<Vec<Key>>, Grab)>,
 ) {
     let wanted: BTreeSet<Vec<Key>> = slots
         .values()
@@ -743,7 +809,7 @@ fn reconcile_emergency(
     }
     if !wanted.is_empty() {
         let chords: Vec<Vec<Key>> = wanted.iter().cloned().collect();
-        match GrabCapture::start_into(epoch, &chords, queue.clone()) {
+        match backend.grab(epoch, &chords, queue) {
             Ok(capture) => *emergency = Some((wanted, capture)),
             Err(err) => {
                 let _ = writeln!(out, "emergency-stop grab failed: {err}");
@@ -799,6 +865,7 @@ fn reconcile_activation(
     out: &mut dyn std::io::Write,
     epoch: &Epoch,
     queue: &sequencer_input::EventQueue,
+    backend: &Backend,
     sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
@@ -882,7 +949,7 @@ fn reconcile_activation(
             slot.yielded = claim.yielded;
             continue;
         }
-        match GrabCapture::start_into(epoch, &claim.chords, queue.clone()) {
+        match backend.grab(epoch, &claim.chords, queue) {
             Ok(capture) => {
                 slot.capture = Some(capture);
                 slot.grabbed = claim.sigs;
@@ -1039,6 +1106,29 @@ mod tests {
 
     fn profile(text: &str) -> Profile {
         parse(text).expect("test profile parses")
+    }
+
+    /// A manager on the devices names what it holds, one keyboard's several devices said
+    /// once; holding no keyboard, it says nothing typed will reach a profile, and where to
+    /// look.
+    #[test]
+    fn a_manager_names_what_it_holds() {
+        let held = ["Office Keyboard", "Video Bus", "Office Keyboard"].map(String::from);
+        let lines = holding_lines(&held, true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("holding: Office Keyboard ×2, Video Bus; "),
+            "{}",
+            lines[0]
+        );
+        let no_keyboard = holding_lines(&["Video Bus".to_owned()], false);
+        assert_eq!(no_keyboard.len(), 2, "{no_keyboard:?}");
+        assert!(
+            no_keyboard[1].starts_with("warning: no keyboard is among them")
+                && no_keyboard[1].contains("`sequencer doctor`"),
+            "{}",
+            no_keyboard[1]
+        );
     }
 
     /// A gated profile acts only on readings that match — every gate it declares.

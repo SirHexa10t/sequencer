@@ -189,6 +189,24 @@ impl Requirement {
         }
     }
 
+    /// Whether root could meet it where this user can't: a permission, as against something
+    /// missing outright. sudo is worth asking for — and worth promising — only when every
+    /// unmet requirement is one of these.
+    ///
+    /// A missing `/dev/uinput` is the one root can't meet: it opens every keyboard, but makes
+    /// no virtual one without the node, and loading kernel modules is not something this
+    /// program does. (The node's being writable is a permission: where the node is missing,
+    /// [`Self::UinputModuleLoaded`] is unmet as well.) Nor can root read a keyboard whose
+    /// node is missing, as inside a container that sees the host's sysfs — a case left to
+    /// fail after the password, rather than worth a check of its own.
+    #[must_use]
+    pub const fn root_can_meet(self) -> bool {
+        match self {
+            Self::UinputModuleLoaded => false,
+            Self::UinputNodeWritable | Self::EvdevReadable => true,
+        }
+    }
+
     /// How to satisfy it.
     ///
     /// One flat match, deliberately: keeping every requirement's advice in a single
@@ -258,33 +276,6 @@ fn check_writable(path: &'static str) -> CheckResult {
     }
 }
 
-/// Whether a device reporting these key codes is a keyboard: it has every code from 1
-/// (`KEY_ESC`) to 31 (`KEY_S`) — Escape, the digit row, Q to P, A and S.
-///
-/// The rule udev's `input_id` builtin uses for `ID_INPUT_KEYBOARD`. Power buttons, media
-/// remotes, mice and game pads report key codes too, but never all of these, and a
-/// keyboard always does.
-pub(crate) fn is_keyboard(has_key: impl Fn(u16) -> bool) -> bool {
-    (1..=31).all(has_key)
-}
-
-/// [`is_keyboard`], asked of a device's `capabilities/key` bitmap in sysfs.
-///
-/// The kernel prints the bitmap as hexadecimal words, most significant first, leaving out
-/// leading zero words (`input_print_bitmap`), so the last word always holds codes 0-63 —
-/// all [`is_keyboard`] looks at. A 32-bit kernel prints 32-bit words, which still covers
-/// codes 1-31.
-fn caps_describe_a_keyboard(caps: &str) -> bool {
-    let Some(low) = caps
-        .split_whitespace()
-        .last()
-        .and_then(|word| u64::from_str_radix(word, 16).ok())
-    else {
-        return false;
-    };
-    is_keyboard(|code| (low >> code) & 1 == 1)
-}
-
 /// A keyboard device in `/dev/input`, and whether this process could open it.
 #[derive(Debug)]
 struct KeyboardNode {
@@ -302,37 +293,19 @@ struct KeyboardNode {
 /// user the game pads passed the old any-device check, so `detect-key` never asked for
 /// sudo and listened to the pads alone.)
 fn check_evdev_readable() -> CheckResult {
-    let Ok(entries) = std::fs::read_dir("/dev/input") else {
-        return CheckResult::Fail("/dev/input cannot be listed".into());
-    };
-    let mut keyboards = Vec::new();
-    for entry in entries.flatten() {
-        let Some(node) = entry
-            .file_name()
-            .to_str()
-            .filter(|name| name.starts_with("event"))
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        // sysfs describes every device, readable or not, which is what lets a keyboard
-        // this process cannot open still be named.
-        let sysfs = Path::new("/sys/class/input").join(&node).join("device");
-        let caps = std::fs::read_to_string(sysfs.join("capabilities/key")).unwrap_or_default();
-        if !caps_describe_a_keyboard(&caps) {
-            continue;
-        }
-        let name = std::fs::read_to_string(sysfs.join("name"))
-            .map_or_else(|_| node.clone(), |name| name.trim().to_owned());
-        let refused = std::fs::File::open(entry.path())
-            .err()
-            .map(|err| err.to_string());
-        keyboards.push(KeyboardNode {
-            name,
-            node,
-            refused,
-        });
-    }
+    // sysfs describes every device, readable or not, which is what lets a keyboard this
+    // process cannot open still be named.
+    let keyboards = crate::devices::list()
+        .into_iter()
+        .filter(|device| device.capabilities.is_keyboard())
+        .map(|device| KeyboardNode {
+            refused: std::fs::File::open(device.path())
+                .err()
+                .map(|err| err.to_string()),
+            name: device.name,
+            node: device.node,
+        })
+        .collect();
     keyboards_verdict(keyboards)
 }
 
@@ -343,7 +316,7 @@ fn keyboards_verdict(mut keyboards: Vec<KeyboardNode>) -> CheckResult {
     if keyboards.is_empty() {
         return CheckResult::Fail("no keyboard found among the input devices".into());
     }
-    keyboards.sort_by_key(|keyboard| node_number(&keyboard.node));
+    keyboards.sort_by_key(|keyboard| crate::devices::node_number(&keyboard.node));
     let total = keyboards.len();
     let mut refusals: Vec<(String, String, Vec<String>)> = Vec::new();
     for keyboard in keyboards {
@@ -370,12 +343,6 @@ fn keyboards_verdict(mut keyboards: Vec<KeyboardNode>) -> CheckResult {
     CheckResult::Fail(format!(
         "{unreadable} of {total} keyboard devices cannot be read — {named}"
     ))
-}
-
-/// `event<N>`'s number, so the report lists devices in the kernel's order rather than
-/// the directory's (`event10` after `event9`, not after `event1`).
-fn node_number(node: &str) -> u32 {
-    node.trim_start_matches("event").parse().unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -414,30 +381,20 @@ mod tests {
         assert!(INPUT_GROUP_CAUTION.contains("keylogging"));
     }
 
-    /// What the kernel prints for an AT keyboard, a mouse, a power button and a game pad:
-    /// only the keyboard has every code from Escape to S.
+    /// sudo is asked for only where root meets what this user can't: the permissions. A
+    /// missing `/dev/uinput` is beyond root too, so a password would buy nothing there.
     #[test]
-    fn only_a_full_key_set_describes_a_keyboard() {
-        assert!(caps_describe_a_keyboard(
-            "402000000 3803078f800d001 feffffdfffefffff fffffffffffffffe\n"
-        ));
-        assert!(!caps_describe_a_keyboard("ff0000 0 0 0 0"), "a mouse");
+    fn root_can_meet_the_permissions_and_nothing_else() {
         assert!(
-            !caps_describe_a_keyboard("10000000000000 0"),
-            "a power button"
+            !Requirement::UinputModuleLoaded.root_can_meet(),
+            "root can't create /dev/uinput"
         );
-        assert!(
-            !caps_describe_a_keyboard("7cdb000000000000 0 0 0 0"),
-            "a game pad"
-        );
-        assert!(!caps_describe_a_keyboard("0"), "no keys at all");
-        assert!(!caps_describe_a_keyboard(""), "an unreadable sysfs file");
-        assert!(
-            caps_describe_a_keyboard("ffffffff fffffffe"),
-            "a 32-bit kernel's words still cover codes 1-31"
-        );
-        // One key short of the set is not a keyboard: KEY_S (31) missing.
-        assert!(!caps_describe_a_keyboard("7ffffffe"));
+        for requirement in [Requirement::UinputNodeWritable, Requirement::EvdevReadable] {
+            assert!(
+                requirement.root_can_meet(),
+                "{requirement:?} is a permission"
+            );
+        }
     }
 
     fn keyboard(name: &str, node: &str, refused: Option<&str>) -> KeyboardNode {
@@ -454,9 +411,9 @@ mod tests {
     fn an_unreadable_keyboard_fails_the_check_and_is_named() {
         let denied = "Permission denied (os error 13)";
         let verdict = keyboards_verdict(vec![
-            keyboard("Corsair K95 Keyboard", "event10", Some(denied)),
-            keyboard("Corsair K95 Keyboard", "event9", Some(denied)),
-            keyboard("G502 Keyboard", "event5", Some(denied)),
+            keyboard("Office Keyboard", "event10", Some(denied)),
+            keyboard("Office Keyboard", "event9", Some(denied)),
+            keyboard("Gaming Mouse Keyboard", "event5", Some(denied)),
         ]);
         let CheckResult::Fail(detail) = verdict else {
             panic!("unreadable keyboards must fail the check: {verdict:?}");
@@ -466,12 +423,12 @@ mod tests {
             "{detail}"
         );
         assert!(
-            detail.contains("G502 Keyboard (event5)")
-                && detail.contains("Corsair K95 Keyboard (event9, event10)"),
+            detail.contains("Gaming Mouse Keyboard (event5)")
+                && detail.contains("Office Keyboard (event9, event10)"),
             "{detail}"
         );
         assert!(
-            detail.find("G502").unwrap() < detail.find("Corsair").unwrap(),
+            detail.find("Gaming Mouse").unwrap() < detail.find("Office").unwrap(),
             "kernel order: event5 comes first: {detail}"
         );
     }

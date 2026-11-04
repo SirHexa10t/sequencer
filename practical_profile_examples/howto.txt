@@ -10,9 +10,9 @@ sequencer profile-apply practical_profile_examples/mpv_music_player_like_youtube
 sequencer profile-apply practical_profile_examples/browser_behavior_for_terminal.toml practical_profile_examples/chromium_extra_keys.toml
 
 # alternatively, to load all .toml files within a given dir (non-recursive), just pass the dir as an arg:
-pro_run profile-apply practical_profile_examples/
+sequencer profile-apply practical_profile_examples/
 
 
 # to quit: 
-# * stop the manager through PID or in first run's terminal, with SIGTERM (CTRL+C)
+# * stop the manager through PID or in first run's terminal, with SIGTERM or SIGINT (CTRL+C)
 # * alternatively, press `ctrl+shift+e` to quit them (these example profiles all declare the same `emergency_stop`)

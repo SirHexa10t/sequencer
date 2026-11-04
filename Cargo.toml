@@ -6,9 +6,9 @@ members = ["crates/*"]
 default-members = ["crates/sequencer-cli"]
 
 [workspace.package]
-# 0.x: the X11 half is done properly; other display stacks (Wayland, and the reserved
-# windows/macos feature names) are the road to 1.0.
-version = "0.7.1"
+# 0.x: X11 is done properly, and Wayland through the input devices (checked live on KDE
+# Plasma); the other display stacks — Windows, macOS — are the road to 1.0.
+version = "0.8.0"
 edition = "2024"
 # Let-chains (`if ... && let ...`) are used, and those need 1.88.
 rust-version = "1.88"
@@ -19,8 +19,8 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/SirHexa10t/sequencer"
 
 [workspace.dependencies]
-sequencer-core = { version = "0.7.1", path = "crates/sequencer-core" }
-sequencer-input = { version = "0.7.1", path = "crates/sequencer-input", default-features = false }
+sequencer-core = { version = "0.8.0", path = "crates/sequencer-core" }
+sequencer-input = { version = "0.8.0", path = "crates/sequencer-input", default-features = false }
 
 thiserror = { version = "2", default-features = false }
 clap = { version = "4", default-features = false }
@@ -52,6 +52,13 @@ signal-hook = { version = "0.4", default-features = false }
 # of two. Nothing this code calls changed between the two (checked 2026-09-30 against
 # both changelogs and a full test run on each). Move it when evdev moves.
 nix = { version = "0.29", default-features = false }
+# Handing grabbed devices to the supervisor process: SCM_RIGHTS over a socket. nix 0.29
+# returns received descriptors as raw numbers, and owning one is `unsafe`; rustix returns
+# `OwnedFd`s, so the workspace stays free of unsafe code. Already in the tree through
+# x11rb (2026-11-03), so this adds no package — only its `net` module to the build.
+# `event` is there because `net`'s socket options use rustix's time conversions and,
+# in 1.1.5, don't turn them on themselves; x11rb enables `event` anyway.
+rustix = { version = "1.1", default-features = false, features = ["std", "net", "event"] }
 
 
 [workspace.lints.rust]

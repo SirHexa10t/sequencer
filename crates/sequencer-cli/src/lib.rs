@@ -88,8 +88,13 @@ mod elevate;
 // Colour for the profile commands' output; there is none without the command line.
 #[cfg(feature = "cli")]
 mod style;
+// A run of this program as a device grab's supervisor, routed from `main`.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+mod supervisor;
 #[cfg(feature = "cli")]
 pub use elevate::run_with_sudo_prompt;
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+pub use supervisor::{SUPERVISOR_MARKER, supervise_if_asked};
 
 #[cfg(feature = "cli")]
 mod args;

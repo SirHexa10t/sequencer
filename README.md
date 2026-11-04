@@ -26,9 +26,12 @@ gap = "50ms"
 seq = ["mouse1"]                  # a left click every 50 ms
 ```
 
-Profiles run on X11 for now. [Applying a binds profile](#applying-a-binds-profile) covers
-applying, stacking and stopping them; `example_profile.toml` documents every field and
-step.
+Profiles run on Linux, in X11 and Wayland sessions: on the input devices themselves where
+they can be opened, which makes a profile whole in either, and on X11's key grabs where
+they can't. [How it reaches the screen](#how-it-reaches-the-screen) says what each costs;
+[Applying a binds profile](#applying-a-binds-profile) covers applying, stacking and
+stopping them; `example_profile.toml` documents every field and step, and
+`practical_profile_examples/` holds a few profiles for real use.
 
 ## Features
 
@@ -40,11 +43,20 @@ step.
   sink that gives up mid-sequence. The profile manager has the same guard one level up:
   a panic in its loop releases every key, frees its grabs and unapplies what it was
   enforcing, exactly as Ctrl+C does.
-- **Nothing to set up on X11.** `profile-apply` is an ordinary X client: no group to
-  join, no device to open, no password. What does read the devices (`detect-key`,
-  `bench`) can borrow sudo for a single run rather than making you widen what every
-  program on the machine can do.
-- **`doctor`** reports what setup is missing and the exact commands to fix it.
+- **Whole profiles on Wayland.** Holding the input devices, a profile hears every trigger
+  and keeps it from every app, native Wayland ones included — not only the keys the
+  compositor would pass to X11 apps.
+- **Your keyboards always come back.** A supervisor process holds every device grab and
+  gives the keyboards back if the manager stops answering for two seconds, at once if it
+  dies — tested live, `kill -9` included.
+- **Out of the way at the lock screen.** While the screen is locked, profiles pause and
+  every key goes through as typed, so a password reaches the lock screen untouched.
+- **Nothing to configure.** What needs the devices borrows sudo for that one run — root
+  is dropped the moment they are open — rather than widening what every program on the
+  machine can do; and where the devices can't be had, profiles fall back to X11's grabs,
+  which need no permission at all.
+- **`doctor`** reports what setup is missing and the exact commands to fix it, and which
+  input devices a profile would hold.
 - **`bench`** measures what the machine really delivers, by reading its own virtual device
   back rather than trusting its own send count.
 - **`profile-apply`** applies a binds file — key remaps and key-triggered sequences —
@@ -59,29 +71,59 @@ Two backends, each serving the commands that need it:
 
 | | Out | In | Needs | Used by |
 |---|---|---|---|---|
-| **X11** | XTEST | passive key grabs | nothing | `profile-apply` |
-| **devices** | `/dev/uinput` | `/dev/input` | device access — see [Setup](#setup) | `detect-key` (reads only), `bench` |
+| **devices** | a virtual device, through `/dev/uinput` | `/dev/input`: held for profiles, only read by `detect-key` | device access — sudo for one run, or a standing setup; see [Setup](#setup) | `profile-apply` (first choice), `detect-key`, `bench` |
+| **X11** | XTEST | passive key grabs | an X server | `profile-apply`, where the devices can't be opened |
 
-Whether there is an X server is decided by trying to connect to one — not by reading
-`$DISPLAY`, which survives the session that set it. `sequencer doctor` prints the answer
-as its `backend:` line.
+`sequencer doctor` prints which one profiles get, as its `backend:` line. Whether there is
+an X server is decided by trying to connect to one — not by reading `$DISPLAY`, which
+survives the session that set it.
 
-**The X11 path is the reason there is no setup step on X11.** It is an ordinary X client:
-it opens no device, so there is no group to join and nothing for sudo to do. It also sits
-*above* libinput, which is where a display server's own automation API lives — the layer
-`xdotool` and pynput use.
+**The device path sits below every display server**, so it reaches X11, Wayland and the
+console alike. For a profile it holds every device that sends keys — keyboards, a mouse's
+keyboard interface (where the mouse's own macros type), macro pads, media, volume and
+brightness keys — and types what no profile claims straight back out through one virtual
+keyboard, so a trigger is kept from every application and everything else arrives as
+typed. Left alone, each for its own reason: mice and pointing sticks, until mouse buttons
+can be triggers; touchpads, tablets, touchscreens, game controllers and motion sensors,
+which would lose their own handling to a stand-in (palm detection, gestures, games reading
+controllers directly); devices that also report switches, such as a lid; devices nothing
+in the session reads; and power and sleep buttons, which are logind's. Which device is
+which follows udev's own rules, and `doctor` lists every device with its verdict.
 
-**The device path sits below every display server**, so it reaches Wayland and the
-console too. Its cost is the permission, and that everything written passes through
-libinput on the way up to an application — and libinput is fussy about what it will route.
-That is not a small detail; see [Rate ceiling](#rate-ceiling).
+A program sitting between you and your keyboard must never trap it, so the grab is made
+safe three ways. Every grab is taken and held by a supervisor process — the same
+program, run again — which gives the devices back if the manager stops answering for two
+seconds, and at once if it dies. A device is taken only once no key is held on it, since a
+key held across the grab would stay down in the session for good. And sequencer's own
+virtual devices are never taken, so nothing it types comes back as your input. While the
+screen is locked — logind's `LockedHint`, which KDE's and GNOME's lockers set — profiles
+pause and every key goes through as typed.
+
+Its costs are three. The permission: in a Wayland session `profile-apply` asks sudo for
+the one run and drops root before it writes anything; in an X11 session it never asks, and
+uses the devices only where you already have access. The hardware it started with: devices
+are opened once, so a keyboard plugged in later — or one that comes back from a suspend as
+a new device — types as usual, without profiles, until the manager runs again. And
+libinput: everything written passes through it on the way up to an application, and it is
+fussy about what it will route. That is not a small detail; see
+[Rate ceiling](#rate-ceiling).
+
+**The X11 path is the fallback, and needs nothing.** It is an ordinary X client: it opens
+no device, so there is no group to join and nothing for sudo to do. It also sits *above*
+libinput, which is where a display server's own automation API lives — the layer
+`xdotool` and pynput use. On X11 it makes a profile whole. In a Wayland session it runs
+through Xwayland, and native Wayland apps see only part of a profile: while one has focus,
+a trigger fires only on the keys the compositor passes to X11 apps, and a bound key still
+reaches the app. The manager says so when it starts that way, and `doctor` says what holds
+on the machine at hand.
 
 ## Setup
 
-A Rust toolchain to build. For profiles that is the whole list; `detect-key`'s exact mode
-and `bench` also need some way to reach the input devices. No system libraries, no `-dev`
-packages, no BIOS settings — `x11rb` speaks the X protocol itself rather than linking
-`libX11`.
+A Rust toolchain to build. `detect-key`'s exact mode, `bench` and a whole profile in a
+Wayland session also need some way to reach the input devices — `sudo` for one run is
+enough. No system libraries, no `-dev` packages, no BIOS settings: `x11rb` speaks the X
+protocol itself rather than linking `libX11`, and the questions put to KWin, KDE's
+keyboard service and logind go over a D-Bus client of the project's own.
 
 ### 1. Rust
 
@@ -100,31 +142,40 @@ cd sequencer
 cargo build --release
 ```
 
-The binary lands at `target/release/sequencer`.
+The binary lands at `target/release/sequencer`. To build it and put it on your `PATH` in
+one go — in `~/.cargo/bin`, which rustup's installer already added:
 
-### 3. Input device access — for `detect-key` and `bench`
+```sh
+cargo install --locked --path crates/sequencer-cli
+```
 
-**Profiles need nothing here.** Skip to [How to run](#how-to-run); `profile-apply` goes
-through the X server and opens no device. This section is for `detect-key`, which reads
-the input devices for exact answers, and `bench`, which writes a virtual one and reads it
-back.
+### 3. Input device access
 
-Two ways, and they trade off against each other. `sequencer doctor` tells you where you
-stand either way.
+`detect-key` reads the input devices for exact answers, `bench` writes a virtual one and
+reads it back, and a profile holds the keyboards and types through a virtual one. Two ways
+to reach them, and they trade off against each other. `sequencer doctor` tells you where
+you stand either way.
 
-**Per run (no setup).** Just run `sequencer detect-key` or `sequencer bench`. When the
-devices are needed but not reachable and you are at a terminal, it explains itself and asks for your password via sudo — for
-that run only. Root lasts exactly as long as opening the devices takes; the process then
-drops back to your user and runs the whole session unprivileged. Nothing persists after it
-exits, and no other program gains anything at any point. A sudo ticket the run created is
-revoked afterwards; one you already had is left alone. Pipelines are never prompted —
-without a terminal the run fails with these instructions instead.
+**Per run (no setup).** Just run the command. When the devices are needed but not
+reachable and you are at a terminal, it explains itself and asks for your password via
+sudo — for that run only. Root lasts exactly as long as opening the devices takes; the
+process then drops back to your user and runs the whole session unprivileged. Nothing
+persists after it exits, and no other program gains anything at any point. A sudo ticket
+the run created is revoked afterwards; one you already had is left alone. Pipelines are
+never prompted: without a terminal, `detect-key` and `bench` fail with these instructions
+instead, and a profile runs on X11's grabs. Nor is a password asked for that couldn't
+help: where `/dev/uinput` doesn't exist, root can't make a virtual device either, so
+`bench` fails with the fix and a profile runs on X11's grabs until the module is loaded.
+
+`profile-apply` asks only in a Wayland session, and only the run that becomes the
+manager: on X11 the X server's own grabs make a profile whole without the devices, and a
+later `profile-apply` just hands its file to the manager already running.
 
 **Standing (no password, ever).** `sequencer doctor` prints the exact commands for whatever
 your machine is missing. In full:
 
 ```sh
-# The uinput module, for creating the virtual device `bench` measures with.
+# The uinput module, for creating virtual devices.
 sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf     # persist across reboots
 
@@ -155,6 +206,8 @@ Only for contributing; CI installs its own copies.
 cargo install cargo-hack   # checks every feature combination compiles
 cargo install cargo-deny   # licence and advisory checks
 ```
+
+The live suite's window tests also need KDE's `kdialog`; see [Development](#development).
 
 ## How to run
 
@@ -211,22 +264,38 @@ indistinguishable from `8`.
 sequencer doctor
 ```
 
-Reports the session and what profiles run on (in a Wayland session, also what native
-Wayland apps see of them), who answers which program has focus and which layout is active,
-and each device requirement (`detect-key` and `bench` read the devices), with the exact fix
-for anything failing. Exit code `0` when the
-checks pass, `1` otherwise — and on X11 that is `0` even with every device check failing,
-because profiles do not touch the devices. From a container with no input devices and no
-X server, up to the first of its three fixes:
+Reports the session; what profiles run on — the devices, as you or through sudo, or X11's
+grabs, and in a Wayland session without the devices, what native Wayland apps then miss;
+who answers which program has focus and which layout is active; the X server's keyboard
+state; and each device requirement, with the exact fix for anything failing. Then every
+input device the kernel lists and what a profile manager does with it — holds it, or
+leaves it alone and why — asked of sysfs, so that it needs no access to the devices.
+
+Exit code `0` when the checks pass, `1` otherwise — except where profiles still run
+without them, through sudo or on X11's grabs: there a failing device check is advice, and
+the exit code stays `0`. The `backend:` line promises sudo only where root could open the
+devices, which a missing `/dev/uinput` rules out. From a container — no X server, and sysfs lists the host's devices while
+`/dev` has no nodes for them — with the device names made generic, up to the first of its
+three fixes:
 
 ```
-sequencer 0.7.1  (linux x86_64)
+sequencer 0.8.0  (linux x86_64)
 session: Linux virtual terminal
-backend: none — profiles need an X server, and none answered
+backend: none — profiles need the input devices, which need setting up first (see below), or an X server, and none answered
 
 [fail] uinput kernel module: /dev/uinput does not exist
 [fail] /dev/uinput writable: /dev/uinput: No such file or directory (os error 2)
-[fail] /dev/input keyboards readable: /dev/input cannot be listed
+[fail] /dev/input keyboards readable: 2 of 2 keyboard devices cannot be read — Wireless Mouse Keyboard (event5): No such file or directory (os error 2); Office Keyboard (event6): No such file or directory (os error 2)
+
+input devices — what a profile manager holds:
+  held  USB Audio Device (event2): keys
+  held  Video Bus (event3): keys
+  held  Wireless Mouse Keyboard (event5): a keyboard
+  held  Office Keyboard (event6): a keyboard
+  left  Power Button (event0, event1): a power or sleep button — logind's
+  left  Wireless Mouse (event4): a mouse — not held yet, so its buttons can't be triggers
+  left  Office Keyboard Mouse (event9): a mouse — not held yet, so its buttons can't be triggers
+  16 more send no keys (-v lists them)
 
 The uinput kernel module is not loaded
   Injecting input below the display server needs /dev/uinput, which the uinput module provides.
@@ -235,7 +304,9 @@ The uinput kernel module is not loaded
           uinput
 ```
 
-`-v` adds the `DISPLAY` / `WAYLAND_DISPLAY` / `XDG_SESSION_TYPE` values it read.
+`-v` adds the `DISPLAY` / `WAYLAND_DISPLAY` / `XDG_SESSION_TYPE` values it read, lists the
+devices that send no keys too, and gives udev's tags for each device, to set beside
+`udevadm info`.
 
 ### Applying a binds profile
 
@@ -253,13 +324,34 @@ moment. The first invocation finds no live manager, takes a PID lock and becomes
 managing everything in the directory; later invocations see the lock and just report.
 A crashed manager's stale lock is detected and replaced, and a manager whose set
 empties out — every profile unapplied or emergency-stopped — quits on its own.
-Ctrl+C on the manager stops everything: every held key is released **and the set is emptied** — `active/` describes
-what a running manager is enforcing, so it never outlives one. Ctrl+C is caught rather
-than fatal, precisely so that release happens. `SEQUENCER_CONFIG_DIR` overrides the
-state location.
+Ctrl+C on the manager stops everything: every held key is released **and the set is
+emptied** — `active/` describes what a running manager is enforcing, so it never outlives
+one. Ctrl+C is caught rather than fatal, precisely so that release happens.
+`SEQUENCER_CONFIG_DIR` overrides the state location.
+
+What a profile runs on is settled as the manager starts ([How it reaches the
+screen](#how-it-reaches-the-screen)), and the manager says which. In a Wayland session the
+first `profile-apply` asks sudo to open the devices — saying first what for, unless you
+already hold a ticket — and sheds root before it writes anything; turn sudo down and the
+run ends there. A real start, with a ticket cached (device names and paths made generic):
+
+```
+Using your cached sudo to open the input devices; root is dropped straight after.
+applied: /home/you/.config/sequencer/active/letter.toml (1 binds)
+managing /home/you/.config/sequencer/active; apply/unapply from any shell, Ctrl+C stops everything
+holding: Office Keyboard, Wireless Mouse Keyboard, USB Audio Device, Video Bus; if this manager stops answering, they are given back within a few seconds
+profile applied: letter.toml (1 binds)
+to stop this script, press: F8
+active: letter.toml
+```
+
+A `warning:` follows the `holding:` line when no keyboard is among the devices held — a
+profile would hear nothing typed. Where the devices can't be used, the manager runs on
+X11's grabs instead; in a Wayland session it says so once, and why, since through
+Xwayland native Wayland apps see only part of a profile.
 
 The format — mirrors like
-`PgUp -> volume-up` (each press taps the target; holding repeats it — and a chord
+`PgUp -> volume-up` (each press taps the target once, however long it is held — and a chord
 trigger fires on its exact combination, lifting any modifier the target does not name
 for the instant of the tap and pressing it straight back, so a held shift never
 recolours what gets typed),
@@ -273,9 +365,9 @@ pattern) — is documented by example in
 [`example_profile.toml`](example_profile.toml), which doubles as the parser's test
 fixture, so the documentation cannot drift from what is accepted.
 
-With a gate set, the run watches it (~5×/s) and grabs or releases the profile's triggers
-as the match comes and goes — a dormant profile eats no keys. `program` matches the
-window class and `kb_lang` the active layout's own name (`us`, `il`); `sequencer
+With a gate set, the run watches it (~20×/s) and takes or lets go of the profile's
+triggers as the match comes and goes — a dormant profile eats no keys. `program` matches
+the window class and `kb_lang` the active layout's own name (`us`, `il`); `sequencer
 detect-key` prints both, as `focus:` and `lang:` lines, which is how you learn the
 spelling to write. On X11 the X server answers both. In a Wayland session, where Xwayland
 sees only X11 windows and names only the first layout, KDE answers instead: KWin names the
@@ -294,25 +386,19 @@ itself. Validation is strict and speaks the format's language — a `PRESS` nobo
 two spellings of one trigger (`{` and `[` are the same key), or a `suppress = false`
 nothing can honour are refused with the reason, not reinterpreted.
 
-Chord triggers work: `[binds."ctrl i"]` grabs the key with its modifier mask (and the
-NumLock/CapsLock variants, so locks don't break it). A chord is modifiers plus one
-ordinary key — the shape an X grab can express. A bare key and chords over it coexist:
-each spelling grabs its own exact mask, so `i`, `ctrl i` and `alt i` are three
-independent binds, and a combination none of them claims reaches the application
-untouched. `shift` distinguishes sides — `rshift >` and `shift >` can be separate
-binds, routed by which side is physically down.
+Chord triggers work: `[binds."ctrl i"]` fires on `i` with exactly Ctrl held, whatever
+NumLock and CapsLock are doing. A chord is modifiers plus one ordinary key — the shape an
+X grab can express, and the device backend matches by the same rules, so a profile means
+the same on either. A bare key and chords over it coexist: each spelling claims its own
+exact combination, so `i`, `ctrl i` and `alt i` are three independent binds, and a
+combination none of them claims reaches the application untouched. `shift` distinguishes
+sides — `rshift >` and `shift >` can be separate binds, routed by which side is physically
+down. Mouse buttons can be sent but not heard: no trigger can be one yet.
 
 `profile-check` runs the same validator without applying anything: no symlink, no lock,
 no grabs, so it is safe in an editor hook. `--format` rewrites sound files in place —
 keywords uppercased, chord modifiers first, operands column-aligned, RNG blocks indented
 — preserving every comment, and it is idempotent.
-
-Profiles run on X11: triggers are heard by key grab and output goes through XTEST, so they
-need no device access and no password. In a Wayland session they run through Xwayland, and
-native Wayland apps see only part of them — while one has focus, a trigger fires only on
-the keys the compositor passes to X11 apps, and a bound key still reaches the app.
-`sequencer doctor` says what holds on the machine at hand; a backend that reaches Wayland
-apps directly is still to come.
 
 ### write-script
 
@@ -336,8 +422,9 @@ buttons. Two consequences, both discovered the hard way and both now handled:
   hold each press back to see whether it begins a scroll gesture — turning rapid clicking
   into one long held button, around 20-30/s.
 
-The virtual device therefore advertises `REL_X`, `REL_Y`, `REL_WHEEL` and `REL_HWHEEL`, and
-never sends any of them. Four unused axes are the difference between clicks that arrive and
+Both virtual devices sequencer ships — `bench`'s, and the virtual keyboard a profile types
+through — therefore advertise `REL_X`, `REL_Y`, `REL_WHEEL` and `REL_HWHEEL`, and never
+send any of them. Four unused axes are the difference between clicks that arrive and
 clicks that vanish.
 
 The X11 backend sidesteps all of this by injecting above libinput rather than below it,
@@ -345,7 +432,8 @@ which is why it was written: before the axes fix, the device path could not hold
 20-30/s. That specific problem is now fixed at the source, so the two are no longer
 obviously far apart — but the X11 backend stays regardless, because its other property is
 the one that matters more. **It needs no device access**, and that is not something the
-axes fix or any other change to the device path can produce.
+axes fix or any other change to the device path can produce: it is what lets a profile run
+where the devices can't be opened.
 
 Whether the fixed device path now matches XTEST's rate is untested. `bench` cannot answer
 it: it reads the device node, which is *below* libinput, so it measures the one layer that
@@ -379,6 +467,25 @@ To offer the same per-run sudo flow the binary has, call
 second argument is how *your* command line spells the doctor command, so the advice printed
 is runnable.
 
+**A program that runs profiles must route the supervisor.** The device backend's
+supervisor is the running program started again, with `sequencer_cli::SUPERVISOR_MARKER`
+as its first argument, so `main` hands its arguments to `supervise_if_asked` before
+anything parses them:
+
+```rust
+fn main() -> std::process::ExitCode {
+    if let Some(code) = sequencer_cli::supervise_if_asked(std::env::args_os()) {
+        return code.into();
+    }
+    // ...then parse and run as usual — here, the whole command line:
+    sequencer_cli::run(std::env::args_os()).into()
+}
+```
+
+Both exist with the `evdev` feature, on Linux. A program that doesn't route the marker
+gets no supervisor, and without one no grab — never a grab nobody watches — so its
+profiles fall back to X11's grabs.
+
 On KDE, `sequencer_cli::input::kde` also answers what Xwayland can't: `windows()` lists
 every window KWin manages, Wayland ones included, and `close()` asks windows to close — each
 through a script KWin runs once and sequencer unloads after. `invoke_kwin_shortcut()` runs
@@ -388,18 +495,20 @@ The library never calls `process::exit`, never installs a logger or signal handl
 never reads `std::env::args` for you. It logs through the `log` facade, so whatever logger
 your program installs receives its messages; `init_logging` is the binary's own.
 
-The two backends are separate features, both on by default. `--features cli,xtest` is
-X11-only — profiles, and `detect-key` through the terminal — with no evdev in your
+The two backends are separate features, both on by default. Profiles are built on `xtest`
+and use the devices as well when `evdev` is in. `--features cli,xtest` is X11-only —
+profiles on X11's grabs, and `detect-key` through the terminal — with no evdev in your
 dependency graph and no device access anywhere in it; `--features cli,evdev` is the
-reverse: `detect-key`'s exact mode and `bench`, but no profiles.
+reverse: `detect-key`'s exact mode and `bench`, but no profiles. `live-tests` is test
+machinery for the live suite, never needed downstream.
 
 ## How it is put together
 
 | Crate | What it holds |
 |---|---|
 | `sequencer-core` | The vocabulary: keys as positions, events, actions, time. `#![no_std]`, one dependency, no clock, no threads, no I/O. |
-| `sequencer-input` | Every operating-system call in the project. |
-| `sequencer-cli` | The clap surface, the binds format and its executor, and the `sequencer` binary. |
+| `sequencer-input` | The backends: the input devices (read, held and written), X11, and the desktop services that answer what X11 can't — KWin and KDE's keyboard service, and logind for the screen lock, over D-Bus. |
+| `sequencer-cli` | The clap surface, the binds format and its executor, the profile manager, session-mode sudo, and the `sequencer` binary. |
 
 `sequencer-core` has no path to an OS input API in its dependency graph and never reads a
 clock, and the executor takes its clock as a parameter — so the tests hand it a virtual one.
@@ -408,42 +517,62 @@ assertion that runs in microseconds. Timing is the whole ballgame for synthetic 
 test suite that has to sleep in real time is one nobody runs.
 
 Within `sequencer-cli`, one product's worth of behaviour lives in its own directory
-(`profile/`, `detect_key/`, `write_script/`), while the binds format, its executor and both
-input backends (`linux/` and `x11/`) stay general. The executor runs one binds profile —
-taps, holds, waits, loops, chance.
+(`profile/`, `detect_key/`, `write_script/`), while the binds format and its executor
+(`binds/`) stay general. The executor runs one binds profile — taps, holds, waits, loops,
+chance. Within `sequencer-input`, `linux/` is the device backend — the grab, the router
+deciding which key goes where, and the supervisor among it — `x11/` the X11 one, and
+`kde/` the KWin and keyboard-service readers; `devices.rs` is udev's device
+classification, which the grab, `detect-key` and `doctor` share.
 
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 294 tests, all headless
+cargo test --workspace --all-features    # 346 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
 ```
-
-What the headless suite cannot prove — live grabs, injection reaching the desktop,
-the manager's lifecycle, per-profile emergency stops, signal handling, the sudo-backed
-device path — lives in the `live` test target (`crates/sequencer-cli/tests/live/`),
-whose hardware-touching tests are `#[ignore]`d so a plain `cargo test` stays safe
-anywhere. Run them on an X11 session via [`SUDO-TEST.sh`](SUDO-TEST.sh) (a thin
-launcher that also caches the sudo ticket the device tests use), or directly:
-
-```sh
-cargo test -p sequencer-cli --test live -- --ignored --test-threads=1 --nocapture
-```
-
-They refuse to start while a real manager is running, keep all state in temp
-directories, and the only key they synthesize at your desktop is Pause.
 
 Tests that need a real `/dev/uinput` skip themselves with a note when it is absent, so the
 suite is green in a container and exercises the device on a real machine. Tests that need a
 D-Bus bus start a private `dbus-daemon` of their own and skip the same way when there is
 none; `SEQUENCER_TEST_BUS_DAEMON` names another bus daemon to use instead (busd works).
 
+What the headless suite cannot prove lives in the `live` test target
+(`crates/sequencer-cli/tests/live/`), whose hardware-touching tests are `#[ignore]`d so a
+plain `cargo test` stays safe anywhere. Its tiers, by what each needs:
+
+| Tier | Needs | Covers |
+|---|---|---|
+| `validation` | nothing — it runs in every `cargo test` | `profile-check`, `--format` and the profile commands' arguments, through the real binary |
+| `x11` | an X session | the manager's lifecycle — stacking, mirrors, loops, per-profile emergency stops, quitting once the set empties — and Ctrl+C. In a Wayland session the lifecycle test skips, and the routing check below stands in |
+| `sudo` | a cached sudo ticket | `bench` round-tripping through uinput, `doctor` on the real machine |
+| `devices` | a Wayland session, sudo, the `live-tests` feature | profiles on the device backend, typed on a test keyboard of the suite's own and read back below the desktop; the supervisor taking the keyboard back from a silent manager and from a killed one |
+| `windows` | the above, plus KDE, `kdialog` and a US layout | the same profiles into kdialog boxes the tests open — an X11 one through Xwayland and a Wayland one — and the routing check: XTEST keys reaching an X11 grab and the focused window |
+
+The test keyboard is made through `/dev/uinput` by a root helper, `sequencer-live-rig`,
+built only with `live-tests`, and each test manager's grab is limited to it, so your own
+keyboards are never grabbed. The window tests type a key only while KWin says the test's
+own box has focus, so a focus slip stops the test instead of typing elsewhere. The only
+keys that reach your desktop are the `x11` tier's Pause chords and, on KDE, the `windows`
+tier's, into boxes of its own — where KDE may ask once to allow remote control. Run
+them all via [`SUDO-TEST.sh`](SUDO-TEST.sh) — a thin launcher that caches the sudo ticket
+the device tiers use (decline and they skip), runs the headless suite, then the live one —
+or directly:
+
+```sh
+cargo test -p sequencer-cli --features live-tests --test live -- --ignored --test-threads=1 --nocapture
+```
+
+They refuse to start while a real manager is running — the device tiers also while a
+sequencer device from an earlier run is still alive — and keep all state in temp
+directories.
+
 CI runs the suite plus fmt, clippy and docs on Linux; cross-compiles for Windows and macOS,
 which is the proof `sequencer-core` is OS-free; checks every feature combination with
-`cargo hack`; and runs `cargo deny`, since the project is GPL-3.0-or-later and a
-dependency's licence is a correctness matter.
+`cargo hack`; tries a real uinput round trip on a VM runner, not yet gating merges; and
+runs `cargo deny`, since the project is GPL-3.0-or-later and a dependency's licence is a
+correctness matter.
 
 ## Platform support
 
@@ -453,11 +582,14 @@ command that needs a device says so — but no backend for either is written.
 
 | Platform | Status |
 |---|---|
-| Linux — X11 | XTEST + key grabs; no setup |
-| Linux — Wayland | profiles through Xwayland, with the limits `doctor` lists (on KDE the gates see every window and layout); `detect-key` and `bench` through the devices |
-| Linux — console | `detect-key` and `bench` (uinput + evdev; need device access) |
+| Linux — X11 | profiles on the input devices where you have access, else XTEST + key grabs with no setup; `detect-key` and `bench` through the devices |
+| Linux — Wayland | profiles on the input devices, through sudo for one run, whole in every app; without the devices, through Xwayland with the limits `doctor` lists. On KDE the gates see every window and layout. `detect-key` and `bench` through the devices |
+| Linux — console | `detect-key` and `bench` (uinput + evdev; need device access); profiles too where you have device access, though `profile-apply` asks sudo only in a Wayland session |
 | Windows | not written (`WH_KEYBOARD_LL` + `SendInput` would be the shape) |
 | macOS | not written (`CGEventTap` + `CGEventPost` would be the shape) |
+
+The device backend has run live in a KDE Plasma Wayland session; in X11 sessions and on
+the console it is built and tested headless, not yet tried live.
 
 ## Limitations
 
@@ -467,6 +599,9 @@ command that needs a device says so — but no backend for either is written.
   BattlEye will not work, and using it there risks the account. Don't.
 - **Clicks land at the pointer.** The tool never moves the cursor.
 - **What is sent is not necessarily received.** See [Rate ceiling](#rate-ceiling).
+- **Mouse buttons can't be triggers**, in any session; they can only be sent.
+- **A keyboard plugged in after the manager starts types without profiles** until the
+  manager runs again — and so does one that comes back from a suspend as a new device.
 - **Linux only.**
 
 ## Troubleshoot
@@ -500,23 +635,27 @@ Press the key labelled `Alt`. If it reports `meta`, the swap is in the hardware 
 you have a second keyboard, pressing the same key there is the comparison that settles it.
 
 **The other half: state the X server holds.** Two kinds outlive a run, and `sequencer
-doctor` reports both on its `keyboard:` line.
+doctor` reports both on its `keyboard:` line — in a Wayland session, as Xwayland sees them.
 
 - A **stuck modifier** — one the server believes is held with no key holding it — makes
   every chord arrive with an extra modifier, so shortcuts match nothing while typing looks
-  fine. `doctor` names it and says how to clear it: tap that modifier on *both* sides (only
-  the stuck side clears it), or re-run your `setxkbmap` command, which resets locks,
-  latches and the active layout group in one go.
-- **Locks** (`CapsLock`, `NumLock`) toggle server-wide state that no grab intercepts and no
-  teardown undoes. On a multi-language setup `CapsLock` is often the layout switch, so a
-  bind on it can leave the keyboard on another language. `sequencer profile-check` warns
-  when a bind presses a lock key, as trigger or as target; take the hint and pick another.
+  fine. XTEST can leave one behind; the device backend's virtual keyboard can't, since
+  removing it releases everything it held. `doctor` names it and says how to clear it: tap
+  that modifier on *both* sides (only the stuck side clears it), or re-run your
+  `setxkbmap` command, which resets locks, latches and the active layout group in one go.
+- **Locks** (`CapsLock`, `NumLock`) toggle session-wide state that no teardown undoes —
+  and on X11 the toggle happens even when a grab takes the key. On a multi-language setup
+  `CapsLock` is often the layout switch, so a bind on it can leave the keyboard on another
+  language. `sequencer profile-check` warns when a bind presses a lock key, as trigger or
+  as target; take the hint and pick another.
 
 **Prevention.** Quit the manager with `Ctrl`+`C` or an `emergency_stop` key rather than
-`kill -9`: both release every key the run is holding, and `SIGKILL` skips exactly that (the
-manager also warns on the way out if the server still has a modifier stuck). Don't bind lock
-keys. Run `sequencer profile-check` on a new profile first — it catches unbalanced
-`PRESS`es, feedback circles and lock keys before anything is grabbed.
+`kill -9`: both release every key the run is holding, and `SIGKILL` skips exactly that —
+on the device backend the supervisor still gives the keyboards back at once, but on X11
+whatever XTEST held stays down (the manager also warns on the way out if the server still
+has a modifier stuck). Don't bind lock keys. Run `sequencer profile-check` on a new profile
+first — it catches unbalanced `PRESS`es, feedback circles and lock keys before anything is
+grabbed.
 
 ## Licence
 

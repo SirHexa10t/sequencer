@@ -852,7 +852,7 @@ fn unescape(value: &str) -> Vec<u8> {
 
 /// This process's effective user id, from `/proc/self/status` — readable even after a
 /// process drops root, when the ownership of the rest of `/proc/self` changes.
-fn effective_uid() -> Result<u32, Error> {
+pub(crate) fn effective_uid() -> Result<u32, Error> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     status
         .lines()
@@ -881,6 +881,24 @@ fn session_endpoints() -> Result<Vec<Endpoint>, Error> {
     } else {
         Err(Error::NoBus)
     }
+}
+
+/// Where the system bus listens: `$DBUS_SYSTEM_BUS_ADDRESS`, else the socket the D-Bus
+/// specification names.
+#[cfg(feature = "evdev")]
+fn system_endpoints() -> Result<Vec<Endpoint>, Error> {
+    if let Some(address) = std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS") {
+        let address = address.to_string_lossy();
+        let found = endpoints(&address);
+        return if found.is_empty() {
+            Err(Error::Address(address.into_owned()))
+        } else {
+            Ok(found)
+        };
+    }
+    Ok(vec![Endpoint::Path(PathBuf::from(
+        "/var/run/dbus/system_bus_socket",
+    ))])
 }
 
 /// The user's runtime directory: `$XDG_RUNTIME_DIR`, else `/run/user/<uid>`, where
@@ -932,6 +950,12 @@ impl Connection {
     /// Connects to the session bus.
     pub(crate) fn session() -> Result<Self, Error> {
         Self::open(&session_endpoints()?)
+    }
+
+    /// Connects to the system bus, where logind answers.
+    #[cfg(feature = "evdev")]
+    pub(crate) fn system() -> Result<Self, Error> {
+        Self::open(&system_endpoints()?)
     }
 
     /// Connects to the bus at a D-Bus address.

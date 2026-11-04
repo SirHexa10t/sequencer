@@ -1,16 +1,21 @@
-//! Platform input: watching real devices, and synthesising events into them.
+//! Platform input: watching real devices, holding them for a profile, and synthesising
+//! events into them.
 //!
-//! Everything in this workspace that talks to an operating system lives here.
+//! Everything in this workspace that talks to the input stack lives here: the devices, the
+//! X server, and the desktop services that answer what X can't — KWin and KDE's keyboard
+//! service, and logind for the screen lock, over D-Bus. (`sequencer-cli` keeps only the
+//! process-level calls — sudo and the privilege drop, the manager's lock, signals, the
+//! terminal.)
 //! `sequencer-core` has no path to any of it in its dependency graph, which is what makes
 //! "the core is testable without a display server" a fact about the build rather than a
 //! promise in a comment.
 //!
 //! Two Linux backends, chosen per session by the caller:
 //!
-//! - [`linux`] — reads `/dev/input`, writes `/dev/uinput`. Below the display server, so
-//!   one code path covers X11, Wayland and the bare console, and it is the only way to
-//!   reach the last two. Needs access to the device nodes, which is what a user has to
-//!   grant.
+//! - [`linux`] — reads `/dev/input`, writes `/dev/uinput`, and for a profile holds the
+//!   keyboards (`linux::grab`). Below the display server, so one code path covers X11,
+//!   Wayland and the bare console, and it is the only way to reach the last two. Needs
+//!   access to the device nodes, which is what a user has to grant.
 //! - [`x11`] — XTEST out, passive key grabs in. X11 only, and **needs no device access at
 //!   all**: an X11 run is an ordinary X client, so it asks for no permissions and no
 //!   password. It also sits above libinput, which historically mattered for the click rate.
@@ -30,10 +35,14 @@ pub mod capture;
 pub mod clock;
 #[cfg(target_os = "linux")]
 mod dbus;
+pub mod devices;
 #[cfg(target_os = "linux")]
 pub mod kde;
 #[cfg(all(any(feature = "evdev", feature = "xtest"), target_os = "linux"))]
 pub mod linux;
+// What logind says of the session — only the device grab asks it.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+mod logind;
 pub mod mock;
 pub mod probe;
 #[cfg(all(feature = "xtest", target_os = "linux"))]

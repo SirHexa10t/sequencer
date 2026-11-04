@@ -13,6 +13,13 @@ use std::process::ExitCode;
 use sequencer_cli::clap;
 
 fn main() -> ExitCode {
+    // A run as a device grab's supervisor goes there first: its argument is a marker, not a
+    // command, and nothing else may read it as one.
+    #[cfg(all(feature = "evdev", target_os = "linux"))]
+    if let Some(code) = sequencer_cli::supervise_if_asked(std::env::args_os()) {
+        return ExitCode::from(code);
+    }
+
     // Global setup belongs here, never in the library: a second logger in one process
     // fails, and an embedder must be free to install their own. The flags are sniffed
     // rather than parsed because logging has to be up before clap reports anything.

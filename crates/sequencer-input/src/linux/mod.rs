@@ -20,7 +20,15 @@ pub mod bench;
 #[cfg(feature = "evdev")]
 pub mod capture;
 #[cfg(feature = "evdev")]
+pub mod grab;
+#[cfg(feature = "evdev")]
 pub mod inject;
+#[cfg(feature = "live-tests")]
+pub mod rig;
+#[cfg(feature = "evdev")]
+pub mod route;
+#[cfg(feature = "evdev")]
+pub mod supervise;
 
 #[cfg(feature = "evdev")]
 pub use bench::{BenchError, BenchObserver, BenchResult, BenchSample, Unobserved};

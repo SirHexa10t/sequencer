@@ -1,8 +1,10 @@
 # Findings — sequencer on KDE Plasma Wayland
 
-Temporary: the record behind the fixes in progress. Delete it once they land. Each claim
-says what it rests on: **code** (read in this checkout), **KWin** (KWin's own source),
-**run** (a test result), or **hypothesis**.
+Temporary: the record behind the Wayland work. Most of its fixes have landed (see
+"Status"); what is left is item 12 — other compositors, and whether "full" means KDE only —
+and the open question on the Xwayland fallback's timing. Delete it once both are settled:
+the rest is in the README and the code. Each claim says what it rests on: **code** (read in
+this checkout), **KWin** (KWin's own source), **run** (a test result), or **hypothesis**.
 
 ## How the tests ran
 
@@ -198,29 +200,59 @@ items marked *live check* still need a run on the KDE machine.
    `lang:` line ask KDE's keyboard service in a Wayland session, and follow every switch
    (T8, D1, D2).
 4. **Fixed (2026-10-27):** the README spells the unapply command `profile-unapply`.
-5. Modifier changes need time through Xwayland: chord outputs lose their modifier, and
-   the lift of a held one comes too late (T3–T5, T10).
-6. Character-key triggers (letters, digits, symbols, Shift+letter) never fire while a
-   Wayland window has focus: KDE passes only what its Xwayland setting allows (T2, T4).
-7. Binds can't block keys in Wayland windows: the app gets the key too (T6).
+5. **Fixed by the device backend (2026-11-03), confirmed live (2026-11-03):** its modifiers
+   and lifts go out through sequencer's own virtual keyboard, below the compositor, and
+   T3–T5 and T10 came out right in both kinds of window. Through Xwayland — the fallback,
+   without the devices — modifier changes still need time: chord outputs lose their
+   modifier, and the lift of a held one comes too late.
+6. **Fixed by the device backend (2026-11-03), confirmed live (2026-11-03):** the grab hears
+   every key before the compositor does, so letter and Shift+letter triggers fire in Wayland
+   windows too (T2, T4). Through Xwayland they still fire only on what KDE's setting passes.
+7. **Fixed by the device backend (2026-11-03), confirmed live (2026-11-03):** a claimed
+   trigger is never written on, so no app gets it (T6). Through Xwayland a Wayland app
+   still gets the key too.
 8. **Fixed (2026-10-27), confirmed live (2026-11-03):** the program gate and
    `detect-key`'s `focus:` line ask KWin in a Wayland session, through a script loaded
    for the run, and see Wayland windows by their app id (T7, D1, D2).
-9. Output depends on KDE's one-time "remote control" permission; refused, it's dropped
-   with no error, and sequencer can't tell (T1).
-10. Mouse-button triggers can't fire in Wayland windows (KWin's source; untested).
-11. `doctor`'s `keyboard:` line and the manager's stuck-modifier warning read Xwayland's
+9. **Fixed by the device backend (2026-11-03), confirmed live (2026-11-03):** its output
+   goes through sequencer's virtual keyboard, which needs no permission from KDE (T1).
+   XTEST output — the fallback's — still depends on KDE's one-time "remote control"
+   permission; refused, it's dropped with no error, and sequencer can't tell.
+10. **Corrected (2026-11-03): not a Wayland issue.** Mouse buttons can't be triggers in any
+    session: the profile format refuses them ("not hearable yet, only sendable"). Hearing
+    them would be a new feature, which the device backend could carry.
+11. **Half moot (2026-11-03):** on the device backend the manager has no stuck modifier to
+    warn about — its virtual keyboard releases everything it held when it goes. `doctor`'s
+    `keyboard:` line, and the warning on the Xwayland fallback, still read Xwayland's
     keyboard state, which may not match KWin's (code; untested).
 12. Other compositors (GNOME, Sway, Hyprland) are untested; whether "full" means KDE only
     is still to decide.
-13. No automated tests of any Wayland path.
-14. The README describes the Xwayland limits now; it needs the full story once the route
-    for 5–7 and 9–11 is settled.
+13. **Fixed (2026-11-03), confirmed live (2026-11-03):** the live suite's `devices` and
+    `windows` tiers run profiles on the device backend in a Wayland session — below the
+    desktop, and into an X11 and a Wayland kdialog box on KDE — and a routing check covers
+    XTEST through Xwayland; `SUDO-TEST.sh` passed whole on the KDE machine.
+14. **Fixed (2026-11-03):** the README tells the whole story — the device backend first,
+    sudo for it in a Wayland session, Xwayland as the fallback with its limits.
 
 ## Open questions
 
-- The design for Wayland: keep the X11 backend and document its limits; a device backend for
-  `profile-apply` (needs input access, and swallowing would mean intercepting the whole
-  keyboard); or KDE's own routes (global shortcuts through kglobalaccel, output through libei).
+- **Decided (2026-11-03):** a device backend for `profile-apply` in Wayland sessions — the
+  keyboards grabbed and re-emitted through a virtual one, which fixes 5–7, 9 and 11 — and in
+  X11 sessions too wherever the devices open, X11 grabs being the fallback; the KDE readers
+  stay for the gates. Rejected: KDE's own routes (global shortcuts through kglobalaccel,
+  output through libei), which can't keep keys as positions, tell left from right, or hold a
+  trigger; and keeping the X11 backend with its limits documented. In progress: built and
+  tested here — the routing policy, the supervisor (which hands the keyboards back if the
+  manager stops answering), the grab, the pause while the screen is locked, and sudo for
+  `profile-apply`. First run on real devices (2026-11-03): no trigger fired, because the
+  grab held no keyboard — its own rule took a volume wheel's absolute axis for a touchpad's
+  and a 32-button mouse for a controller, so it held only a sound card's and a display's
+  keys. Device choice now follows udev's rules, the manager names what it holds and warns
+  when no keyboard is among it, and `doctor` lists each device's verdict. The rerun passed
+  T1–T10 in both window kinds. The live suite then found the supervisor's hand-back inert —
+  a hung manager would have kept the keyboards — so the supervisor now takes and holds every
+  grab itself, and the suite tests the release on a real device. `SUDO-TEST.sh` then passed
+  whole on the KDE machine (2026-11-03).
 - Whether a pause after each modifier change — what T10 did by hand — is enough to make chords
-  and lifts reliable through Xwayland, and how long it needs to be.
+  and lifts reliable through Xwayland, and how long it needs to be. Only the fallback's
+  question now (see 5).

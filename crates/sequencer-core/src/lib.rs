@@ -4,8 +4,8 @@
 //! This crate never reads a clock, never sleeps, never touches a device and never spawns a
 //! thread — `#![no_std]` is the mechanical guarantee, so reaching for `Instant::now()` or
 //! `thread::sleep()` from here is a compile error rather than a code-review catch. The
-//! backends (`sequencer-input`) own every OS call; the products (`sequencer-cli`) own the
-//! loops. What lives here is the vocabulary both of them speak:
+//! backends (`sequencer-input`) own every call into the input stack; the products
+//! (`sequencer-cli`) own the loops. What lives here is the vocabulary both of them speak:
 //!
 //! - [`input`]: keys as *positions* (the USB HID usage table), buttons, and the events a
 //!   backend reports, with the modifier classes folded the way X folds them.

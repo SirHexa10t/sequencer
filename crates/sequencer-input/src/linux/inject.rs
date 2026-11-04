@@ -49,8 +49,18 @@ impl UinputSink {
     /// If `/dev/uinput` is missing or not writable. That is the common case on a fresh
     /// machine, and [`crate::Requirement::UinputNodeWritable`] explains the fix.
     pub fn open() -> Result<Self, SinkError> {
+        Self::open_as(DEVICE_NAME, std::iter::empty())
+    }
+
+    /// [`Self::open`], under the name `name`, declaring `extra` keys too: the stand-in for
+    /// grabbed keyboards, which must be able to pass on every key they have, named here or
+    /// not.
+    pub(crate) fn open_as(
+        name: &str,
+        extra: impl IntoIterator<Item = KeyCode>,
+    ) -> Result<Self, SinkError> {
         let mut keys = AttributeSet::<KeyCode>::new();
-        for code in keymap::all_codes() {
+        for code in keymap::all_codes().chain(extra) {
             keys.insert(code);
         }
 
@@ -77,7 +87,7 @@ impl UinputSink {
         axes.insert(RelativeAxisCode::REL_HWHEEL);
 
         let device = VirtualDevice::builder()
-            .and_then(|builder| builder.name(DEVICE_NAME).with_keys(&keys))
+            .and_then(|builder| builder.name(name).with_keys(&keys))
             .and_then(|builder| builder.with_relative_axes(&axes))
             .and_then(VirtualDeviceBuilder::build)
             .map_err(uinput_error)?;
@@ -130,6 +140,13 @@ impl UinputSink {
         let result = self.device.emit(&self.pending).map_err(uinput_error);
         self.pending.clear();
         result
+    }
+
+    /// Writes one frame passed on from a grabbed device, as it came, and commits it.
+    /// Nothing here is this sink's own, so its release ledger is left alone: a forwarded
+    /// key-down is the hand's to release.
+    pub(crate) fn forward(&mut self, frame: &[InputEvent]) -> Result<(), SinkError> {
+        self.device.emit(frame).map_err(uinput_error)
     }
 }
 
@@ -195,11 +212,19 @@ fn uinput_error(err: io::Error) -> SinkError {
 
 /// `/dev/uinput` could not be opened, with the fix named.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "cannot open /dev/uinput ({0}); run `sequencer doctor` for the udev rule and group \
-     membership this needs"
-)]
+#[error("cannot open /dev/uinput ({0}); run `sequencer doctor` for {fix}", fix = fix_for(.0))]
 pub struct UinputUnavailable(#[source] io::Error);
+
+/// What `doctor` has for it: where there is no node, loading the module that makes one —
+/// the udev rule and the group would change nothing yet; where the node is there but not
+/// this user's, the rule and the group.
+fn fix_for(err: &io::Error) -> &'static str {
+    if err.kind() == io::ErrorKind::NotFound {
+        "how to load the uinput module, which provides it"
+    } else {
+        "the udev rule and group membership this needs"
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -213,6 +238,23 @@ mod tests {
             action,
             level: 0,
         }
+    }
+
+    /// The error names the fix that fits: with no node, loading the module — the udev rule
+    /// and the group would change nothing yet; with the node there but not writable, those.
+    #[test]
+    fn an_unopenable_uinput_names_the_fix_that_fits() {
+        let missing = UinputUnavailable(io::Error::from(io::ErrorKind::NotFound)).to_string();
+        assert!(
+            missing.contains("load the uinput module") && !missing.contains("udev rule"),
+            "{missing}"
+        );
+        let denied =
+            UinputUnavailable(io::Error::from(io::ErrorKind::PermissionDenied)).to_string();
+        assert!(
+            denied.contains("udev rule and group membership") && !denied.contains("module"),
+            "{denied}"
+        );
     }
 
     /// Whether this machine can actually create a virtual device. Most CI containers
@@ -233,6 +275,11 @@ mod tests {
     /// an application receiving nothing reveals it, and no assertion below the compositor
     /// notices. So this inspects what the kernel actually published for the device.
     ///
+    /// It asks sysfs rather than opening the device, and judges by udev's own rules
+    /// ([`crate::devices`]), which libinput goes by. sysfs needs no access, and a machine
+    /// can grant `/dev/uinput` without `/dev/input` — a uaccess rule rather than the `input`
+    /// group — where opening the device we just made is refused.
+    ///
     /// Named `uinput` so CI's device-enabled job selects it.
     #[test]
     fn the_uinput_device_advertises_pointer_axes() {
@@ -247,24 +294,29 @@ mod tests {
             .into_iter()
             .next()
             .expect("the device has an event node");
-        let device = evdev::Device::open(&node).expect("open the device we just made");
+        let event = node
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("an event node's name");
+        let published = crate::devices::list()
+            .into_iter()
+            .find(|device| device.node == event)
+            .expect("sysfs lists the device we just made")
+            .capabilities;
 
-        let axes = device
-            .supported_relative_axes()
-            .expect("a pointer must advertise relative axes at all");
         assert!(
-            axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y),
+            published.kinds().contains(&crate::devices::Kind::Mouse),
             "libinput classifies by axes, not buttons: without REL_X/REL_Y the clicks go nowhere"
         );
         assert!(
-            axes.contains(RelativeAxisCode::REL_WHEEL),
+            published.declares_relative(RelativeAxisCode::REL_WHEEL.0),
             "without a wheel libinput falls back to BUTTON scrolling, and then holds every \
              press back to see whether it starts a scroll instead of a click"
         );
         assert!(
-            device
-                .supported_keys()
-                .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT)),
+            published
+                .key_codes()
+                .any(|code| code == KeyCode::BTN_LEFT.0),
             "and the buttons must still be there"
         );
     }

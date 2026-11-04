@@ -2,15 +2,18 @@
 //!
 //! In a Wayland session an X11 app — sequencer's profiles included, which listen through
 //! Xwayland — hears a key pressed in a native Wayland app only if KWin passes it on. KWin
-//! decides from two settings in `kwinrc`'s `[Xwayland]` group, set in System Settings →
-//! Legacy X11 App Support:
+//! decides from `kwinrc`'s `[Xwayland]` group, set in System Settings → Legacy X11 App
+//! Support:
 //!
 //! - `XwaylandEavesdrops`: `None`, `Modifiers`, `Combinations` (the default) or `All`.
 //!   KConfig stores the choice by name, read without regard to case, falls back to its
 //!   number, and removes the key when it holds the default.
-//! - `XwaylandEavesdropsMouse`: whether mouse buttons pass too; off by default.
 //!
 //! What passes is a copy: the Wayland app still receives the key.
+//!
+//! The group's other setting, `XwaylandEavesdropsMouse` (whether mouse buttons pass too),
+//! is not read: mouse buttons can't be triggers, so nothing here would use it. It comes
+//! back with a reader if mouse triggers ever reach the X11 fallback.
 
 use std::path::PathBuf;
 
@@ -35,15 +38,12 @@ pub enum KeySharing {
 pub struct XwaylandSharing {
     /// The keys.
     pub keys: KeySharing,
-    /// Whether mouse buttons pass too.
-    pub mouse: bool,
 }
 
 impl Default for XwaylandSharing {
     fn default() -> Self {
         Self {
             keys: KeySharing::Combinations,
-            mouse: false,
         }
     }
 }
@@ -78,13 +78,6 @@ fn from_kwinrc(texts: &[&str]) -> XwaylandSharing {
         .and_then(|value| key_sharing(&value));
     if let Some(keys) = keys {
         sharing.keys = keys;
-    }
-    let mouse = texts
-        .iter()
-        .find_map(|text| setting(text, "XwaylandEavesdropsMouse"))
-        .and_then(|value| boolean(&value));
-    if let Some(mouse) = mouse {
-        sharing.mouse = mouse;
     }
     sharing
 }
@@ -123,15 +116,6 @@ fn key_sharing(value: &str) -> Option<KeySharing> {
     }
 }
 
-/// A KConfig boolean: `true`, `on`, `yes` or `1`, and their opposites.
-fn boolean(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "on" | "yes" | "1" => Some(true),
-        "false" | "off" | "no" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,20 +127,19 @@ mod tests {
             from_kwinrc(&["[Compositing]\nBackend=OpenGL\n"]),
             XwaylandSharing {
                 keys: KeySharing::Combinations,
-                mouse: false
             }
         );
     }
 
-    /// By name in any case, or by number; only the `[Xwayland]` group counts.
+    /// By name in any case, or by number; only the `[Xwayland]` group counts, and only the
+    /// key itself — not the mouse setting beside it, whose name starts the same way.
     #[test]
     fn the_setting_is_read_as_kconfig_writes_it() {
-        let text = "[Other]\nXwaylandEavesdrops=None\n\n[Xwayland]\nXwaylandEavesdrops=all\nXwaylandEavesdropsMouse=true\n";
+        let text = "[Other]\nXwaylandEavesdrops=None\n\n[Xwayland]\nXwaylandEavesdropsMouse=0\nXwaylandEavesdrops=all\n";
         assert_eq!(
             from_kwinrc(&[text]),
             XwaylandSharing {
                 keys: KeySharing::All,
-                mouse: true
             }
         );
         assert_eq!(
@@ -170,17 +153,17 @@ mod tests {
         );
     }
 
-    /// The user's file wins over the system's, key by key.
+    /// The user's file wins over the system's — where it sets the key at all.
     #[test]
     fn the_users_file_overrides_the_systems() {
-        let user = "[Xwayland]\nXwaylandEavesdropsMouse=true\n";
-        let system = "[Xwayland]\nXwaylandEavesdrops=None\nXwaylandEavesdropsMouse=false\n";
+        let system = "[Xwayland]\nXwaylandEavesdrops=None\n";
+        let user = "[Xwayland]\nXwaylandEavesdrops=All\n";
+        assert_eq!(from_kwinrc(&[user, system]).keys, KeySharing::All);
+        let silent_user = "[Compositing]\nBackend=OpenGL\n";
         assert_eq!(
-            from_kwinrc(&[user, system]),
-            XwaylandSharing {
-                keys: KeySharing::None,
-                mouse: true
-            }
+            from_kwinrc(&[silent_user, system]).keys,
+            KeySharing::None,
+            "a user file that doesn't set it leaves the system's value"
         );
     }
 

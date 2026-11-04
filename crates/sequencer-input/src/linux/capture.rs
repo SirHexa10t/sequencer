@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use evdev::{Device, EventSummary, KeyCode};
+use evdev::{Device, EventSummary};
 use sequencer_core::input::{EventKind, InputEvent};
 
 use crate::capture::{CaptureStream, Epoch, EventQueue};
+use crate::devices::Capabilities;
 use crate::linux::inject::DEVICE_NAME;
 use crate::linux::keymap;
 
@@ -78,7 +79,10 @@ impl EvdevCapture {
         }
         // Not an error: a pad or a mouse may be what the caller wants to hear. But a
         // listener with no keyboard hears nothing typed, and saying so beats silence.
-        if !devices.iter().any(|(_, device)| is_keyboard(device)) {
+        if !devices
+            .iter()
+            .any(|(_, device)| Capabilities::of(device).is_keyboard())
+        {
             log::warn!(
                 "no keyboard is readable, so key presses will not be heard; run `sequencer \
                  doctor` for the access this needs"
@@ -118,13 +122,6 @@ impl EvdevCapture {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
     }
-}
-
-/// Whether `device` is a keyboard, by the same rule `doctor`'s check applies to sysfs.
-fn is_keyboard(device: &Device) -> bool {
-    device
-        .supported_keys()
-        .is_some_and(|keys| crate::probe::is_keyboard(|code| keys.contains(KeyCode(code))))
 }
 
 /// Reads one device until it goes away or capture stops.

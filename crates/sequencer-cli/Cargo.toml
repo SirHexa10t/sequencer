@@ -18,13 +18,18 @@ cli = ["dep:clap", "dep:nix", "dep:serde", "dep:toml", "dep:toml_edit", "dep:sig
 # init_logging(): the stderr logger behind -q/-v/-vv. Off for embedders that install
 # their own `log` logger. It pulls in no dependency, only the printer's own code.
 logging = []
-# The Linux device backend: detect-key's exact mode and bench. On by default; inert on
-# other platforms. `nix` rides along for session mode's privilege drop.
+# The Linux device backend: detect-key's exact mode, bench, and the devices profiles run
+# on first (with `xtest`). On by default; inert on other platforms. `nix` rides along for
+# session mode's privilege drop.
 evdev = ["sequencer-input/evdev", "dep:nix"]
-# The X11 backend, which profile-apply runs on. On by default: it needs no device access
-# and so no password, which is the difference between a tool you set up and one you just
-# run.
+# The X11 backend, which the profile manager is built on and falls back to where the
+# devices can't be opened. On by default: it needs no device access and so no password,
+# which is the difference between a tool you set up and one you just run.
 xtest = ["sequencer-input/xtest"]
+# The live suite's device tiers: `sequencer-live-rig`, the helper that types on a test
+# keyboard of its own and reads back what sequencer's virtual keyboard sends. Test
+# machinery, never shipped: SUDO-TEST.sh turns it on for the live pass.
+live-tests = ["evdev", "sequencer-input/live-tests"]
 
 [dependencies]
 sequencer-core = { workspace = true }
@@ -72,6 +77,12 @@ nix = { workspace = true, features = ["signal", "fs"] }
 name = "sequencer"
 path = "src/bin/sequencer.rs"
 required-features = ["cli"]
+
+# The live suite's root helper for the device tiers (`tests/live/rig.rs` drives it).
+[[bin]]
+name = "sequencer-live-rig"
+path = "src/bin/live_rig.rs"
+required-features = ["live-tests"]
 
 # The live suite drives the real binary (CARGO_BIN_EXE), so it needs the same gate.
 [[test]]

@@ -254,3 +254,30 @@ fn doctor_runs_on_a_headless_machine() {
     let report = run(&["doctor"]);
     assert!(report.stdout.contains("session:"), "{}", report.stdout);
 }
+
+/// The binary routes the supervisor marker before anything parses it: started the way the
+/// device backend starts it, it says it is watching, takes beats, and leaves on a goodbye.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+#[test]
+fn the_binary_serves_as_its_own_supervisor() {
+    use sequencer_input::linux::supervise::Supervisor;
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sequencer"));
+    command.arg(sequencer_cli::SUPERVISOR_MARKER);
+    let supervisor = Supervisor::spawn(command).expect("the binary answers as a supervisor");
+    supervisor.beat().expect("it is watching");
+    supervisor.finish();
+}
+
+/// Typed by a person, the marker is refused with a word on what it is for, rather than
+/// waiting on a terminal for a manager that isn't there.
+#[cfg(all(feature = "evdev", target_os = "linux"))]
+#[test]
+fn the_supervisor_marker_alone_is_refused() {
+    let typed = run(&[sequencer_cli::SUPERVISOR_MARKER]);
+    assert_eq!(typed.status.code(), Some(2), "{}", typed.stderr);
+    assert!(
+        typed.stderr.contains("for sequencer's own use"),
+        "{}",
+        typed.stderr
+    );
+}
