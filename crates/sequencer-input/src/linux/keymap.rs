@@ -69,6 +69,8 @@ static KEYS: &[(Key, KeyCode)] = &[
     (Key::NextTrack, KeyCode::KEY_NEXTSONG), (Key::PrevTrack, KeyCode::KEY_PREVIOUSSONG),
     (Key::BrightnessUp, KeyCode::KEY_BRIGHTNESSUP),
     (Key::BrightnessDown, KeyCode::KEY_BRIGHTNESSDOWN),
+    // HID's "AC Back"/"AC Forward", which the kernel reports as these two.
+    (Key::BrowserBack, KeyCode::KEY_BACK), (Key::BrowserForward, KeyCode::KEY_FORWARD),
 
     (Key::NumLock, KeyCode::KEY_NUMLOCK), (Key::KeypadDivide, KeyCode::KEY_KPSLASH),
     (Key::KeypadMultiply, KeyCode::KEY_KPASTERISK), (Key::KeypadMinus, KeyCode::KEY_KPMINUS),
@@ -133,6 +135,14 @@ pub fn code_to_button(code: KeyCode) -> Option<Button> {
         .iter()
         .find(|(_, mapped)| *mapped == code)
         .map(|(button, _)| *button)
+}
+
+/// The key or mouse button an evdev code is, if it is either.
+#[must_use]
+pub fn code_to_holdable(code: KeyCode) -> Option<Holdable> {
+    code_to_key(code)
+        .map(Holdable::Key)
+        .or_else(|| code_to_button(code).map(Holdable::Button))
 }
 
 /// The evdev code for anything holdable.

@@ -23,6 +23,9 @@ pub mod capture;
 pub mod grab;
 #[cfg(feature = "evdev")]
 pub mod inject;
+// The mice a profile's triggers name, held through stand-ins; the grab's own business.
+#[cfg(feature = "evdev")]
+mod pointers;
 #[cfg(feature = "live-tests")]
 pub mod rig;
 #[cfg(feature = "evdev")]

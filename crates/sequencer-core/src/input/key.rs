@@ -133,6 +133,11 @@ pub enum Key {
     PrevTrack,
     BrightnessUp,
     BrightnessDown,
+    /// The browser's back key — also where some mice send their back side button, as a key
+    /// rather than as the button (`mouse4`).
+    BrowserBack,
+    /// The browser's forward key — where those mice send their forward side button.
+    BrowserForward,
 
     NumLock,
     KeypadDivide,
@@ -227,6 +232,7 @@ pub(super) static KEY_NAMES: &[(&str, Key)] = &[
     ("play-pause", Key::PlayPause), ("next-track", Key::NextTrack),
     ("prev-track", Key::PrevTrack),
     ("brightness-up", Key::BrightnessUp), ("brightness-down", Key::BrightnessDown),
+    ("browser-back", Key::BrowserBack), ("browser-forward", Key::BrowserForward),
 
     ("printscreen", Key::PrintScreen), ("prtsc", Key::PrintScreen),
     ("scrolllock", Key::ScrollLock),
@@ -419,6 +425,7 @@ mod tests {
         assert_eq!(Key::LeftBracket.to_string(), "[");
         assert_eq!(Key::Minus.to_string(), "-");
         assert_eq!(Key::VolumeUp.to_string(), "volume-up");
+        assert_eq!(Key::BrowserBack.to_string(), "browser-back");
         assert_eq!(Key::Space.to_string(), "space");
     }
 
@@ -436,6 +443,10 @@ mod tests {
             assert_eq!(name.parse::<Key>().unwrap(), Key::VolumeUp, "{name}");
         }
         assert_eq!("page-up".parse::<Key>().unwrap(), Key::PageUp);
+        assert_eq!(
+            "browser_forward".parse::<Key>().unwrap(),
+            Key::BrowserForward
+        );
         assert_eq!("-".parse::<Key>().unwrap(), Key::Minus);
         assert_eq!("_".parse::<Key>().unwrap(), Key::Minus);
     }

@@ -1,0 +1,15 @@
+# sequencer: keeps a USB mouse's entry in udev's mouse database — the DPI and wheel click
+# angle libinput scales motion and scrolling by — while a sequencer profile holds the mouse.
+#
+# A held mouse reaches the session through a stand-in: a virtual device with the mouse's own
+# name and IDs, marked by the phys "sequencer-stand-in". udev's 70-mouse.rules looks a mouse
+# up by its bus, which it takes from the USB device above a USB mouse — and a stand-in has
+# none. This gives a USB mouse's stand-in that bus, from the bus number it copies, and leaves
+# the lookup to udev. Bluetooth mice need nothing: udev reads that bus from the number. No
+# device but sequencer's stand-ins is touched.
+#
+# Install as /etc/udev/rules.d/69-sequencer-stand-in.rules — 69, to come before udev's
+# 70-mouse.rules — then run `sudo udevadm control --reload-rules`. Stand-ins made after
+# that are looked up; no trigger is needed.
+
+ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", KERNELS=="input*", ATTRS{phys}=="sequencer-stand-in", ATTRS{id/bustype}=="0003", ENV{ID_BUS}="usb"

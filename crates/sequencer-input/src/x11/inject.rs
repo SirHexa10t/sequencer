@@ -29,6 +29,7 @@ use x11rb::rust_connection::RustConnection;
 use sequencer_core::emit::{Emit, EmitAction, Holdable, InputSink, SinkError};
 use sequencer_core::input::{Button, Key, Mods};
 use sequencer_core::time::Duration;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 /// The offset from a Linux evdev code to the X keycode for the same physical key.
@@ -37,7 +38,8 @@ pub(super) const EVDEV_TO_X_KEYCODE: u16 = 8;
 /// Injects synthetic input into the running X server.
 #[derive(Debug)]
 pub struct XTestSink {
-    conn: RustConnection,
+    /// Shared with the [`LiftedTap`] made from this sink: see [`Self::lifted_tap`].
+    conn: Arc<RustConnection>,
     root: Window,
     /// What is currently pressed, newest last, so [`InputSink::release_all`] can undo a
     /// partial click in reverse — the same contract the uinput sink keeps.
@@ -69,10 +71,27 @@ impl XTestSink {
             .map_err(|err| SinkError::Backend(Box::new(err)))?;
         let root = conn.setup().roots[screen].root;
         Ok(Self {
-            conn,
+            conn: Arc::new(conn),
             root,
             held: Vec::new(),
         })
+    }
+
+    /// The [`LiftedTap`] for this sink, on this sink's own connection.
+    ///
+    /// One connection, not two, because a compositor counts injecting clients: Xwayland
+    /// hands each connected X client's XTEST input to the compositor over a libei connection
+    /// of that client's own, named for its command (`setup_ei` in Xwayland's
+    /// `xwayland-xtest.c`, 24.1), and KDE asks the user to allow each new one — two X
+    /// connections asked twice before a single profile could act. (A departed client's libei
+    /// connection is kept for ten minutes and handed to the next client of the same command,
+    /// which is why a rerun inside that time asks nothing.)
+    #[must_use]
+    pub fn lifted_tap(&self) -> LiftedTap {
+        LiftedTap {
+            conn: Arc::clone(&self.conn),
+            root: self.root,
+        }
     }
 
     /// Sends one `XTestFakeInput`. `detail` is an X keycode for a key, or a button number
@@ -201,7 +220,8 @@ impl InputSink for XTestSink {
 
 /// A tap fired while the hand still holds modifiers the target does not name: the
 /// standing keys are lifted, the target tapped clean, and the hand's keys pressed
-/// back down — all real XTEST input on one connection, in one call.
+/// back down — all real XTEST input on one connection, in one call. That connection is
+/// the sink's ([`XTestSink::lifted_tap`]), so a manager injects as one client.
 ///
 /// This is the mechanism `xdotool key --clearmodifiers` has field-proven for years.
 /// An earlier version orchestrated the same steps from the executor, interleaved
@@ -213,21 +233,11 @@ impl InputSink for XTestSink {
 /// key clears it), and a trigger press landing inside arrives unmodified.
 #[derive(Debug)]
 pub struct LiftedTap {
-    conn: RustConnection,
+    conn: Arc<RustConnection>,
     root: Window,
 }
 
 impl LiftedTap {
-    /// Connects and confirms XTEST, like [`XTestSink::open`]; `None` when there is
-    /// no server. Without one, contaminated taps fall back to recolourable injection.
-    #[must_use]
-    pub fn open() -> Option<Self> {
-        let (conn, screen) = x11rb::connect(None).ok()?;
-        conn.xtest_get_version(2, 2).ok()?.reply().ok()?;
-        let root = conn.setup().roots.get(screen)?.root;
-        Some(Self { conn, root })
-    }
-
     /// Taps `targets` (down in order, up in reverse, `duration` between) with the
     /// way cleared first: keys of `held` classes the target does not name are lifted,
     /// and so is `lift_primary` when given — the trigger's own key, when the target
@@ -386,10 +396,13 @@ mod tests {
     /// user can check against `xmodmap -pke`. Off-by-one here is invisible at runtime:
     /// the server accepts any keycode and simply does nothing useful with a wrong one.
     #[test]
-    fn volume_keys_land_on_the_standard_x_keycodes() {
+    fn media_keys_land_on_the_standard_x_keycodes() {
         assert_eq!(x_keycode(Key::VolumeUp), Some(123));
         assert_eq!(x_keycode(Key::VolumeDown), Some(122));
         assert_eq!(x_keycode(Key::Mute), Some(121));
+        // XF86Back and XF86Forward.
+        assert_eq!(x_keycode(Key::BrowserBack), Some(166));
+        assert_eq!(x_keycode(Key::BrowserForward), Some(167));
     }
 
     /// The XTEST button numbering, including the gap X leaves for scroll detents.

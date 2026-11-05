@@ -78,6 +78,18 @@ pub(crate) fn run(config: &TempConfig, args: &[&str]) -> (std::process::ExitStat
     (output.status, text)
 }
 
+/// Whether nobody holds the manager's lock under `config`. The lock file itself stays: the
+/// lock is an advisory `flock`, and keeping one stable inode is what makes taking it
+/// race-free. What must be true once a manager is gone is that nobody holds it — which the
+/// kernel guarantees, however the manager died.
+#[cfg(target_os = "linux")]
+pub(crate) fn lock_is_free(config: &TempConfig) -> bool {
+    let Ok(file) = std::fs::File::open(config.lock_file()) else {
+        return true;
+    };
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok()
+}
+
 /// The file's content right now (empty if it does not exist yet).
 pub(crate) fn read(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
@@ -152,18 +164,19 @@ impl Manager {
         spawned
     }
 
-    /// `profile-apply` on `profiles` on the device backend, holding the rig's keyboard and
+    /// `profile-apply` on `profiles` on the device backend, holding the rig's devices and
     /// nothing of the user's: stdin is the terminal, so session mode elevates on the cached
-    /// sudo ticket. Started once it says it holds that keyboard alone.
+    /// sudo ticket. Started once it says it holds the rig's keyboard alone — the rig's mouse
+    /// it holds only while a profile names its buttons.
     #[cfg(all(feature = "live-tests", target_os = "linux"))]
     pub(crate) fn start_on_devices(config: &TempConfig, profiles: &[&Path]) -> Self {
         use sequencer_cli::input::linux::grab::GRAB_ONLY_VARIABLE;
-        use sequencer_cli::input::linux::rig::TEST_KEYBOARD_NAME;
+        use sequencer_cli::input::linux::rig::{TEST_DEVICES, TEST_KEYBOARD_NAME};
 
         let (child, log) = spawn_manager(config, profiles, |command| {
             command
                 .stdin(Stdio::inherit())
-                .env(GRAB_ONLY_VARIABLE, TEST_KEYBOARD_NAME);
+                .env(GRAB_ONLY_VARIABLE, TEST_DEVICES);
         });
         let mut spawned = Self {
             pid: i32::try_from(child.id()).expect("pid fits"),
@@ -184,6 +197,13 @@ impl Manager {
 
     pub(crate) fn log(&self) -> &Path {
         &self.log
+    }
+
+    /// The manager process itself: on the devices, the elevated run, not the child waiting on
+    /// it through sudo.
+    #[cfg(all(feature = "live-tests", target_os = "linux"))]
+    pub(crate) const fn pid(&self) -> i32 {
+        self.pid
     }
 
     pub(crate) fn alive(&mut self) -> bool {

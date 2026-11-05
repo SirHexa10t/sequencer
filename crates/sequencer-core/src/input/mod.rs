@@ -27,10 +27,12 @@ pub use map::{Category, INPUT_MAP, InputEntry, InputMap};
 /// level and an emitted event's level both defaulting to zero, and a binding only firing
 /// on synthetic events *strictly above* its level, a binding cannot retrigger itself.
 /// The safe behaviour falls out of the arithmetic instead of needing a special case, and
-/// deliberate remap cascades stay possible later by raising the level. Nothing reads the
-/// origin today: the core engine that applied this rule retired (2026-09-29), and the
-/// binds format guards against self-retriggering instead, by refusing any profile whose
-/// output would keep re-pressing its own triggers.
+/// deliberate remap cascades stay possible later by raising the level. That rule itself
+/// retired with the core engine that applied it (2026-09-29): the binds format guards
+/// against self-retriggering instead, by refusing any profile whose output would keep
+/// re-pressing its own triggers. What reads the level now is the profile manager, as a
+/// chain's depth: a trigger fired by a bind's output runs its own bind one deeper, and the
+/// device backend stops chaining at a fixed depth.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EventOrigin {
     /// Real hardware — or an event the backend could not attribute, since failing safe
@@ -190,6 +192,22 @@ pub enum EventKind {
     },
 }
 
+impl EventKind {
+    /// The key or mouse button that went down (`true`) or came up (`false`), for what a
+    /// trigger can be — key and button alike; `None` for the wheel and pointer motion.
+    #[must_use]
+    pub const fn edge(self) -> Option<(crate::emit::Holdable, bool)> {
+        use crate::emit::Holdable;
+        match self {
+            Self::KeyDown(key) => Some((Holdable::Key(key), true)),
+            Self::KeyUp(key) => Some((Holdable::Key(key), false)),
+            Self::ButtonDown(button) => Some((Holdable::Button(button), true)),
+            Self::ButtonUp(button) => Some((Holdable::Button(button), false)),
+            Self::Scroll { .. } | Self::Motion { .. } => None,
+        }
+    }
+}
+
 /// One thing the user did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InputEvent {
@@ -245,6 +263,23 @@ mod tests {
     use alloc::string::ToString as _;
 
     use super::*;
+
+    /// Keys and buttons are edges alike — a trigger can be either — and the wheel and the
+    /// pointer are none.
+    #[test]
+    fn keys_and_buttons_are_edges_and_motion_is_not() {
+        use crate::emit::Holdable;
+        assert_eq!(
+            EventKind::KeyDown(Key::A).edge(),
+            Some((Holdable::Key(Key::A), true))
+        );
+        assert_eq!(
+            EventKind::ButtonUp(Button::Back).edge(),
+            Some((Holdable::Button(Button::Back), false))
+        );
+        assert_eq!(EventKind::Scroll { dx: 0, dy: 1 }.edge(), None);
+        assert_eq!(EventKind::Motion { x: 1, y: 1 }.edge(), None);
+    }
 
     /// The folding rules chords and events must agree on: left/right shift, ctrl and
     /// meta are one class each; right alt is AltGr, its own; non-modifiers are none.

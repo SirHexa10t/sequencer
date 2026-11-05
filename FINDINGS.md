@@ -217,10 +217,39 @@ items marked *live check* still need a run on the KDE machine.
 9. **Fixed by the device backend (2026-11-03), confirmed live (2026-11-03):** its output
    goes through sequencer's virtual keyboard, which needs no permission from KDE (T1).
    XTEST output — the fallback's — still depends on KDE's one-time "remote control"
-   permission; refused, it's dropped with no error, and sequencer can't tell.
-10. **Corrected (2026-11-03): not a Wayland issue.** Mouse buttons can't be triggers in any
-    session: the profile format refuses them ("not hearable yet, only sendable"). Hearing
-    them would be a new feature, which the device backend could carry.
+   permission; refused, it's dropped with no error, and sequencer can't tell. (Xwayland's
+   source, `hw/xwayland/xwayland-xtest.c` in 24.1, explains the counts: one libei connection
+   per connected X client, kept for ten minutes after it leaves and reused by the next client
+   of the same command — so a manager injecting through two connections asked twice, and a
+   rerun inside ten minutes asked nothing. A manager injects through one since 2026-11-04.
+   Key and button events reach KWin with no position, so the first-use pointer jump isn't
+   anything sequencer sends (code); that it comes from KWin setting up a new connection's
+   devices is a hypothesis.)
+10. **Built (2026-11-04), *live check*:** mouse buttons can be triggers on the device
+    backend (code). A mouse is grabbed only while an applied profile names one of its
+    buttons, and passes on through a stand-in carrying its name and IDs, so KWin's settings
+    for it still apply (code). The X11 fallback refuses such a profile, saying why (code).
+    Not carried over: udev's mouse database entry (DPI, wheel click angle) for a USB mouse —
+    udev looks it up only for a device on a USB or Bluetooth bus, and takes a USB one's bus
+    from the USB device above it, which the stand-in hasn't (systemd's
+    `60-persistent-input.rules` and `70-mouse.rules`). An optional udev rule gives a USB
+    mouse's stand-in that bus, and udev then looks it up (developer's call, 2026-11-04:
+    `udev/69-sequencer-stand-in.rules`, README Setup step 4). First live runs (2026-11-04):
+    both mouse tests failed alike — the mouse was never held — while every keyboard test
+    passed, hotplug's among them (run). The manager's log names it: the stand-in could not
+    be made, "Invalid argument" (run). Not the credentials after root is shed, as first
+    supposed: `/dev/uinput` grants the user by uid there, which the drop keeps (run). The
+    cause is evdev 0.13.2's `UI_SET_PHYS` binding, which encodes a one-byte argument where
+    the kernel's request carries a pointer, so the kernel knows no such request (evdev's
+    `src/sys.rs`; the kernel's `uinput.h`). The rig's test mouse, made without a `phys`,
+    works. Fixed upstream in one commit on 0.13.2 (`7fee138a34`, merged 2025-10-10), in no
+    release yet; sequencer now pins evdev to that commit until one carries it (developer's
+    call, 2026-11-04; a `TODO` in the root manifest). **Confirmed live (2026-11-04)** with
+    the pin: `SUDO-TEST.sh` passed whole — a named button fires its bind and never reaches
+    the session, the rest of the mouse passes through a stand-in carrying its name, IDs,
+    buttons and axes, and a mouse is held only while a profile names it (run); the `phys`
+    regression test ran headless and passed (run). With the udev rule installed, its live
+    test passed too (2026-11-05): udev put the test mouse's stand-in on the USB bus (run).
 11. **Half moot (2026-11-03):** on the device backend the manager has no stuck modifier to
     warn about — its virtual keyboard releases everything it held when it goes. `doctor`'s
     `keyboard:` line, and the warning on the Xwayland fallback, still read Xwayland's

@@ -110,20 +110,23 @@ fn injections_grow(log: &Path, above: usize, secs: u64) -> bool {
 }
 
 // The second bind shares its primary key with the profile's own emergency chord on
-// purpose: pressing ctrl+F10 must run the bind, and only ctrl+shift+F10 may stop the
+// purpose: pressing ctrl+End must run the bind, and only ctrl+shift+End may stop the
 // profile — the field bug where any grab on a stop chord's primary stopped it. The
 // bare F9 bind coexists with the ctrl+shift+F9 chord: exact masks, disjoint grabs.
+// No chord here is Ctrl plus an F-key alone: desktops grab those for themselves — KWin's
+// window views sit on Ctrl+F7–F10, XFCE's workspaces on Ctrl+F1–F12 — and a grab the
+// desktop holds is one the manager is refused.
 const MIRROR: &str = "\
 [defaults]
 suppress = true
-emergency_stop = \"ctrl shift f10\"
+emergency_stop = \"ctrl shift end\"
 [binds.f9]
 bind = \"pause\"
 [binds.\"ctrl shift f9\"]
 bind = \"pause\"
-[binds.\"ctrl f10\"]
+[binds.\"ctrl end\"]
 bind = \"pause\"
-[binds.\"ctrl f8\"]
+[binds.\"ctrl insert\"]
 bind = \"ctrl shift pause\"
 ";
 
@@ -199,7 +202,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "{text}"
     );
     assert!(
-        text.contains("to stop this script, press: ctrl shift F10"),
+        text.contains("to stop this script, press: ctrl shift end"),
         "the stop hint must name p1's chord: {text}"
     );
     assert_eq!(
@@ -323,7 +326,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "{out}"
     );
     assert!(
-        out.contains("to stop this script, press: ctrl shift F10"),
+        out.contains("to stop this script, press: ctrl shift end"),
         "the re-apply repeats the stop hint: {out}"
     );
     assert!(
@@ -338,13 +341,13 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     // here would miss the grab (the field bug: worked once, then went dead).
     let before = settled_injections(manager.log());
     press_keys(&[Key::LeftCtrl]);
-    tap_chord(&[Key::F8]);
+    tap_chord(&[Key::Insert]);
     assert!(
         injections_grow(manager.log(), before, 3),
-        "ctrl+F8 fires its extra-modifier target"
+        "ctrl+Insert fires its extra-modifier target"
     );
     let after_first = settled_injections(manager.log());
-    tap_chord(&[Key::F8]);
+    tap_chord(&[Key::Insert]);
     let second_fired = injections_grow(manager.log(), after_first, 3);
     release_keys(&[Key::LeftCtrl]);
     assert!(
@@ -353,14 +356,14 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
          ctrl would have wiped the held state"
     );
 
-    // ctrl+F10 shares the emergency's primary key but not its modifiers: it must run
+    // ctrl+End shares the emergency's primary key but not its modifiers: it must run
     // its own bind — fired between a lift and restore of our injected ctrl — and
     // stop nothing.
     let before = settled_injections(manager.log());
-    tap_chord(&[Key::LeftCtrl, Key::F10]);
+    tap_chord(&[Key::LeftCtrl, Key::End]);
     assert!(
         injections_grow(manager.log(), before, 3),
-        "ctrl+F10 runs its bind rather than being mistaken for the stop chord"
+        "ctrl+End runs its bind rather than being mistaken for the stop chord"
     );
     assert!(
         config.active().join("p1.toml").is_symlink(),
@@ -368,7 +371,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
     );
 
     // A lifted tap must not confuse the stop path: with ctrl+shift held, F9 fires
-    // its tap at once, and F10 — completing the exact emergency chord, since the
+    // its tap at once, and End — completing the exact emergency chord, since the
     // restore left ctrl+shift down — must stop p1. Nothing may fire after the stop.
     let before = settled_injections(manager.log());
     press_keys(&CTRL_SHIFT);
@@ -378,7 +381,7 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         "the lifted tap fires under the held chord"
     );
     let settled = settled_injections(manager.log());
-    tap_chord(&[Key::F10]);
+    tap_chord(&[Key::End]);
     release_keys(&CTRL_SHIFT);
     assert!(
         harness::await_line(manager.log(), "emergency stop: p1.toml unapplied", 3),
@@ -423,16 +426,10 @@ fn the_manager_lifecycle_from_apply_to_empty_set_quit() {
         std::fs::read_dir(config.active()).map_or(true, |mut dir| dir.next().is_none()),
         "active/ is empty afterwards"
     );
-    // The lock file itself stays: the lock is an advisory `flock`, and keeping one
-    // stable inode is what makes taking it race-free. What must be true is that nobody
-    // holds it any more — which the kernel guarantees for us, however the manager died.
-    if config.lock_file().exists() {
-        let file = std::fs::File::open(config.lock_file()).expect("open the lock file");
-        assert!(
-            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok(),
-            "the manager quit but something still holds its lock"
-        );
-    }
+    assert!(
+        harness::lock_is_free(&config),
+        "the manager quit but something still holds its lock"
+    );
 }
 
 /// Ctrl+C semantics plus focus gating: a program-gated profile stays dormant and

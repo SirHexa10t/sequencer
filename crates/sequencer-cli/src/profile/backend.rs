@@ -26,8 +26,9 @@ pub(super) enum Backend {
     X11 {
         /// "Is that key still down?", asked of the X server.
         probe: Option<Box<KeyProbe>>,
-        /// The clean tap between lifted modifiers.
-        lifter: Option<Box<LiftedTap>>,
+        /// The clean tap between lifted modifiers, on the sink's own connection — one
+        /// injecting client, so KDE asks to allow it once.
+        lifter: Box<LiftedTap>,
     },
     /// The grabbed devices, re-emitted through a virtual keyboard.
     #[cfg(feature = "evdev")]
@@ -163,11 +164,12 @@ pub(super) fn open(
                 .unwrap_or_default()
         )));
     }
+    let sink = XTestSink::open()?;
     let backend = Backend::X11 {
         probe: KeyProbe::open().map(Box::new),
-        lifter: LiftedTap::open().map(Box::new),
+        lifter: Box::new(sink.lifted_tap()),
     };
-    Ok((backend, Sink::X11(Box::new(XTestSink::open()?)), fallback))
+    Ok((backend, Sink::X11(Box::new(sink)), fallback))
 }
 
 /// The device backend, started: the devices `opened` already, or opened now as the user;
@@ -197,6 +199,23 @@ fn devices(
     Ok((grab, sink))
 }
 
+/// `chords` as X11's key grabs take them — keys only — or `None` when one holds a mouse
+/// button, which no key grab can name.
+fn key_chords(chords: &[Vec<Holdable>]) -> Option<Vec<Vec<Key>>> {
+    chords
+        .iter()
+        .map(|chord| {
+            chord
+                .iter()
+                .map(|member| match member {
+                    Holdable::Key(key) => Some(*key),
+                    Holdable::Button(_) => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
 impl Backend {
     /// Takes `chords` as triggers, their presses fed to `queue`.
     ///
@@ -206,18 +225,35 @@ impl Backend {
     pub(super) fn grab(
         &self,
         epoch: &Epoch,
-        chords: &[Vec<Key>],
+        chords: &[Vec<Holdable>],
         queue: &EventQueue,
     ) -> std::result::Result<Grab, String> {
         match self {
-            Self::X11 { .. } => GrabCapture::start_into(epoch, chords, queue.clone())
-                .map(Grab::X11)
-                .map_err(|err| err.to_string()),
+            Self::X11 { .. } => {
+                let keys = key_chords(chords).ok_or_else(|| {
+                    "a mouse button can't be a trigger on X11's key grabs: it needs the input \
+                     devices, which this session couldn't open"
+                        .to_owned()
+                })?;
+                GrabCapture::start_into(epoch, &keys, queue.clone())
+                    .map(Grab::X11)
+                    .map_err(|err| err.to_string())
+            }
             #[cfg(feature = "evdev")]
             Self::Devices(grab) => grab
                 .claim(chords)
                 .map(Grab::Devices)
                 .map_err(|err| err.to_string()),
+        }
+    }
+
+    /// Whether mouse buttons can be triggers here: on the devices, which hold the mice; not
+    /// on X11's key grabs, which can't name a button.
+    pub(super) const fn hears_buttons(&self) -> bool {
+        match self {
+            Self::X11 { .. } => false,
+            #[cfg(feature = "evdev")]
+            Self::Devices(_) => true,
         }
     }
 
@@ -233,20 +269,24 @@ impl Backend {
 
     /// Taps `targets` clean of `held`'s classes they don't name; `false` sends the caller to
     /// plain injection. `lift_primary` is X11's: the trigger's own key, which a grabbed
-    /// device's virtual keyboard never saw go down, so never needs lifting.
+    /// device's virtual keyboard never saw go down, so never needs lifting. `depth` is the
+    /// devices': how deep in a chain the bind sending the tap runs (X11's grabs hear XTEST
+    /// input on their own, with no depth to keep).
     pub(super) fn tap_lifted(
         &self,
         targets: &[Holdable],
         held: Mods,
         lift_primary: Option<Key>,
         duration: Duration,
+        depth: u8,
     ) -> bool {
         match self {
-            Self::X11 { lifter, .. } => lifter
-                .as_ref()
-                .is_some_and(|lifter| lifter.tap(targets, held, lift_primary, duration)),
+            Self::X11 { lifter, .. } => {
+                let _ = depth;
+                lifter.tap(targets, held, lift_primary, duration)
+            }
             #[cfg(feature = "evdev")]
-            Self::Devices(grab) => grab.tap_lifted(targets, held, duration),
+            Self::Devices(grab) => grab.tap_lifted(targets, held, duration, depth),
         }
     }
 

@@ -557,6 +557,9 @@ pub struct InputDevice {
     pub node: String,
     /// The name it reports.
     pub name: String,
+    /// Where it says it is attached (`phys`): a USB path for most, empty for many virtual
+    /// devices — and sequencer's own mark on its stand-ins.
+    pub phys: String,
     /// What it declares.
     pub capabilities: Capabilities,
 }
@@ -586,9 +589,13 @@ pub fn list() -> Vec<InputDevice> {
             let device = entry.path().join("device");
             let name = std::fs::read_to_string(device.join("name"))
                 .map_or_else(|_| node.clone(), |name| name.trim().to_owned());
+            let phys = std::fs::read_to_string(device.join("phys"))
+                .map(|phys| phys.trim().to_owned())
+                .unwrap_or_default();
             Some(InputDevice {
                 capabilities: Capabilities::read(&device),
                 name,
+                phys,
                 node,
             })
         })

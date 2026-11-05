@@ -10,16 +10,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use sequencer_core::emit::{Holdable, InputSink};
-use sequencer_core::input::{Key, Mods};
+use sequencer_core::emit::{Emit, Holdable, InputSink, SinkError};
+use sequencer_core::input::{EventOrigin, Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::Clock as _;
 
 use super::backend::{self, Backend, Fallback, Grab};
 use super::state::{LockGuard, scan_active};
-use crate::binds::format::{
-    Profile, chord_mods, parse, patterns_apply, primary_key, trigger_cycle,
-};
+use crate::binds::format::{Profile, chord_mods, parse, patterns_apply, primary, trigger_cycle};
 use crate::binds::run;
 use crate::runtime::{CapturePump, EventPump, Wake};
 use crate::session::{Focus, Layout};
@@ -89,10 +87,10 @@ struct Slot {
     /// The grab signatures this slot's capture holds right now — the routing truth:
     /// an event belongs to whoever GRABBED it, never to whoever declares it, which
     /// is what lets a yielded bind's events arrive at its claimant instead.
-    grabbed: BTreeSet<(Key, Mods)>,
+    grabbed: BTreeSet<(Holdable, Mods)>,
     /// Signatures this slot yielded to a higher-precedence claimant, with the
     /// claimant's name — kept so only the transitions get printed.
-    yielded: BTreeMap<(Key, Mods), String>,
+    yielded: BTreeMap<(Holdable, Mods), String>,
     /// The link's own timestamp when this slot loaded. A re-apply replaces the link,
     /// and the changed stamp is the cue to reload — editing the FILE alone changes
     /// nothing here, which is what keeps a running profile from mutating under the
@@ -108,7 +106,7 @@ struct Slot {
 impl Slot {
     /// This profile's emergency chords the way their events arrive: primary + held
     /// modifier classes, one per alternative spelling.
-    fn stop_chords(&self) -> Vec<(Key, Mods)> {
+    fn stop_chords(&self) -> Vec<(Holdable, Mods)> {
         run::stop_chords(&self.profile)
     }
 
@@ -124,11 +122,11 @@ impl Slot {
 #[derive(Debug, Default)]
 struct Claim {
     /// The trigger chords to grab — one representative per folded signature.
-    chords: Vec<Vec<Key>>,
+    chords: Vec<Vec<Holdable>>,
     /// The signatures those chords cover.
-    sigs: BTreeSet<(Key, Mods)>,
+    sigs: BTreeSet<(Holdable, Mods)>,
     /// Signatures someone earlier already claimed, and who.
-    yielded: BTreeMap<(Key, Mods), String>,
+    yielded: BTreeMap<(Holdable, Mods), String>,
 }
 
 /// Claims every trigger of `profile` whose folded signature is still free, and
@@ -141,11 +139,11 @@ struct Claim {
 fn claim_triggers(
     profile: &Profile,
     claimant: &str,
-    claimed: &mut BTreeMap<(Key, Mods), String>,
+    claimed: &mut BTreeMap<(Holdable, Mods), String>,
 ) -> Claim {
     let mut claim = Claim::default();
     for bind in &profile.binds {
-        let Some(primary) = primary_key(&bind.trigger) else {
+        let Some(primary) = primary(&bind.trigger) else {
             continue;
         };
         let signature = (primary, chord_mods(&bind.trigger));
@@ -216,13 +214,12 @@ fn refresh_wants(slots: &mut BTreeMap<String, Slot>, class: Option<&str>, lang: 
 
 /// The bracketed spelling of the bind owning `signature` in `profile` — the first
 /// spelling, when side-variants share it.
-fn label_of(profile: &Profile, signature: (Key, Mods)) -> String {
+fn label_of(profile: &Profile, signature: (Holdable, Mods)) -> String {
     profile
         .binds
         .iter()
         .find(|bind| {
-            primary_key(&bind.trigger) == Some(signature.0)
-                && chord_mods(&bind.trigger) == signature.1
+            primary(&bind.trigger) == Some(signature.0) && chord_mods(&bind.trigger) == signature.1
         })
         .map_or_else(String::new, |bind| {
             format!("[binds.\"{}\"]", bind.trigger_text)
@@ -471,15 +468,14 @@ fn dispatch(
     focus: Option<&Focus>,
     layout: Option<&Layout>,
 ) -> Result<()> {
-    let (sequencer_core::input::EventKind::KeyDown(key)
-    | sequencer_core::input::EventKind::KeyUp(key)) = event.kind
-    else {
+    // A key or a mouse button, down or up: what a trigger can be.
+    let Some((input, down)) = event.kind.edge() else {
         return Ok(());
     };
-    if matches!(event.kind, sequencer_core::input::EventKind::KeyDown(_)) {
+    if down {
         let stopping: Vec<String> = slots
             .iter()
-            .filter(|(_, slot)| slot.stop_chords().contains(&(key, event.mods)))
+            .filter(|(_, slot)| slot.stop_chords().contains(&(input, event.mods)))
             .map(|(name, _)| name.clone())
             .collect();
         if !stopping.is_empty() {
@@ -491,7 +487,7 @@ fn dispatch(
     }
     let Some((name, slot)) = slots
         .iter_mut()
-        .find(|(_, slot)| slot.grabbed.contains(&(key, event.mods)))
+        .find(|(_, slot)| slot.grabbed.contains(&(input, event.mods)))
     else {
         return Ok(());
     };
@@ -524,6 +520,13 @@ fn dispatch(
     // The same question, single key: the wait a tap owes when its target re-presses the
     // trigger's own key.
     let key_down_fn = move |key: Key| backend.any_down(&[key]);
+    // How deep in a chain this bind runs: a hand's press is depth 0, and a trigger fired by
+    // another bind's output is one deeper than that bind ran. What it sends carries the
+    // depth, so the device backend knows when to stop chaining (X11's grabs keep none).
+    let depth = match event.origin {
+        EventOrigin::Physical => 0,
+        EventOrigin::Synthetic { level } => level,
+    };
     // A tap whose trigger holds classes its target does not name fires between
     // lifted modifiers: the standing keys come up, the tap lands clean, and the
     // hand's keys go back down — one backend call, one connection or one device.
@@ -531,7 +534,7 @@ fn dispatch(
                         held: Mods,
                         primary: Option<Key>,
                         hold: sequencer_core::time::Duration| {
-        backend.tap_lifted(targets, held, primary, hold)
+        backend.tap_lifted(targets, held, primary, hold, depth)
     };
     let stops = slot.stop_chords();
     let mut pumps = run::Pumps {
@@ -545,11 +548,40 @@ fn dispatch(
         key_down: Some(&key_down_fn as &dyn Fn(Key) -> bool),
         lift: Some(&lift_fn as run::LiftTap<'_>),
     };
-    let mut executor = run::Executor::new(&slot.profile, sink, clock, rng, &mut slot.held);
+    let mut at_depth = AtDepth {
+        sink: &mut *sink,
+        depth,
+    };
+    let mut executor = run::Executor::new(&slot.profile, &mut at_depth, clock, rng, &mut slot.held);
     let outcome = executor.handle(event, &mut pumps)?;
     match outcome {
         None | Some(run::Outcome::SourceClosed) => Ok(()),
         Some(run::Outcome::EmergencyStop) => stop_slot(out, sink, clock, slots, &name),
+    }
+}
+
+/// The sink a bind runs on, every emit stamped with the depth the bind runs at in a chain:
+/// what decides whether the device backend lets its output fire another trigger. The
+/// executor itself knows nothing of chains, and needn't.
+struct AtDepth<'a> {
+    sink: &'a mut dyn InputSink,
+    depth: u8,
+}
+
+impl InputSink for AtDepth<'_> {
+    fn emit(&mut self, emit: &Emit) -> std::result::Result<(), SinkError> {
+        self.sink.emit(&Emit {
+            level: self.depth,
+            ..*emit
+        })
+    }
+
+    fn flush(&mut self) -> std::result::Result<(), SinkError> {
+        self.sink.flush()
+    }
+
+    fn release_all(&mut self) {
+        self.sink.release_all();
     }
 }
 
@@ -658,7 +690,7 @@ struct Enforcement<'a, S: InputSink> {
     /// Refused links, with the stamp they were refused at: a re-apply replaces the
     /// link, and the changed stamp is what earns a retry.
     failed: BTreeMap<String, Option<std::time::SystemTime>>,
-    emergency: Option<(BTreeSet<Vec<Key>>, Grab)>,
+    emergency: Option<(BTreeSet<Vec<Holdable>>, Grab)>,
     /// The configuration directory, resolved once at start: the set's links and the
     /// stopping marker live under it, and a teardown must not depend on re-reading
     /// the environment.
@@ -727,7 +759,7 @@ fn teardown(
     sink: &mut dyn InputSink,
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, Grab)>,
+    emergency: &mut Option<(BTreeSet<Vec<Holdable>>, Grab)>,
 ) {
     for (_, mut slot) in std::mem::take(slots) {
         if let Some(mut capture) = slot.capture.take() {
@@ -756,13 +788,13 @@ fn rescan(
     clock: &SystemClock,
     slots: &mut BTreeMap<String, Slot>,
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, Grab)>,
+    emergency: &mut Option<(BTreeSet<Vec<Holdable>>, Grab)>,
     focus: &mut Option<Focus>,
     layout: &mut Option<Layout>,
     rescan_dir: bool,
 ) -> Result<()> {
     if rescan_dir {
-        reconcile_set(out, clock, sink, slots, failed)?;
+        reconcile_set(out, clock, sink, slots, failed, backend.hears_buttons())?;
     }
     reconcile_emergency(out, epoch, queue, backend, slots, emergency);
     ensure_watchers(out, slots, focus, layout)?;
@@ -791,9 +823,9 @@ fn reconcile_emergency(
     queue: &sequencer_input::EventQueue,
     backend: &Backend,
     slots: &BTreeMap<String, Slot>,
-    emergency: &mut Option<(BTreeSet<Vec<Key>>, Grab)>,
+    emergency: &mut Option<(BTreeSet<Vec<Holdable>>, Grab)>,
 ) {
-    let wanted: BTreeSet<Vec<Key>> = slots
+    let wanted: BTreeSet<Vec<Holdable>> = slots
         .values()
         .flat_map(|slot| slot.profile.emergency_stop.iter().cloned())
         .collect();
@@ -808,7 +840,7 @@ fn reconcile_emergency(
         capture.stop();
     }
     if !wanted.is_empty() {
-        let chords: Vec<Vec<Key>> = wanted.iter().cloned().collect();
+        let chords: Vec<Vec<Holdable>> = wanted.iter().cloned().collect();
         match backend.grab(epoch, &chords, queue) {
             Ok(capture) => *emergency = Some((wanted, capture)),
             Err(err) => {
@@ -878,7 +910,7 @@ fn reconcile_activation(
 
     // The claim pass. Stops are seeded for every slot, dormant ones included — the
     // emergency grab stays alive regardless of focus, and no bind may shadow it.
-    let mut claimed: BTreeMap<(Key, Mods), String> = slots
+    let mut claimed: BTreeMap<(Holdable, Mods), String> = slots
         .values()
         .flat_map(Slot::stop_chords)
         .map(|stop| (stop, "the emergency grab".to_owned()))
@@ -980,6 +1012,7 @@ fn reconcile_set(
     sink: &mut dyn InputSink,
     slots: &mut BTreeMap<String, Slot>,
     failed: &mut BTreeMap<String, Option<std::time::SystemTime>>,
+    hears_buttons: bool,
 ) -> Result<()> {
     let set = scan_active()?;
     // Gone, or re-applied: a replaced link carries a fresh stamp, and a reload is a
@@ -1053,6 +1086,11 @@ fn reconcile_set(
                     failed.insert(name.clone(), stamp);
                     continue;
                 }
+                if let Some(why) = unhearable(&profile, hears_buttons) {
+                    writeln!(out, "profile refused: {name}: {why}")?;
+                    failed.insert(name.clone(), stamp);
+                    continue;
+                }
                 let verb = if updated.contains(name) {
                     "profile updated"
                 } else {
@@ -1081,6 +1119,15 @@ fn reconcile_set(
         }
     }
     Ok(())
+}
+
+/// Why `profile` can't run on this backend, if it can't: a mouse-button trigger where
+/// only keys can be heard. Refused at load — a conflict to wait out it is not.
+fn unhearable(profile: &Profile, hears_buttons: bool) -> Option<&'static str> {
+    (!hears_buttons && profile.names_a_mouse_button()).then_some(
+        "a mouse button can't be a trigger on X11's key grabs: it needs the input devices, \
+         which this manager couldn't open",
+    )
 }
 
 /// Reads and validates one profile for the manager.
@@ -1207,12 +1254,12 @@ mod tests {
         let gated = profile("[defaults]\nprogram = \"*term*\"\n[binds.\"ctrl w\"]\nbind = \"q\"");
         let global =
             profile("[binds.\"ctrl w\"]\nbind = \"p\"\n\n[binds.\"ctrl e\"]\nbind = \"p\"");
-        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+        let mut claimed: BTreeMap<(Holdable, Mods), String> = BTreeMap::new();
 
         let first = claim_triggers(&gated, "gated.toml", &mut claimed);
         let second = claim_triggers(&global, "global.toml", &mut claimed);
 
-        let ctrl_w = (Key::W, Mods::CTRL);
+        let ctrl_w = (Holdable::Key(Key::W), Mods::CTRL);
         assert!(first.sigs.contains(&ctrl_w), "the gated profile claims it");
         assert!(first.yielded.is_empty());
         assert!(!second.sigs.contains(&ctrl_w), "the global slot yields it");
@@ -1222,7 +1269,7 @@ mod tests {
             "the yield names its claimant"
         );
         assert!(
-            second.sigs.contains(&(Key::E, Mods::CTRL)),
+            second.sigs.contains(&(Holdable::Key(Key::E), Mods::CTRL)),
             "the global slot's other bind stays live"
         );
         assert_eq!(second.chords.len(), 1, "one grab survives the yield");
@@ -1234,8 +1281,8 @@ mod tests {
     #[test]
     fn stop_chords_outrank_every_bind() {
         let global = profile("[binds.\"ctrl shift F10\"]\nbind = \"p\"\n\n[binds.q]\nbind = \"p\"");
-        let stop = (Key::F10, Mods::CTRL.and(Mods::SHIFT));
-        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+        let stop = (Holdable::Key(Key::F10), Mods::CTRL.and(Mods::SHIFT));
+        let mut claimed: BTreeMap<(Holdable, Mods), String> = BTreeMap::new();
         claimed.insert(stop, "the emergency grab".to_owned());
 
         let claim = claim_triggers(&global, "global.toml", &mut claimed);
@@ -1247,7 +1294,7 @@ mod tests {
             claim.yielded.get(&stop).map(String::as_str),
             Some("the emergency grab")
         );
-        assert!(claim.sigs.contains(&(Key::Q, Mods::NONE)));
+        assert!(claim.sigs.contains(&(Holdable::Key(Key::Q), Mods::NONE)));
     }
 
     /// Side-variant spellings collapse to one grab within their own slot — the
@@ -1257,7 +1304,7 @@ mod tests {
         let both = profile(
             "[binds.\"shift >\"]\nbind = \"shift ]\"\n\n[binds.\"rshift >\"]\nbind = \"q\"",
         );
-        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+        let mut claimed: BTreeMap<(Holdable, Mods), String> = BTreeMap::new();
         let claim = claim_triggers(&both, "p.toml", &mut claimed);
         assert_eq!(claim.chords.len(), 1, "one grab for both spellings");
         assert!(claim.yielded.is_empty(), "sharing is not yielding");
@@ -1270,17 +1317,19 @@ mod tests {
     fn colliding_globals_lose_only_the_shared_bind() {
         let first = profile("[binds.F5]\nbind = \"p\"");
         let second = profile("[binds.F5]\nbind = \"q\"\n\n[binds.F6]\nbind = \"q\"");
-        let mut claimed: BTreeMap<(Key, Mods), String> = BTreeMap::new();
+        let mut claimed: BTreeMap<(Holdable, Mods), String> = BTreeMap::new();
 
         let a = claim_triggers(&first, "a.toml", &mut claimed);
         let b = claim_triggers(&second, "b.toml", &mut claimed);
-        assert!(a.sigs.contains(&(Key::F5, Mods::NONE)));
+        assert!(a.sigs.contains(&(Holdable::Key(Key::F5), Mods::NONE)));
         assert_eq!(
-            b.yielded.get(&(Key::F5, Mods::NONE)).map(String::as_str),
+            b.yielded
+                .get(&(Holdable::Key(Key::F5), Mods::NONE))
+                .map(String::as_str),
             Some("a.toml")
         );
         assert!(
-            b.sigs.contains(&(Key::F6, Mods::NONE)),
+            b.sigs.contains(&(Holdable::Key(Key::F6), Mods::NONE)),
             "the rest of b stays live"
         );
     }
@@ -1289,8 +1338,11 @@ mod tests {
     #[test]
     fn labels_name_the_written_spelling() {
         let p = profile("[binds.\"ctrl w\"]\nbind = \"q\"");
-        assert_eq!(label_of(&p, (Key::W, Mods::CTRL)), "[binds.\"ctrl w\"]");
-        assert_eq!(label_of(&p, (Key::Q, Mods::NONE)), "");
+        assert_eq!(
+            label_of(&p, (Holdable::Key(Key::W), Mods::CTRL)),
+            "[binds.\"ctrl w\"]"
+        );
+        assert_eq!(label_of(&p, (Holdable::Key(Key::Q), Mods::NONE)), "");
     }
 
     /// A loaded slot as `reconcile_set` builds it, with `held` as the run left it.
@@ -1404,5 +1456,49 @@ mod tests {
             "released once, not per stop"
         );
         let _ = std::fs::remove_dir_all(config);
+    }
+
+    /// A mouse-button trigger — or stop — is refused where only keys can be heard, with
+    /// the reason, and runs where the mice can be held; a profile of keys runs anywhere.
+    #[test]
+    fn a_mouse_trigger_needs_a_backend_that_hears_buttons() {
+        let clicks = profile("[binds.mouse4]\nbind = \"a\"");
+        let stops_on_a_click =
+            profile("[defaults]\nemergency_stop = \"mouse5\"\n[binds.F9]\nbind = \"a\"");
+        let keys = profile("[binds.F9]\nbind = \"mouse4\"");
+        for profile in [&clicks, &stops_on_a_click] {
+            let why = unhearable(profile, false).expect("refused on X11's grabs");
+            assert!(why.contains("X11's key grabs"), "{why}");
+            assert_eq!(unhearable(profile, true), None);
+        }
+        assert_eq!(
+            unhearable(&keys, false),
+            None,
+            "a button sent is fine anywhere"
+        );
+    }
+
+    /// A bind runs at the depth of the event that fired it, and everything it sends says
+    /// so — the executor emits at no depth of its own — while flushes and releases pass
+    /// straight through.
+    #[test]
+    fn what_a_bind_sends_carries_its_chain_depth() {
+        use sequencer_core::emit::EmitAction;
+        let watcher = sequencer_input::MockInjector::new();
+        let mut inner = watcher.clone();
+        let mut at_depth = AtDepth {
+            sink: &mut inner,
+            depth: 3,
+        };
+        let press = Emit {
+            at: sequencer_core::time::Timestamp::ZERO,
+            action: EmitAction::KeyDown(Key::X),
+            level: 0,
+        };
+        at_depth.emit(&press).unwrap();
+        at_depth.flush().unwrap();
+        at_depth.release_all();
+        assert_eq!(watcher.recorded(), [Emit { level: 3, ..press }]);
+        assert_eq!(watcher.release_all_calls(), 1);
     }
 }

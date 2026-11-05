@@ -381,6 +381,32 @@ mod tests {
         assert!(INPUT_GROUP_CAUTION.contains("keylogging"));
     }
 
+    /// The README's standing setup writes the files doctor's fixes name, with their contents,
+    /// and in a form that runs as typed in bash, zsh and fish alike — fish has no heredoc, so
+    /// a file goes in through `printf … | sudo tee` (one did fail there, 2026-11-05).
+    #[test]
+    fn the_readme_writes_doctors_files_in_a_form_every_shell_runs() {
+        let readme = include_str!("../../../README.md");
+        let all = [
+            Requirement::UinputModuleLoaded,
+            Requirement::UinputNodeWritable,
+            Requirement::EvdevReadable,
+        ];
+        for step in all
+            .into_iter()
+            .flat_map(|requirement| requirement.remediation().steps)
+        {
+            if let Step::WriteFile { path, body } = step {
+                assert!(readme.contains(path), "the README never writes {path}");
+                assert!(
+                    readme.contains(body.trim_end()),
+                    "the README writes other contents into {path}"
+                );
+            }
+        }
+        assert!(!readme.contains("<<"), "a heredoc, which fish can't run");
+    }
+
     /// sudo is asked for only where root meets what this user can't: the permissions. A
     /// missing `/dev/uinput` is beyond root too, so a password would buy nothing there.
     #[test]

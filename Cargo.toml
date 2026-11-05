@@ -30,7 +30,17 @@ clap = { version = "4", default-features = false }
 # two brought nine crates between them.
 log = { version = "0.4", default-features = false }
 spin_sleep = "1.3"
-evdev = "0.13"
+# TODO: back to a crates.io release (`evdev = "0.13.x"`) once one carries the fix this
+# commit pins — and drop its `allow-git` entry in deny.toml with it. evdev 0.13.2, the
+# latest release as of 2026-11-04, encodes the `UI_SET_PHYS` ioctl with a one-byte
+# argument where the kernel's request carries a pointer, so the kernel refuses it
+# ("Invalid argument") and no mouse's stand-in can be made: its `phys` is how sequencer
+# and the stand-in udev rule know it (found live, 2026-11-04). This commit is 0.13.2 plus
+# that one fix (upstream PR #163, `src/sys.rs` alone; nix still 0.29), merged 2025-10-10
+# and in no release since. Pinned by rev, never a branch, so the build can't move under us;
+# the version beside it is cargo-deny's (a git dependency without one counts as a
+# wildcard), and leaves only `git` and `rev` to delete when a release comes.
+evdev = { version = "0.13.2", git = "https://github.com/emberian/evdev", rev = "5055f650b3a8c4ef45fd548e58bc080009462f2d" }
 # X11 XTEST injection and key grabs — pure Rust, no libX11.
 # `xtest` injects, `xkb` reads which keyboard layout (group) is active.
 x11rb = { version = "0.14", default-features = false, features = ["xtest", "xkb"] }

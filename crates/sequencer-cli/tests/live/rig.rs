@@ -1,13 +1,15 @@
 //! The test's side of `sequencer-live-rig`, the root helper for the device tiers: started on
-//! the cached sudo ticket, told what to type on its test keyboard, and asked what
-//! sequencer's virtual keyboard sent back. Every judgement stays here, unprivileged.
+//! the cached sudo ticket, told what to type on its test keyboard and do with its test mouse,
+//! and asked what sequencer's virtual keyboard sent back and what a mouse's stand-in passed
+//! on. Every judgement stays here, unprivileged.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use sequencer_cli::core::input::Key;
+use sequencer_cli::core::input::{Button, Key};
+use sequencer_cli::input::linux::rig::TEST_MOUSE_BUTTONS;
 
 /// How long the rig may take to start: sudo, then a keyboard and its device node.
 const START_WITHIN: Duration = Duration::from_secs(10);
@@ -34,8 +36,19 @@ pub(crate) struct Rig {
     input: Option<ChildStdin>,
     /// Its answers, in order.
     answers: Receiver<String>,
-    /// What the virtual keyboard sent once watched, in order.
-    sent: Receiver<(Key, i32)>,
+    /// What the virtual keyboard sent once watched, in order, each when it came.
+    sent: Receiver<(Instant, Key, i32)>,
+    /// What the test mouse's stand-in passed on once watched, in order.
+    passed: Receiver<Passed>,
+}
+
+/// One thing the test mouse's stand-in passed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Passed {
+    /// A button going down (1) or coming up (0).
+    Button(Button, i32),
+    /// One frame's motion: its steps to the right and down.
+    Moved(i32, i32),
 }
 
 impl Rig {
@@ -52,11 +65,16 @@ impl Rig {
         let output = child.stdout.take().expect("the rig's output is piped");
         let (answered, answers) = mpsc::channel();
         let (sends, sent) = mpsc::channel();
+        let (stood_in, passed) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines().map_while(Result::ok) {
-                let delivered = match line.strip_prefix("out ") {
-                    Some(event) => parse_sent(event).is_none_or(|event| sends.send(event).is_ok()),
-                    None => answered.send(line).is_ok(),
+                let delivered = if let Some(event) = line.strip_prefix("out ") {
+                    parse_sent(event)
+                        .is_none_or(|(key, value)| sends.send((Instant::now(), key, value)).is_ok())
+                } else if let Some(event) = line.strip_prefix("in ") {
+                    parse_passed(event).is_none_or(|event| stood_in.send(event).is_ok())
+                } else {
+                    answered.send(line).is_ok()
                 };
                 if !delivered {
                     break;
@@ -68,6 +86,7 @@ impl Rig {
             child,
             answers,
             sent,
+            passed,
         };
         match rig.answers.recv_timeout(START_WITHIN) {
             Ok(line) if line == "ready" => Some(rig),
@@ -132,6 +151,16 @@ impl Rig {
         );
     }
 
+    /// Puts a new test keyboard in place of the old one, as a keyboard back from a suspend
+    /// comes back a new device.
+    pub(crate) fn replug(&mut self) {
+        let answer = self.command("replug");
+        assert_eq!(
+            answer, "replugged",
+            "the rig could not plug a new keyboard in"
+        );
+    }
+
     /// Whether a grab holds the test keyboard.
     pub(crate) fn held(&mut self) -> bool {
         match self.command("held").as_str() {
@@ -141,9 +170,74 @@ impl Rig {
         }
     }
 
+    /// Plugs in the test mouse: the buttons a profile names, two axes and a wheel. Nothing
+    /// may be sent from it until its stand-in is watched: until then, a click or a move would
+    /// reach the user's session.
+    pub(crate) fn plug_mouse(&mut self) {
+        let answer = self.command("mouse");
+        assert_eq!(answer, "plugged", "the rig could not plug a mouse in");
+    }
+
+    /// Clicks `button` on the test mouse: down, then up.
+    pub(crate) fn click(&mut self, button: Button) {
+        for verb in ["mpress", "mrelease"] {
+            let answer = self.command(&format!("{verb} {button}"));
+            assert_eq!(answer, "ok", "the rig would not {verb} {button}");
+            std::thread::sleep(BETWEEN_KEYS);
+        }
+    }
+
+    /// Moves the test mouse `across` to the right and `down`.
+    pub(crate) fn move_by(&mut self, across: i32, down: i32) {
+        let answer = self.command(&format!("move {across} {down}"));
+        assert_eq!(answer, "ok", "the rig would not move its mouse");
+        std::thread::sleep(BETWEEN_KEYS);
+    }
+
+    /// Whether a grab holds the test mouse.
+    pub(crate) fn mouse_held(&mut self) -> bool {
+        match self.command("mouse-held").as_str() {
+            "held" => true,
+            "free" => false,
+            other => panic!("the rig can't tell whether its mouse is held: {other}"),
+        }
+    }
+
+    /// Grabs the test mouse's stand-in, so that what it passes on comes to [`Self::passed`]
+    /// and reaches nothing else — the rig checking first that it carries the mouse's name,
+    /// IDs, buttons and axes.
+    pub(crate) fn watch_stand_in(&mut self) {
+        let answer = self.command("watch-stand-in");
+        assert_eq!(
+            answer, "watching",
+            "the rig found no stand-in for its mouse to watch, or a wrong one"
+        );
+    }
+
+    /// What the test mouse's stand-in passed on since last asked: once it begins, until it
+    /// falls quiet — or nothing, if it doesn't begin within [`FIRST_SENT_WITHIN`].
+    pub(crate) fn passed(&self) -> Vec<Passed> {
+        let mut events = Vec::new();
+        let mut wait = FIRST_SENT_WITHIN;
+        while let Ok(event) = self.passed.recv_timeout(wait) {
+            events.push(event);
+            wait = QUIET;
+        }
+        events
+    }
+
     /// What the virtual keyboard sent since last asked: once it begins, until it falls
     /// quiet — or nothing, if it doesn't begin within [`FIRST_SENT_WITHIN`].
     pub(crate) fn sent(&self) -> Vec<(Key, i32)> {
+        self.sent_timed()
+            .into_iter()
+            .map(|(_, key, value)| (key, value))
+            .collect()
+    }
+
+    /// [`Self::sent`], each event with when it came — for what a profile's timing must
+    /// keep apart.
+    pub(crate) fn sent_timed(&self) -> Vec<(Instant, Key, i32)> {
         let mut events = Vec::new();
         let mut wait = FIRST_SENT_WITHIN;
         while let Ok(event) = self.sent.recv_timeout(wait) {
@@ -210,4 +304,20 @@ fn ended_within(child: &mut Child, polls: u32) -> bool {
 fn parse_sent(text: &str) -> Option<(Key, i32)> {
     let (key, value) = text.rsplit_once(' ')?;
     Some((key.parse().ok()?, value.parse().ok()?))
+}
+
+/// `button BUTTON VALUE` or `move ACROSS DOWN`, as the rig says what a stand-in passed on.
+fn parse_passed(text: &str) -> Option<Passed> {
+    let (what, rest) = text.split_once(' ')?;
+    let (first, second) = rest.split_once(' ')?;
+    match what {
+        "button" => {
+            let button = TEST_MOUSE_BUTTONS
+                .into_iter()
+                .find(|button| button.to_string() == first)?;
+            Some(Passed::Button(button, second.parse().ok()?))
+        }
+        "move" => Some(Passed::Moved(first.parse().ok()?, second.parse().ok()?)),
+        _ => None,
+    }
 }

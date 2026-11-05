@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use sequencer_core::emit::Holdable;
-use sequencer_core::input::{Key, Mods};
+use sequencer_core::input::{Button, Key, Mods};
 use sequencer_core::time::Duration;
 
 /// A parsed, validated binds file.
@@ -28,7 +28,7 @@ pub(crate) struct Profile {
     pub(crate) kb_lang: Option<Vec<String>>,
     /// Chords that stop the whole run gracefully, releasing everything held — any
     /// one of them fires it. Empty when the file names none.
-    pub(crate) emergency_stop: Vec<Vec<Key>>,
+    pub(crate) emergency_stop: Vec<Vec<Holdable>>,
 }
 
 /// One `[binds.<trigger>]` section.
@@ -36,8 +36,8 @@ pub(crate) struct Profile {
 pub(crate) struct Bind {
     /// The trigger, as written — for error and banner text.
     pub(crate) trigger_text: String,
-    /// The trigger keys. One for a plain key; several for a chord trigger.
-    pub(crate) trigger: Vec<Key>,
+    /// The trigger: one key or mouse button, after the modifiers of a chord trigger.
+    pub(crate) trigger: Vec<Holdable>,
     /// What the binding does.
     pub(crate) action: Action,
     /// How long a tap in this binding holds the key down.
@@ -66,6 +66,21 @@ pub(crate) enum Loops {
 }
 
 impl Profile {
+    /// Whether a trigger or a stop chord here is a mouse button — which only the device
+    /// backend can hear.
+    #[cfg_attr(
+        not(all(feature = "xtest", target_os = "linux")),
+        allow(dead_code, reason = "used by the profile manager and by tests")
+    )]
+    pub(crate) fn names_a_mouse_button(&self) -> bool {
+        self.binds
+            .iter()
+            .map(|bind| &bind.trigger)
+            .chain(&self.emergency_stop)
+            .flatten()
+            .any(|member| matches!(member, Holdable::Button(_)))
+    }
+
     /// Every check a profile must pass that is about the *set* of binds rather than any
     /// one of them: no stop chord doubling as a trigger, no two spellings sharing a grab,
     /// no circle of binds feeding each other. Called by [`parse`] once a file's binds are
@@ -78,7 +93,7 @@ impl Profile {
         binds: Vec<Bind>,
         program: Option<Vec<String>>,
         kb_lang: Option<Vec<String>>,
-        emergency_stop: Vec<Vec<Key>>,
+        emergency_stop: Vec<Vec<Holdable>>,
     ) -> Result<Self, String> {
         for stop in &emergency_stop {
             if let Some(bind) = binds.iter().find(|bind| &bind.trigger == stop) {
@@ -100,16 +115,16 @@ impl Profile {
         // chord, matched by folded classes alone, must stay unambiguous — it may not
         // blur into any bind's grab. Alt is the exception to the folding: right alt is
         // AltGr, its own bit.
-        let mut grabs: BTreeMap<(Option<Key>, Mods), String> = BTreeMap::new();
+        let mut grabs: BTreeMap<(Option<Holdable>, Mods), String> = BTreeMap::new();
         for bind in &binds {
-            let signature = (primary_key(&bind.trigger), chord_mods(&bind.trigger));
+            let signature = (primary(&bind.trigger), chord_mods(&bind.trigger));
             let label = format!("[binds.\"{}\"]", bind.trigger_text);
             grabs.entry(signature).or_insert(label);
         }
         // The stop chords join the same grab space — the manager grabs them alongside
         // the triggers, and X cannot hold two grabs on one combination.
         for stop in &emergency_stop {
-            let signature = (primary_key(stop), chord_mods(stop));
+            let signature = (primary(stop), chord_mods(stop));
             let label = format!("emergency_stop \"{}\"", chord_text(stop));
             if let Some(previous) = grabs.insert(signature, label.clone()) {
                 return Err(format!(
@@ -272,7 +287,7 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
     let emergency_stop = parse_emergency(defaults.emergency_stop)?;
 
     let mut binds = Vec::with_capacity(raw.binds.len());
-    let mut seen: BTreeMap<Vec<Key>, String> = BTreeMap::new();
+    let mut seen: BTreeMap<Vec<Holdable>, String> = BTreeMap::new();
     for (trigger_text, raw_bind) in raw.binds {
         let context = format!("[binds.\"{trigger_text}\"]");
         let bind = lower_bind(&trigger_text, &raw_bind, default_tap, default_gap)
@@ -308,8 +323,9 @@ pub(crate) fn parse(text: &str) -> Result<Profile, String> {
     Profile::assemble(binds, program, kb_lang, emergency_stop)
 }
 
-/// A chord the way a user would write it: the keys' display names, space-joined.
-pub(crate) fn chord_text(chord: &[Key]) -> String {
+/// A chord the way a user would write it: the keys' display names and the buttons' binds
+/// spellings (`mouse4`), space-joined.
+pub(crate) fn chord_text(chord: &[Holdable]) -> String {
     chord
         .iter()
         .map(ToString::to_string)
@@ -317,28 +333,28 @@ pub(crate) fn chord_text(chord: &[Key]) -> String {
         .join(" ")
 }
 
-/// The one non-modifier key of a chord — what an X grab actually fires on.
+/// The one member of a chord that isn't a modifier — the key or mouse button a grab
+/// actually fires on.
 ///
 /// Mirrors the split the grab layer performs, so the manager can route an arriving
-/// keycode back to the bind that asked for it. `None` for an all-modifier chord, which
+/// press back to the bind that asked for it. `None` for an all-modifier chord, which
 /// validation refuses anyway.
-pub(crate) fn primary_key(chord: &[Key]) -> Option<Key> {
-    chord.iter().copied().find(|key| !is_modifier(*key))
+pub(crate) fn primary(chord: &[Holdable]) -> Option<Holdable> {
+    chord.iter().copied().find(|member| match member {
+        Holdable::Key(key) => !is_modifier(*key),
+        Holdable::Button(_) => true,
+    })
 }
 
-/// The modifier classes a chord names, folded the way the grab layer folds them —
-/// [`Mods`] is the one table for it, shared with the live event path so a trigger
-/// and the event it fires can never disagree about what "its modifiers" means.
-pub(crate) fn chord_mods(chord: &[Key]) -> Mods {
-    Mods::of_chord(chord)
-}
-
-/// The modifier classes a bind's *target* names — the keys it will synthesize.
-pub(crate) fn target_mods(targets: &[Holdable]) -> Mods {
+/// The modifier classes a chord names — a trigger, or a target the bind synthesizes —
+/// folded the way the grab layer folds them: [`Mods`] is the one table for it, shared
+/// with the live event path so a trigger and the event it fires can never disagree about
+/// what "its modifiers" means. Buttons name none.
+pub(crate) fn chord_mods(chord: &[Holdable]) -> Mods {
     Mods::of_chord(
-        &targets
+        &chord
             .iter()
-            .filter_map(|target| match target {
+            .filter_map(|member| match member {
                 Holdable::Key(key) => Some(*key),
                 Holdable::Button(_) => None,
             })
@@ -360,7 +376,10 @@ pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
         let pressed: Vec<Key> = bind
             .trigger
             .iter()
-            .copied()
+            .filter_map(|member| match member {
+                Holdable::Key(key) => Some(*key),
+                Holdable::Button(_) => None,
+            })
             .chain(action_keys(bind))
             .collect();
         let locks: Vec<String> = LOCKS
@@ -378,11 +397,21 @@ pub(crate) fn warnings(profile: &Profile) -> Vec<String> {
                 locks.join(" and ")
             ));
         }
+        if let Some(Holdable::Button(button @ (Button::Left | Button::Right))) =
+            primary(&bind.trigger)
+        {
+            notes.push(format!(
+                "[binds.\"{}\"]: the {button} button is a trigger here, so while the profile \
+                 applies, a {button} click goes to the bind and never to the app under the \
+                 pointer; a side button (mouse4, mouse5) is the safe trigger",
+                bind.trigger_text
+            ));
+        }
         let Action::Mirror(targets) = &bind.action else {
             continue;
         };
         let held = chord_mods(&bind.trigger);
-        let wanted = target_mods(targets);
+        let wanted = chord_mods(targets);
         if !wanted.covers(held) {
             notes.push(format!(
                 "[binds.\"{}\"]: the held {held} would recolour the tap, so it fires \
@@ -447,9 +476,9 @@ pub(crate) fn trigger_cycle(profiles: &[(&str, &Profile)]) -> Option<Vec<String>
     }
     // Trigger lookup: side-variant spellings share (primary, classes) and all of
     // them count as hit — an injected chord reaches whichever the router picks.
-    let mut by_trigger: BTreeMap<(Key, Mods), Vec<usize>> = BTreeMap::new();
+    let mut by_trigger: BTreeMap<(Holdable, Mods), Vec<usize>> = BTreeMap::new();
     for (index, (_, bind)) in nodes.iter().enumerate() {
-        if let Some(primary) = primary_key(&bind.trigger) {
+        if let Some(primary) = primary(&bind.trigger) {
             by_trigger
                 .entry((primary, chord_mods(&bind.trigger)))
                 .or_default()
@@ -529,11 +558,11 @@ fn bind_label(profile: &str, bind: &Bind) -> String {
 }
 
 /// The trigger presses a bind's execution is guaranteed to land: every non-modifier
-/// key it puts down, with the modifier classes its OWN execution has down at that
+/// key or button it puts down, with the modifier classes its OWN execution has down at that
 /// instant — hand-supplied covered classes and listed modifiers for a mirror,
 /// PRESS-tracked state for a sequence. Maybe-executed steps (RNG blocks) count as
 /// executed: for refusing circles, "could emit" is the honest reading.
-fn produced_events(bind: &Bind) -> Vec<(Key, Mods)> {
+fn produced_events(bind: &Bind) -> Vec<(Holdable, Mods)> {
     let held = chord_mods(&bind.trigger);
     let mut events = Vec::new();
     match &bind.action {
@@ -541,7 +570,7 @@ fn produced_events(bind: &Bind) -> Vec<(Key, Mods)> {
         Action::Mirror(targets) => {
             // Covered classes stay physically supplied; contaminating ones are
             // lifted for the tap — either way, held ∩ wanted is what surrounds it.
-            let baseline = held.intersect(target_mods(targets));
+            let baseline = held.intersect(chord_mods(targets));
             chord_events(targets, baseline, &mut events);
         }
         Action::Seq(steps) => {
@@ -553,13 +582,11 @@ fn produced_events(bind: &Bind) -> Vec<(Key, Mods)> {
                     }
                     Step::Hold(targets) => {
                         for target in targets {
-                            let Holdable::Key(key) = target else {
-                                continue;
-                            };
-                            if Mods::of_key(*key).is_some() {
-                                pressed.push(*key);
-                            } else {
-                                events.push((*key, Mods::of_chord(&pressed)));
+                            match target {
+                                Holdable::Key(key) if Mods::of_key(*key).is_some() => {
+                                    pressed.push(*key);
+                                }
+                                _ => events.push((*target, Mods::of_chord(&pressed))),
                             }
                         }
                     }
@@ -582,18 +609,17 @@ fn produced_events(bind: &Bind) -> Vec<(Key, Mods)> {
     events
 }
 
-/// One chord going down in listed order: modifiers accumulate as they pass, and
-/// every ordinary key lands as an event under whatever is accumulated so far.
-/// Buttons are skipped — no key grab can name one.
-fn chord_events(targets: &[Holdable], baseline: Mods, events: &mut Vec<(Key, Mods)>) {
+/// One chord going down in listed order: modifiers accumulate as they pass, and every
+/// ordinary key or button lands as an event under whatever is accumulated so far.
+fn chord_events(targets: &[Holdable], baseline: Mods, events: &mut Vec<(Holdable, Mods)>) {
     let mut running = baseline;
     for target in targets {
-        let Holdable::Key(key) = target else {
-            continue;
-        };
-        match Mods::of_key(*key) {
-            Some(class) => running = running.and(class),
-            None => events.push((*key, running)),
+        match target {
+            Holdable::Key(key) => match Mods::of_key(*key) {
+                Some(class) => running = running.and(class),
+                None => events.push((*target, running)),
+            },
+            Holdable::Button(_) => events.push((*target, running)),
         }
     }
 }
@@ -646,7 +672,7 @@ fn parse_patterns(raw: Option<OneOrMany>, field: &str) -> Result<Option<Vec<Stri
 
 /// Parses `emergency_stop`: one key or chord spelled like any trigger, or a list of
 /// alternatives — any one of them stops the run.
-fn parse_emergency(raw: Option<OneOrMany>) -> Result<Vec<Vec<Key>>, String> {
+fn parse_emergency(raw: Option<OneOrMany>) -> Result<Vec<Vec<Holdable>>, String> {
     let Some(spellings) = raw.map(OneOrMany::into_vec) else {
         return Ok(Vec::new());
     };
@@ -824,37 +850,43 @@ fn parse_target(text: &str) -> Result<Vec<Holdable>, String> {
     Ok(targets)
 }
 
-/// Parses a trigger: one key, or a space-separated chord of keys.
+/// Parses a trigger: one key or mouse button, or a space-separated chord of modifiers
+/// and one of those.
 ///
-/// Triggers are keyboard-only: they are heard by key grab, and no grab can name a mouse
-/// button.
-fn parse_trigger(text: &str) -> Result<Vec<Key>, String> {
-    let mut keys = Vec::new();
+/// A mouse button is heard on the device backend alone, which grabs the mice that have
+/// it: on X11's grabs the manager refuses such a profile, with the reason.
+fn parse_trigger(text: &str) -> Result<Vec<Holdable>, String> {
+    let mut members = Vec::new();
     for token in text.split_whitespace() {
-        if let Some(Holdable::Button(_)) = sequencer_core::input::INPUT_MAP.input_of(token) {
-            return Err(format!(
-                "`{token}` cannot trigger: mouse buttons are not hearable yet, only sendable"
-            ));
+        if let Some(button @ Holdable::Button(_)) = sequencer_core::input::INPUT_MAP.input_of(token)
+        {
+            members.push(button);
+            continue;
         }
-        keys.push(
+        members.push(Holdable::Key(
             token
                 .parse::<Key>()
                 .map_err(|err| format!("in the trigger: {err}"))?,
-        );
+        ));
     }
-    if keys.is_empty() {
+    if members.is_empty() {
         return Err("the trigger is empty".to_owned());
     }
     // The grab layer's shape, checked here so a bad chord is a parse error with the
     // file's own words rather than a runtime refusal.
-    let ordinary = keys.iter().filter(|key| !is_modifier(**key)).count();
+    let ordinary = members
+        .iter()
+        .filter(|member| !matches!(member, Holdable::Key(key) if is_modifier(*key)))
+        .count();
     if ordinary == 0 {
         return Err("a trigger needs one non-modifier key, not modifiers alone".to_owned());
     }
     if ordinary > 1 {
-        return Err("a chord may decorate only one ordinary key (modifiers + one key)".to_owned());
+        return Err(
+            "a chord may decorate only one ordinary key or button (modifiers + one)".to_owned(),
+        );
     }
-    Ok(keys)
+    Ok(members)
 }
 
 /// One block a `seq` still has open while it is checked: what opened it, and (for
@@ -1161,6 +1193,11 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
 
+    /// A chord of keys, as a trigger or a stop holds it.
+    fn keys(keys: &[Key]) -> Vec<Holdable> {
+        keys.iter().copied().map(Holdable::Key).collect()
+    }
+
     /// The advisory list: a mirror whose trigger holds modifiers its target does not
     /// name gets one (its tap is deferred), everything else stays quiet — a target
     /// that names the held classes, a bare trigger, and a sequence (whose steps are
@@ -1370,7 +1407,7 @@ mod tests {
                 .any(|bind| bind.action == Action::Nothing),
             "the template shows a swallowed key"
         );
-        assert_eq!(profile.emergency_stop, vec![vec![Key::F8]]);
+        assert_eq!(profile.emergency_stop, vec![keys(&[Key::F8])]);
         assert!(
             profile
                 .binds
@@ -1392,7 +1429,7 @@ mod tests {
             .iter()
             .find(|b| b.trigger_text.eq_ignore_ascii_case("ctrl i"))
             .expect("the ctrl i trigger");
-        assert_eq!(chord.trigger, vec![Key::LeftCtrl, Key::I]);
+        assert_eq!(chord.trigger, keys(&[Key::LeftCtrl, Key::I]));
         let alias = profile
             .binds
             .iter()
@@ -1491,9 +1528,12 @@ mod tests {
         let profile = parse_ok("[binds.\"ctrl shift i\"]\nseq = [\"a\"]");
         assert_eq!(
             profile.binds[0].trigger,
-            vec![Key::LeftCtrl, Key::LeftShift, Key::I]
+            keys(&[Key::LeftCtrl, Key::LeftShift, Key::I])
         );
-        assert_eq!(primary_key(&profile.binds[0].trigger), Some(Key::I));
+        assert_eq!(
+            primary(&profile.binds[0].trigger),
+            Some(Holdable::Key(Key::I))
+        );
 
         let err = parse_err("[binds.\"a b\"]\nseq = [\"x\"]");
         assert!(err.contains("only one ordinary key"), "{err}");
@@ -1524,7 +1564,7 @@ mod tests {
             parse_ok("[defaults]\nemergency_stop = \"ctrl alt q\"\n[binds.F6]\nseq = [\"a\"]");
         assert_eq!(
             profile.emergency_stop,
-            vec![vec![Key::LeftCtrl, Key::LeftAlt, Key::Q]]
+            vec![keys(&[Key::LeftCtrl, Key::LeftAlt, Key::Q])]
         );
         let err =
             parse_err("[defaults]\nemergency_stop = \"ctrl q\"\n[binds.\"ctrl q\"]\nseq = [\"a\"]");
@@ -1536,7 +1576,10 @@ mod tests {
     #[test]
     fn bind_targets_take_chords() {
         let profile = parse_ok("[binds.\"rshift >\"]\nbind = \"shift ]\"");
-        assert_eq!(profile.binds[0].trigger, vec![Key::RightShift, Key::Period]);
+        assert_eq!(
+            profile.binds[0].trigger,
+            keys(&[Key::RightShift, Key::Period])
+        );
         assert_eq!(
             profile.binds[0].action,
             Action::Mirror(vec![
@@ -1757,7 +1800,10 @@ mod tests {
         );
         assert_eq!(
             profile.emergency_stop,
-            vec![vec![Key::F8], vec![Key::LeftCtrl, Key::LeftShift, Key::E]]
+            vec![
+                keys(&[Key::F8]),
+                keys(&[Key::LeftCtrl, Key::LeftShift, Key::E])
+            ]
         );
         let err = parse_err("[defaults]\nemergency_stop = []\n[binds.F6]\nseq = [\"a\"]");
         assert!(err.contains("empty list"), "{err}");
@@ -1790,8 +1836,8 @@ mod tests {
             "every spelling carries the section's action"
         );
         assert_eq!(profile.binds[0].trigger_text, "F6");
-        assert_eq!(profile.binds[1].trigger, vec![Key::F7]);
-        assert_eq!(profile.binds[2].trigger, vec![Key::LeftCtrl, Key::I]);
+        assert_eq!(profile.binds[1].trigger, keys(&[Key::F7]));
+        assert_eq!(profile.binds[2].trigger, keys(&[Key::LeftCtrl, Key::I]));
 
         let err = parse_err("[binds.F6]\nalso = [\"F6\"]\nbind = \"p\"");
         assert!(err.contains("same trigger"), "{err}");
@@ -1873,15 +1919,63 @@ mod tests {
         assert!(err.contains("same trigger"), "{err}");
     }
 
+    /// A mouse button triggers like a key, alone or under a keyboard's modifiers; it is
+    /// still one primary per chord. The left and right buttons draw a warning — while the
+    /// profile applies, their clicks go to the bind — and the middle and side buttons none.
     #[test]
-    fn mouse_buttons_send_but_do_not_trigger() {
+    fn mouse_buttons_trigger_and_the_main_two_warn() {
         let profile = parse_ok("[binds.F6]\nbind = \"mouse1\"");
         assert_eq!(
             profile.binds[0].action,
             Action::Mirror(vec![Holdable::Button(Button::Left)])
         );
-        let err = parse_err("[binds.mouse1]\nbind = \"a\"");
-        assert!(err.contains("cannot trigger"), "{err}");
+        let side =
+            parse_ok("[binds.mouse4]\nbind = \"a\"\n\n[binds.\"ctrl mouse5\"]\nbind = \"ctrl b\"");
+        let trigger = |text: &str| {
+            side.binds
+                .iter()
+                .find(|bind| bind.trigger_text == text)
+                .map(|bind| bind.trigger.clone())
+        };
+        assert_eq!(
+            trigger("mouse4"),
+            Some(vec![Holdable::Button(Button::Back)])
+        );
+        assert_eq!(
+            trigger("ctrl mouse5"),
+            Some(vec![
+                Holdable::Key(Key::LeftCtrl),
+                Holdable::Button(Button::Forward)
+            ])
+        );
+        assert!(warnings(&side).is_empty(), "{:?}", warnings(&side));
+        for (button, name) in [("mouse1", "left"), ("mouse2", "right")] {
+            let notes = warnings(&parse_ok(&format!("[binds.{button}]\nbind = \"a\"")));
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.contains(&format!("the {name} button is a trigger"))),
+                "{button}: {notes:?}"
+            );
+        }
+        assert!(
+            warnings(&parse_ok("[binds.mouse3]\nbind = \"a\"")).is_empty(),
+            "the middle button warns of nothing"
+        );
+        let err = parse_err("[binds.\"mouse4 mouse5\"]\nbind = \"a\"");
+        assert!(err.contains("only one ordinary key or button"), "{err}");
+    }
+
+    /// A profile names a mouse button through a trigger or through a stop chord alike —
+    /// either one needs a backend that hears buttons. A button it only sends doesn't.
+    #[test]
+    fn a_button_as_trigger_or_stop_chord_is_named_and_one_sent_is_not() {
+        assert!(parse_ok("[binds.mouse4]\nbind = \"a\"").names_a_mouse_button());
+        assert!(
+            parse_ok("[defaults]\nemergency_stop = \"ctrl mouse5\"\n[binds.F6]\nseq = [\"a\"]")
+                .names_a_mouse_button()
+        );
+        assert!(!parse_ok("[binds.F6]\nbind = \"mouse1\"").names_a_mouse_button());
     }
 
     #[test]

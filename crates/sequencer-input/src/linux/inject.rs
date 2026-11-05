@@ -127,16 +127,18 @@ impl UinputSink {
         }
     }
 
-    /// Writes the staged events and the synchronisation marker that commits them.
+    /// Writes the staged events as one frame, committed by the synchronisation marker.
     ///
     /// The `SYN_REPORT` is not optional: without it the kernel treats the events as an
-    /// incomplete packet and nothing downstream sees them.
+    /// incomplete packet and nothing downstream sees them. `VirtualDevice::emit` writes it
+    /// after every batch itself (evdev 0.13), so the batch here holds the events alone. A
+    /// second marker of our own (as there once was) costs a write and nothing more — the
+    /// kernel's input core passes no frame on that holds only its marker — so no read-back
+    /// can tell the two apart, and none tests it.
     fn commit(&mut self) -> Result<(), SinkError> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.pending
-            .push(InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0));
         let result = self.device.emit(&self.pending).map_err(uinput_error);
         self.pending.clear();
         result
@@ -194,7 +196,9 @@ impl InputSink for UinputSink {
     }
 }
 
-fn code_for(what: Holdable) -> Result<KeyCode, SinkError> {
+/// The evdev code a key or button is sent as, or why it can't be: shared by every sink that
+/// writes the virtual devices.
+pub(crate) fn code_for(what: Holdable) -> Result<KeyCode, SinkError> {
     keymap::holdable_to_code(what).ok_or(match what {
         Holdable::Key(key) => SinkError::UnmappableKey(key),
         Holdable::Button(_) => SinkError::Unsupported("that mouse button"),
@@ -226,6 +230,16 @@ fn fix_for(err: &io::Error) -> &'static str {
     }
 }
 
+/// Whether this machine can actually create a virtual device. Most CI containers cannot,
+/// so every test that needs one bows out rather than failing.
+#[cfg(test)]
+pub(crate) fn uinput_available() -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/uinput")
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,15 +269,6 @@ mod tests {
             denied.contains("udev rule and group membership") && !denied.contains("module"),
             "{denied}"
         );
-    }
-
-    /// Whether this machine can actually create a virtual device. Most CI containers
-    /// cannot, so every test that needs one bows out rather than failing.
-    fn uinput_available() -> bool {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/uinput")
-            .is_ok()
     }
 
     /// The virtual device must advertise relative axes, or libinput does not classify it as

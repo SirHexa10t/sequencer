@@ -160,6 +160,15 @@ seq = [
 ]
 
 
+# ================================= mouse buttons as triggers =================================
+
+# Like any key: "mouse1" (left) .. "mouse5" (forward thumb-button) ; chords too: "ctrl mouse5"
+#   "mouse1"/"mouse2" work, but `profile-check` warns about overriding them
+# X11's grabs can't hear buttons - commenting this out to keep this file apply-able on X11's fallback too
+# [binds.mouse5]
+# bind = "ctrl c"
+
+
 # ================================= gates and swallowing on language =================================
 
 # commenting this out to avoid duplicate-key (previously defined) - we'll keep this file apply-able 

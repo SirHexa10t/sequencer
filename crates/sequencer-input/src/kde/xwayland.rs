@@ -12,8 +12,9 @@
 //! What passes is a copy: the Wayland app still receives the key.
 //!
 //! The group's other setting, `XwaylandEavesdropsMouse` (whether mouse buttons pass too),
-//! is not read: mouse buttons can't be triggers, so nothing here would use it. It comes
-//! back with a reader if mouse triggers ever reach the X11 fallback.
+//! is not read: mouse buttons are triggers on the input devices alone, and the X11 fallback
+//! refuses them, so nothing here would use it. It comes back with a reader if mouse
+//! triggers ever reach the X11 fallback.
 
 use std::path::PathBuf;
 

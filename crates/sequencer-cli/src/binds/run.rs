@@ -17,7 +17,7 @@
 //! released, in reverse order.
 
 use sequencer_core::emit::{Emit, Holdable, InputSink};
-use sequencer_core::input::{EventKind, Key, Mods};
+use sequencer_core::input::{Key, Mods};
 use sequencer_core::rng::Rng;
 use sequencer_core::time::{Clock, Duration};
 
@@ -57,7 +57,7 @@ pub(crate) type LiftTap<'a> = &'a dyn Fn(&[Holdable], Mods, Option<Key>, Duratio
 /// the path a tap takes when the hand's held classes would recolour it.
 pub(crate) struct Pumps<'a> {
     pub(crate) triggers: &'a mut dyn EventPump,
-    pub(crate) stop: &'a [(Key, Mods)],
+    pub(crate) stop: &'a [(Holdable, Mods)],
     pub(crate) gate: Option<&'a dyn Fn() -> bool>,
     pub(crate) mods_down: Option<&'a dyn Fn(Mods) -> bool>,
     pub(crate) key_down: Option<&'a dyn Fn(Key) -> bool>,
@@ -65,9 +65,9 @@ pub(crate) struct Pumps<'a> {
 }
 
 impl Pumps<'_> {
-    /// Whether this event is one of the profile's own emergency chords.
-    fn is_stop(&self, key: Key, mods: Mods) -> bool {
-        self.stop.contains(&(key, mods))
+    /// Whether this press is one of the profile's own emergency chords.
+    fn is_stop(&self, input: Holdable, mods: Mods) -> bool {
+        self.stop.contains(&(input, mods))
     }
 }
 
@@ -127,15 +127,15 @@ impl Drop for ReleaseGuard<'_> {
     }
 }
 
-/// A profile's emergency chords the way their events will arrive: primary plus held
-/// modifier classes, one entry per alternative spelling.
-pub(crate) fn stop_chords(profile: &Profile) -> Vec<(Key, Mods)> {
+/// A profile's emergency chords the way their events will arrive: primary — a key or a
+/// mouse button — plus held modifier classes, one entry per alternative spelling.
+pub(crate) fn stop_chords(profile: &Profile) -> Vec<(Holdable, Mods)> {
     profile
         .emergency_stop
         .iter()
         .filter_map(|chord| {
             Some((
-                super::format::primary_key(chord)?,
+                super::format::primary(chord)?,
                 super::format::chord_mods(chord),
             ))
         })
@@ -230,11 +230,11 @@ impl<'a> Executor<'a> {
         // Only presses drive anything now: a mirror tap releases its own keys, and the
         // trigger's release usually goes elsewhere anyway — ending our active grab
         // (see the capture backend) hands routing back to the server mid-press.
-        if let EventKind::KeyDown(key) = event.kind {
-            if pumps.is_stop(key, event.mods) {
+        if let Some((input, true)) = event.kind.edge() {
+            if pumps.is_stop(input, event.mods) {
                 return Ok(Some(Outcome::EmergencyStop));
             }
-            if let Some(bind) = bind_of(self.profile, key, event.mods, pumps.key_down) {
+            if let Some(bind) = bind_of(self.profile, input, event.mods, pumps.key_down) {
                 match &bind.action {
                     // Swallowed: the grab consumed the press, and that is the whole
                     // point of `bind = "NOP"`. Nothing to emit, nothing to release.
@@ -246,7 +246,7 @@ impl<'a> Executor<'a> {
                         // trigger matching it equals the spelling's classes, and the
                         // event is the side that cannot lie.
                         let held = event.mods;
-                        let wanted = super::format::target_mods(&targets);
+                        let wanted = super::format::chord_mods(&targets);
                         if wanted.covers(held) {
                             // A target that re-presses the trigger's own key cannot
                             // fire while the hand is still on it: the grab consumed a
@@ -254,7 +254,9 @@ impl<'a> Executor<'a> {
                             // down for an already-down key makes no fresh edge for
                             // anyone (field bug: `ctrl w -> ctrl shift w` closed no
                             // terminal tab). Wait for the key to lift first.
-                            if targets.contains(&Holdable::Key(key)) {
+                            if let Holdable::Key(key) = input
+                                && targets.contains(&input)
+                            {
                                 match self.await_key_release(key, pumps)? {
                                     Heard::Nothing => {}
                                     Heard::StopBind | Heard::GateLost => return Ok(None),
@@ -287,12 +289,16 @@ impl<'a> Executor<'a> {
                             // target re-presses the trigger's own key, that key is
                             // lifted too: a fresh edge is impossible while it is
                             // physically down.
-                            let lift_primary = targets.contains(&Holdable::Key(key)).then_some(key);
+                            let lift_primary = match input {
+                                Holdable::Key(key) if targets.contains(&input) => Some(key),
+                                _ => None,
+                            };
                             if let Some(lift) = pumps.lift
                                 && lift(&targets, held, lift_primary, tap)
                             {
                                 log::info!(
-                                    "mirror tap fired between lifted modifiers trigger={key}"
+                                    "mirror tap fired between lifted modifiers trigger={}",
+                                    sequencer_core::input::INPUT_MAP.display_name(input)
                                 );
                                 return Ok(None);
                             }
@@ -300,7 +306,8 @@ impl<'a> Executor<'a> {
                             // recoloured through the real sink — better than never.
                         }
                         log::info!(
-                            "mirror tap trigger={key} target={}",
+                            "mirror tap trigger={} target={}",
+                            sequencer_core::input::INPUT_MAP.display_name(input),
                             targets
                                 .iter()
                                 .map(|target| {
@@ -554,22 +561,22 @@ impl<'a> Executor<'a> {
             };
             match pumps.triggers.wait_until(Some(chunk)) {
                 Wake::Event(event) => {
-                    if let EventKind::KeyDown(key) = event.kind {
-                        if pumps.is_stop(key, event.mods) {
+                    if let Some((input, true)) = event.kind.edge() {
+                        if pumps.is_stop(input, event.mods) {
                             return Ok(Heard::Emergency);
                         }
                         // The grab fires a chord as its one ordinary key with the
                         // modifiers riding along as event state — so a re-press is
                         // the primary plus the chord's exact modifier classes.
                         if let Some(bind) = bind
-                            && trigger_matches(bind, key, event.mods)
+                            && trigger_matches(bind, input, event.mods)
                         {
                             return Ok(Heard::StopBind);
                         }
                     }
-                    if let EventKind::KeyUp(key) = event.kind
+                    if let Some((input, false)) = event.kind.edge()
                         && let Some(bind) = bind
-                        && released_trigger(bind, key)
+                        && released_trigger(bind, input)
                     {
                         return Ok(Heard::StopBind);
                     }
@@ -618,7 +625,7 @@ impl<'a> Executor<'a> {
             let deadline = self.clock.now().saturating_add_nanos(DEFER_POLL_NANOS);
             match pumps.triggers.wait_until(Some(deadline)) {
                 Wake::Event(event) => {
-                    if let EventKind::KeyDown(pressed) = event.kind
+                    if let Some((pressed, true)) = event.kind.edge()
                         && pumps.is_stop(pressed, event.mods)
                     {
                         return Ok(Heard::Emergency);
@@ -651,16 +658,16 @@ impl<'a> Executor<'a> {
         loop {
             match pumps.triggers.wait_until(Some(self.clock.now())) {
                 Wake::Event(event) => {
-                    if let EventKind::KeyDown(key) = event.kind {
-                        if pumps.is_stop(key, event.mods) {
+                    if let Some((input, true)) = event.kind.edge() {
+                        if pumps.is_stop(input, event.mods) {
                             return Ok(Heard::Emergency);
                         }
-                        if trigger_matches(bind, key, event.mods) {
+                        if trigger_matches(bind, input, event.mods) {
                             return Ok(Heard::StopBind);
                         }
                     }
-                    if let EventKind::KeyUp(key) = event.kind
-                        && released_trigger(bind, key)
+                    if let Some((input, false)) = event.kind.edge()
+                        && released_trigger(bind, input)
                     {
                         return Ok(Heard::StopBind);
                     }
@@ -676,13 +683,13 @@ impl<'a> Executor<'a> {
     }
 }
 
-/// Whether a `KeyUp` of `key` is the trigger of an `only_while_pressed` bind coming up.
+/// Whether a release of `input` is the trigger of an `only_while_pressed` bind coming up.
 ///
 /// The device path delivers the release as an event; the X11 grab never does (its
 /// active grab ends on the press, so the release is routed elsewhere), which is what
 /// [`Pumps::key_down`] is for — see [`trigger_up`]. Both feed the same decision.
-fn released_trigger(bind: &Bind, key: Key) -> bool {
-    bind.only_while_pressed && super::format::primary_key(&bind.trigger) == Some(key)
+fn released_trigger(bind: &Bind, input: Holdable) -> bool {
+    bind.only_while_pressed && super::format::primary(&bind.trigger) == Some(input)
 }
 
 /// Whether an `only_while_pressed` bind's trigger is physically up right now, by the
@@ -690,8 +697,10 @@ fn released_trigger(bind: &Bind, key: Key) -> bool {
 /// the only source, and on the device backend it is a complete one.
 fn trigger_up(bind: &Bind, pumps: &Pumps<'_>) -> bool {
     bind.only_while_pressed
-        && match (pumps.key_down, super::format::primary_key(&bind.trigger)) {
-            (Some(key_down), Some(key)) => !key_down(key),
+        && match (pumps.key_down, super::format::primary(&bind.trigger)) {
+            (Some(key_down), Some(Holdable::Key(key))) => !key_down(key),
+            // A button's release always arrives as an event: the device backend, the only
+            // one that hears buttons, passes every release on.
             _ => false,
         }
 }
@@ -727,14 +736,14 @@ fn skip_block(steps: &[Step], from: usize) -> usize {
 /// the probe is only consulted between twins.
 fn bind_of<'p>(
     profile: &'p Profile,
-    key: Key,
+    input: Holdable,
     mods: Mods,
     key_down: Option<&dyn Fn(Key) -> bool>,
 ) -> Option<&'p Bind> {
     let mut matching = profile
         .binds
         .iter()
-        .filter(|bind| trigger_matches(bind, key, mods));
+        .filter(|bind| trigger_matches(bind, input, mods));
     let first = matching.next()?;
     let Some(second) = matching.next() else {
         return Some(first);
@@ -743,8 +752,11 @@ fn bind_of<'p>(
         let hand_is_on = |bind: &&Bind| {
             bind.trigger
                 .iter()
-                .filter(|&&trigger_key| super::format::is_modifier(trigger_key))
-                .all(|&trigger_key| down(trigger_key))
+                .filter_map(|member| match member {
+                    Holdable::Key(key) if super::format::is_modifier(*key) => Some(*key),
+                    _ => None,
+                })
+                .all(down)
         };
         if let Some(bind) = [first, second].into_iter().chain(matching).find(hand_is_on) {
             return Some(bind);
@@ -755,11 +767,11 @@ fn bind_of<'p>(
     Some(first)
 }
 
-/// Whether an event (primary key + held modifier classes) is exactly this bind's
-/// trigger chord. Exact, not superset: `ctrl w` must not pass for `ctrl shift w`,
+/// Whether an event (primary key or button + held modifier classes) is exactly this
+/// bind's trigger chord. Exact, not superset: `ctrl w` must not pass for `ctrl shift w`,
 /// in either direction.
-fn trigger_matches(bind: &Bind, key: Key, mods: Mods) -> bool {
-    super::format::primary_key(&bind.trigger) == Some(key)
+fn trigger_matches(bind: &Bind, input: Holdable, mods: Mods) -> bool {
+    super::format::primary(&bind.trigger) == Some(input)
         && super::format::chord_mods(&bind.trigger) == mods
 }
 
@@ -802,6 +814,8 @@ fn emit_infallible(
 
 #[cfg(test)]
 mod tests {
+    use sequencer_core::input::EventKind;
+
     use super::*;
     use crate::runtime::ScriptedPump;
     use sequencer_core::emit::EmitAction;

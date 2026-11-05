@@ -49,8 +49,8 @@ impl Key {
             | Self::RightCtrl | Self::RightShift | Self::RightAlt
             | Self::RightMeta => Category::Modifier,
             Self::VolumeUp | Self::VolumeDown | Self::Mute | Self::PlayPause
-            | Self::NextTrack | Self::PrevTrack | Self::BrightnessUp
-            | Self::BrightnessDown => Category::Media,
+            | Self::NextTrack | Self::PrevTrack | Self::BrightnessUp | Self::BrightnessDown
+            | Self::BrowserBack | Self::BrowserForward => Category::Media,
         }
     }
 }
@@ -70,7 +70,7 @@ pub enum Category {
     Numpad,
     /// Ctrl, shift, alt and meta, both hands.
     Modifier,
-    /// Volume, playback and brightness keys.
+    /// Volume, playback, brightness and browser keys.
     Media,
     /// Mouse buttons and wheel notches.
     Mouse,
@@ -333,6 +333,7 @@ mod tests {
     #[test]
     fn categories_separate_the_families() {
         assert_eq!(Key::VolumeUp.category(), Category::Media);
+        assert_eq!(Key::BrowserBack.category(), Category::Media);
         assert_eq!(Key::LeftCtrl.category(), Category::Modifier);
         assert_eq!(Key::PageUp.category(), Category::Nav);
         assert_eq!(Key::Keypad8.category(), Category::Numpad);

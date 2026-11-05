@@ -46,6 +46,9 @@ stopping them; `example_profile.toml` documents every field and step, and
 - **Whole profiles on Wayland.** Holding the input devices, a profile hears every trigger
   and keeps it from every app, native Wayland ones included — not only the keys the
   compositor would pass to X11 apps.
+- **Mouse buttons as triggers.** On the input devices a profile can bind a mouse's side
+  buttons — or any of its buttons — and the mouse is held only while some profile names
+  one, through a stand-in that keeps the desktop's settings for it.
 - **Your keyboards always come back.** A supervisor process holds every device grab and
   gives the keyboards back if the manager stops answering for two seconds, at once if it
   dies — tested live, `kill -9` included.
@@ -59,8 +62,8 @@ stopping them; `example_profile.toml` documents every field and step, and
   input devices a profile would hold.
 - **`bench`** measures what the machine really delivers, by reading its own virtual device
   back rather than trusting its own send count.
-- **`profile-apply`** applies a binds file — key remaps and key-triggered sequences —
-  until stopped. `example_profile.toml` in the repository is the annotated format reference.
+- **`profile-apply`** applies a binds file — key remaps, and sequences triggered by a key
+  or a mouse button — until stopped. `example_profile.toml` in the repository is the annotated format reference.
 - **`detect-key`** prints the name of every key you press, in the exact spelling a binds
   file accepts — reading the input devices for exact answers by default, or the terminal
   with `--no-sudo` for zero-permission use anywhere.
@@ -83,30 +86,40 @@ console alike. For a profile it holds every device that sends keys — keyboards
 keyboard interface (where the mouse's own macros type), macro pads, media, volume and
 brightness keys — and types what no profile claims straight back out through one virtual
 keyboard, so a trigger is kept from every application and everything else arrives as
-typed. Left alone, each for its own reason: mice and pointing sticks, until mouse buttons
-can be triggers; touchpads, tablets, touchscreens, game controllers and motion sensors,
-which would lose their own handling to a stand-in (palm detection, gestures, games reading
-controllers directly); devices that also report switches, such as a lid; devices nothing
-in the session reads; and power and sleep buttons, which are logind's. Which device is
-which follows udev's own rules, and `doctor` lists every device with its verdict.
+typed. A mouse or a pointing stick is held only while some applied profile names one of
+its buttons as a trigger, and passes on through a stand-in of its own: a virtual device
+with its name and IDs, so the desktop's settings for that mouse — speed, scroll
+direction, handedness — still apply (with one exception, under
+[Limitations](#limitations)). Left alone, each for its own reason: touchpads, tablets,
+touchscreens, game controllers and motion sensors, which would lose their own handling to
+a stand-in (palm detection, gestures, games reading controllers directly); devices that
+also report switches, such as a lid; devices nothing in the session reads; and power and
+sleep buttons, which are logind's. Which device is which follows udev's own rules, and
+`doctor` lists every device with its verdict.
 
 A program sitting between you and your keyboard must never trap it, so the grab is made
-safe three ways. Every grab is taken and held by a supervisor process — the same
+safe four ways. Every grab is taken and held by a supervisor process — the same
 program, run again — which gives the devices back if the manager stops answering for two
 seconds, and at once if it dies. A device is taken only once no key is held on it, since a
-key held across the grab would stay down in the session for good. And sequencer's own
-virtual devices are never taken, so nothing it types comes back as your input. While the
+key held across the grab would stay down in the session for good. sequencer's own virtual
+devices are never taken, so nothing it types comes back as your input. And should the
+thread reading the devices end while the manager runs on — a failed read, a bug — it gives
+them back first. While the
 screen is locked — logind's `LockedHint`, which KDE's and GNOME's lockers set — profiles
 pause and every key goes through as typed.
 
-Its costs are three. The permission: in a Wayland session `profile-apply` asks sudo for
-the one run and drops root before it writes anything; in an X11 session it never asks, and
-uses the devices only where you already have access. The hardware it started with: devices
-are opened once, so a keyboard plugged in later — or one that comes back from a suspend as
-a new device — types as usual, without profiles, until the manager runs again. And
-libinput: everything written passes through it on the way up to an application, and it is
-fussy about what it will route. That is not a small detail; see
-[Rate ceiling](#rate-ceiling).
+Its costs are two. The permission: in a Wayland session `profile-apply` asks sudo for the
+one run and drops root before it writes anything; in an X11 session it never asks, and
+uses the devices only where you already have access. And libinput: everything written
+passes through it on the way up to an application, and it is fussy about what it will
+route. That is not a small detail; see [Rate ceiling](#rate-ceiling).
+
+A keyboard plugged in while the manager runs — or one that comes back from a suspend as a
+new device — is held within about a second, by the same rule, and so is a mouse a profile
+names. After sudo the manager keeps only the `input` group, which opens them on most
+distributions; where the device nodes are root's alone, a keyboard plugged in later types
+as usual, without profiles, until the manager runs again — and since mice are opened only
+once a profile names them, no mouse button can be a trigger there.
 
 **The X11 path is the fallback, and needs nothing.** It is an ordinary X client: it opens
 no device, so there is no group to join and nothing for sudo to do. It also sits *above*
@@ -123,7 +136,8 @@ A Rust toolchain to build. `detect-key`'s exact mode, `bench` and a whole profil
 Wayland session also need some way to reach the input devices — `sudo` for one run is
 enough. No system libraries, no `-dev` packages, no BIOS settings: `x11rb` speaks the X
 protocol itself rather than linking `libX11`, and the questions put to KWin, KDE's
-keyboard service and logind go over a D-Bus client of the project's own.
+keyboard service and logind go over a D-Bus client of the project's own. Every command
+below runs as typed in bash, zsh and fish.
 
 ### 1. Rust
 
@@ -180,9 +194,7 @@ sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf     # persist across reboots
 
 # Let the `input` group use it.
-sudo tee /etc/udev/rules.d/99-sequencer-uinput.rules <<'EOF'
-KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
-EOF
+printf '%s\n' 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/99-sequencer-uinput.rules >/dev/null
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
@@ -197,6 +209,29 @@ current shell without logging out, `newgrp input`.
 > run read *every* input device on the machine. That is full keylogging capability,
 > including passwords typed into any application. The per-run option exists precisely so
 > this is a choice rather than a prerequisite.
+
+### 4. Optional: a USB mouse's DPI while a profile holds it
+
+While a profile names one of its buttons, a mouse reaches the session through a stand-in
+with its name and IDs. udev lists the DPI of some mice, which libinput scales motion by,
+and gives it to a USB mouse only through the USB device above it — which a stand-in
+hasn't, so such a mouse moves at another speed while held. To see whether yours is listed,
+run this on the mouse's node (`sequencer doctor` names it); a line printed means it is:
+
+```sh
+udevadm info --query=property --name=/dev/input/event4 | grep MOUSE_DPI
+```
+
+This rule gives a USB mouse's stand-in its bus, and udev looks it up as it did the mouse.
+It touches nothing but sequencer's stand-ins, and applies to those made after the reload:
+
+```sh
+printf '%s\n' 'ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", KERNELS=="input*", ATTRS{phys}=="sequencer-stand-in", ATTRS{id/bustype}=="0003", ENV{ID_BUS}="usb"' | sudo tee /etc/udev/rules.d/69-sequencer-stand-in.rules >/dev/null
+sudo udevadm control --reload-rules
+```
+
+The same rule, explained, is `udev/69-sequencer-stand-in.rules` in this repository, for
+packaging. A Bluetooth mouse needs nothing: udev reads that bus from the stand-in itself.
 
 ### Optional developer tools
 
@@ -290,11 +325,11 @@ backend: none — profiles need the input devices, which need setting up first (
 input devices — what a profile manager holds:
   held  USB Audio Device (event2): keys
   held  Video Bus (event3): keys
+  held  Wireless Mouse (event4): a mouse — while a profile names one of its buttons
   held  Wireless Mouse Keyboard (event5): a keyboard
   held  Office Keyboard (event6): a keyboard
+  held  Office Keyboard Mouse (event9): a mouse — while a profile names one of its buttons
   left  Power Button (event0, event1): a power or sleep button — logind's
-  left  Wireless Mouse (event4): a mouse — not held yet, so its buttons can't be triggers
-  left  Office Keyboard Mouse (event9): a mouse — not held yet, so its buttons can't be triggers
   16 more send no keys (-v lists them)
 
 The uinput kernel module is not loaded
@@ -386,6 +421,11 @@ itself. Validation is strict and speaks the format's language — a `PRESS` nobo
 two spellings of one trigger (`{` and `[` are the same key), or a `suppress = false`
 nothing can honour are refused with the reason, not reinterpreted.
 
+What a profile sends is heard like typing: one profile's output can fire another's trigger,
+on X11's grabs and on the devices alike. `profile-apply` refuses a set whose binds would
+trigger each other in a circle, and on the devices a chain is cut eight links deep besides,
+for any loop the check can't see.
+
 Chord triggers work: `[binds."ctrl i"]` fires on `i` with exactly Ctrl held, whatever
 NumLock and CapsLock are doing. A chord is modifiers plus one ordinary key — the shape an
 X grab can express, and the device backend matches by the same rules, so a profile means
@@ -393,7 +433,17 @@ the same on either. A bare key and chords over it coexist: each spelling claims 
 exact combination, so `i`, `ctrl i` and `alt i` are three independent binds, and a
 combination none of them claims reaches the application untouched. `shift` distinguishes
 sides — `rshift >` and `shift >` can be separate binds, routed by which side is physically
-down. Mouse buttons can be sent but not heard: no trigger can be one yet.
+down.
+
+A mouse button can be a trigger too — `[binds.mouse4]`, or a chord such as
+`[binds."ctrl mouse5"]` — on the input devices, which hold the mouse while the profile
+applies. X11's key grabs can't hear a button, so the fallback refuses such a profile and
+says why. `profile-check` warns when the left or right button (`mouse1`, `mouse2`) is a
+trigger: while the profile applies, that click goes to the bind and never to the app under
+the pointer, which a side button (`mouse4`, `mouse5`) leaves alone. Some mice send their
+side buttons as the browser's back and forward keys instead; `detect-key` names what a
+press is, and those bind as `browser-back` and `browser-forward` — keys, which both
+backends hear.
 
 `profile-check` runs the same validator without applying anything: no symlink, no lock,
 no grabs, so it is safe in an editor hook. `--format` rewrites sound files in place —
@@ -527,7 +577,7 @@ classification, which the grab, `detect-key` and `doctor` share.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 346 tests, all headless
+cargo test --workspace --all-features    # 379 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
@@ -545,14 +595,15 @@ plain `cargo test` stays safe anywhere. Its tiers, by what each needs:
 | Tier | Needs | Covers |
 |---|---|---|
 | `validation` | nothing — it runs in every `cargo test` | `profile-check`, `--format` and the profile commands' arguments, through the real binary |
-| `x11` | an X session | the manager's lifecycle — stacking, mirrors, loops, per-profile emergency stops, quitting once the set empties — and Ctrl+C. In a Wayland session the lifecycle test skips, and the routing check below stands in |
+| `x11` | an X session | the manager's lifecycle on X11's grabs — stacking, mirrors, loops, per-profile emergency stops, quitting once the set empties — and Ctrl+C. In a Wayland session the lifecycle test skips: the `devices` tier tells the same story there, and the routing check below covers XTEST |
 | `sudo` | a cached sudo ticket | `bench` round-tripping through uinput, `doctor` on the real machine |
-| `devices` | a Wayland session, sudo, the `live-tests` feature | profiles on the device backend, typed on a test keyboard of the suite's own and read back below the desktop; the supervisor taking the keyboard back from a silent manager and from a killed one |
+| `devices` | a Wayland session, sudo, the `live-tests` feature | profiles on the device backend, typed on a test keyboard of the suite's own and read back below the desktop; the manager's lifecycle there — stacking, a loop, re-applying, per-profile stops, quitting once the set empties; a keyboard plugged in again; a test mouse's button as a trigger, the rest of the mouse read back through its stand-in, and the mouse held only while a profile names it; the supervisor taking the keyboard back from a silent manager and from a killed one |
 | `windows` | the above, plus KDE, `kdialog` and a US layout | the same profiles into kdialog boxes the tests open — an X11 one through Xwayland and a Wayland one — and the routing check: XTEST keys reaching an X11 grab and the focused window |
 
-The test keyboard is made through `/dev/uinput` by a root helper, `sequencer-live-rig`,
-built only with `live-tests`, and each test manager's grab is limited to it, so your own
-keyboards are never grabbed. The window tests type a key only while KWin says the test's
+The test keyboard and mouse are made through `/dev/uinput` by a root helper,
+`sequencer-live-rig`, built only with `live-tests`, and each test manager's grab is
+limited to them, so your own keyboards and mice are never grabbed. The test mouse clicks
+and moves only once its stand-in is held by the test, so none of it reaches your pointer. The window tests type a key only while KWin says the test's
 own box has focus, so a focus slip stops the test instead of typing elsewhere. The only
 keys that reach your desktop are the `x11` tier's Pause chords and, on KDE, the `windows`
 tier's, into boxes of its own — where KDE may ask once to allow remote control. Run
@@ -599,9 +650,17 @@ the console it is built and tested headless, not yet tried live.
   BattlEye will not work, and using it there risks the account. Don't.
 - **Clicks land at the pointer.** The tool never moves the cursor.
 - **What is sent is not necessarily received.** See [Rate ceiling](#rate-ceiling).
-- **Mouse buttons can't be triggers**, in any session; they can only be sent.
-- **A keyboard plugged in after the manager starts types without profiles** until the
-  manager runs again — and so does one that comes back from a suspend as a new device.
+- **Mouse buttons are triggers on the input devices only.** The X11 fallback refuses a
+  profile that names one, saying why.
+- **A USB mouse listed in udev's mouse database can move at another speed while a profile
+  holds it**, unless [the optional udev rule](#4-optional-a-usb-mouses-dpi-while-a-profile-holds-it)
+  is installed. udev gives a mouse the DPI that database lists for it — which libinput
+  scales motion by — only on a USB or Bluetooth bus, and takes a USB one's bus from the USB
+  device above it, which a stand-in has none of. The desktop's own settings for the mouse
+  still apply, and a Bluetooth mouse keeps its entry.
+- **Where device nodes are root's alone, a keyboard plugged in after a sudo start types
+  without profiles** until the manager runs again, and no mouse button can be a trigger;
+  elsewhere both are held within a second.
 - **Linux only.**
 
 ## Troubleshoot

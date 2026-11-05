@@ -76,6 +76,17 @@ pub enum Holdable {
     Button(Button),
 }
 
+/// A key as its own name shows it (`F10`, `ctrl`), a button as the binds format spells it
+/// (`mouse4`) — so a message names a chord the way a profile writes it.
+impl core::fmt::Display for Holdable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Key(key) => write!(f, "{key}"),
+            Self::Button(_) => f.write_str(&crate::input::INPUT_MAP.display_name(*self)),
+        }
+    }
+}
+
 impl Holdable {
     /// The action that presses this.
     #[must_use]

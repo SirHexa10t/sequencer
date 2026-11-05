@@ -172,9 +172,10 @@ pub(crate) fn profile_apply(args: &ProfileApplyArgs, deps: &mut Deps<'_>) -> Res
 
 /// Refuses the whole apply if the set it would create contains a feedback circle.
 ///
-/// Injections pass through grabs like real presses (on X11 today; on the device backend
-/// once its chaining is built, for parity), and EVERY profile's grabs hear them — so a
-/// circle can span files. The whole future set is checked before anything
+/// Injections pass through grabs like real presses — X11's grabs hear XTEST input, and the
+/// device backend routes profiles' output as it routes the hands' — and EVERY profile's
+/// grabs hear them, so a circle can span files. (On the devices a chain is also cut eight
+/// deep at run time, for what this check can't see.) The whole future set is checked before anything
 /// links: this batch, plus what is already applied (minus the versions this batch
 /// replaces). The manager re-checks at load, for links made by hand.
 #[cfg(all(feature = "xtest", target_os = "linux"))]

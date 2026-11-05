@@ -322,12 +322,13 @@ mod xwayland {
         Ok(())
     }
 
-    /// Mouse buttons are triggers nowhere — the binds format refuses a profile that makes one
-    /// a trigger — so the note says so, rather than leave the compositor's mouse sharing
-    /// (KDE has a setting for it, which `kde::xwayland_sharing` doesn't read for that reason)
-    /// to suggest that sharing them would make them fire.
-    const MOUSE_REFUSED: &str = "- a mouse button can't be a trigger, in any session: a profile \
-                                 naming one as a trigger is refused";
+    /// Mouse buttons are triggers on the input devices alone — X11's key grabs, which a
+    /// profile runs on through Xwayland, can't hear one, and the manager refuses a profile
+    /// naming one there — so the note says so, rather than leave the compositor's mouse
+    /// sharing (KDE has a setting for it, which `kde::xwayland_sharing` doesn't read for that
+    /// reason) to suggest that sharing them would make them fire.
+    const MOUSE_REFUSED: &str = "- a mouse button can't be a trigger here: X11's key grabs can't \
+                                 hear one, so a profile naming one as a trigger is refused";
 
     /// The note's lines, KDE's setting given when it is known. Pure, so the wording is
     /// testable with no session.
@@ -407,15 +408,17 @@ mod xwayland {
             })
         }
 
-        /// Mouse buttons are triggers in no session, so every note says they are refused —
-        /// off KDE, and under each of KDE's settings.
+        /// Mouse buttons are triggers on the input devices alone, so every note on running
+        /// through Xwayland says they are refused there — off KDE, and under each of KDE's
+        /// settings.
         #[test]
         fn every_note_says_mouse_triggers_are_refused() {
             let kde = every_setting().map(|keys| note(Some(XwaylandSharing { keys })));
             for lines in kde.into_iter().chain([note(None)]) {
                 let text = lines.join("\n");
                 assert!(
-                    text.contains("a mouse button can't be a trigger, in any session")
+                    text.contains("a mouse button can't be a trigger here")
+                        && text.contains("key grabs can't hear one")
                         && text.contains("is refused"),
                     "{text}"
                 );
@@ -702,7 +705,7 @@ mod input_devices {
         let rows: Vec<Row> = devices::list()
             .into_iter()
             .map(|device| Row {
-                take: grab::take(&device.name, &device.capabilities),
+                take: grab::take_listed(&device),
                 tags: device
                     .capabilities
                     .kinds()
@@ -754,12 +757,16 @@ mod input_devices {
         }
         let (held, left): (Vec<_>, Vec<_>) = groups
             .iter()
-            .partition(|(row, _)| matches!(row.take, Take::Grab { .. }));
+            .partition(|(row, _)| matches!(row.take, Take::Grab { .. } | Take::Pointer(_)));
         let mut lines = vec!["input devices — what a profile manager holds:".to_owned()];
         for (row, nodes) in held.into_iter().chain(left) {
             let (verdict, what) = match row.take {
                 Take::Grab { keyboard: true } => ("held", Kind::Keyboard.to_string()),
                 Take::Grab { keyboard: false } => ("held", Kind::Key.to_string()),
+                Take::Pointer(kind) => (
+                    "held",
+                    format!("{kind} — while a profile names one of its buttons"),
+                ),
                 Take::Leave(why) => ("left", why.to_string()),
             };
             let tags = match (verbose, row.tags.is_empty()) {
@@ -806,11 +813,7 @@ mod input_devices {
                 row("event0", "Power Button", Take::Leave(Left::System)),
                 row("event1", "Power Button", Take::Leave(Left::System)),
                 row("event3", "Video Bus", Take::Grab { keyboard: false }),
-                row(
-                    "event4",
-                    "Wireless Mouse",
-                    Take::Leave(Left::Pointer(Kind::Mouse)),
-                ),
+                row("event4", "Wireless Mouse", Take::Pointer(Kind::Mouse)),
                 row("event6", "Office Keyboard", Take::Grab { keyboard: true }),
                 row("event7", "Office Keyboard", Take::Leave(Left::NoKeys)),
                 row("event10", "Office Keyboard", Take::Grab { keyboard: true }),
@@ -852,7 +855,10 @@ mod input_devices {
             );
             assert!(keyboard_at < power_at, "held before left: {lines:#?}");
             let (_, mouse) = line_with(&lines, "Wireless Mouse (event4)");
-            assert!(mouse.contains("a mouse — not held yet"), "{mouse}");
+            assert!(
+                mouse.contains("a mouse — while a profile names one of its buttons"),
+                "{mouse}"
+            );
             line_with(&lines, "2 more send no keys");
             assert!(
                 !lines.iter().any(|line| line.contains("Headphone Jack")),
