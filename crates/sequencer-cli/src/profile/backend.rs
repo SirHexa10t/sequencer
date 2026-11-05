@@ -14,7 +14,9 @@ use sequencer_core::emit::{Emit, Holdable, InputSink, SinkError};
 use sequencer_core::input::{Key, Mods};
 use sequencer_core::time::Duration;
 #[cfg(feature = "evdev")]
-use sequencer_input::linux::grab::{DeviceClaim, DeviceGrab, DeviceSink, GrabError, Opened};
+use sequencer_input::linux::grab::{
+    DeviceClaim, DeviceGrab, DeviceSink, GrabError, GrabLost, Opened,
+};
 use sequencer_input::{Epoch, EventQueue, GrabCapture, KeyProbe, LiftedTap, XTestSink};
 
 use crate::{Error, Result};
@@ -290,17 +292,32 @@ impl Backend {
         }
     }
 
-    /// Tells the supervisor the manager still answers; `false` once it is gone. X11 has no
-    /// supervisor, and always answers.
+    /// Tells the supervisor the manager still answers — or, once the run can't go on, says
+    /// why it ends: the supervisor gone, or a reader that stopped and gave its devices back.
+    /// X11 has no supervisor, and always answers.
     #[cfg_attr(
         not(feature = "evdev"),
-        allow(dead_code, reason = "only a device grab has a supervisor to beat")
+        allow(
+            dead_code,
+            clippy::unnecessary_wraps,
+            reason = "only a device grab has a supervisor to beat, or a reader to lose"
+        )
     )]
-    pub(super) fn beat(&self) -> bool {
+    pub(super) fn beat(&self) -> std::result::Result<(), &'static str> {
         match self {
-            Self::X11 { .. } => true,
+            Self::X11 { .. } => Ok(()),
             #[cfg(feature = "evdev")]
-            Self::Devices(grab) => grab.beat().is_ok(),
+            Self::Devices(grab) => grab.beat().map_err(|lost| match lost {
+                GrabLost::KeyboardReader => {
+                    "the keyboards' reader stopped and gave them back, so no key trigger could fire"
+                }
+                GrabLost::MouseReader => {
+                    "the mice's reader stopped and gave them back, so no button trigger could fire"
+                }
+                // The supervisor gone, or an end this manager doesn't know: either way, the
+                // keyboards are the session's again.
+                _ => "the supervisor gave the keyboards back while this manager was not answering",
+            }),
         }
     }
 

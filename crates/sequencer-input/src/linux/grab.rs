@@ -11,7 +11,8 @@
 //! held across the grab would stay down in the session for good; sequencer's own virtual
 //! devices are never grabbed, so nothing it sends comes back as the user's input; and a
 //! reader that ends while the manager runs on — a failed read, a panic — gives back what it
-//! held (`Holding`), since the supervisor, still beaten, would otherwise keep it grabbed.
+//! held (`Holding`), since the supervisor, still beaten, would otherwise keep it grabbed,
+//! and the next beat stops the manager ([`GrabLost`]) rather than let it run on half-deaf.
 //!
 //! What is grabbed, for now ([`take`]): every device udev counts as sending keys
 //! ([`crate::devices`]), short of the kinds below — keyboards, a mouse's keyboard interface
@@ -243,6 +244,39 @@ pub enum GrabError {
     /// be grabbed.
     #[error("the supervisor went away as it took the grabs: {0}")]
     Supervisor(#[source] io::Error),
+}
+
+/// Why a grab can't go on, as its beat finds it: the manager must stop. A manager running
+/// on with part of the devices given back would leave its profiles half-deaf, with no way
+/// to tell which triggers still fire (developer's call, 2026-11-05).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum GrabLost {
+    /// The supervisor is gone: it gave the devices back, or died.
+    #[error("the supervisor is gone: {0}")]
+    Supervisor(#[source] io::Error),
+    /// The keyboards' reader ended on its own — a failed read, a panic — and gave them
+    /// back: no key trigger can fire now.
+    #[error("the keyboards' reader stopped, and gave them back")]
+    KeyboardReader,
+    /// The mice's reader ended on its own, and gave them back: no button trigger can fire.
+    #[error("the mice's reader stopped, and gave them back")]
+    MouseReader,
+}
+
+/// Which reader, if either, has ended while the grab runs on — on its own, then, since
+/// the grab's end takes both away first.
+fn reader_lost(
+    keyboards: Option<&JoinHandle<()>>,
+    mice: Option<&JoinHandle<()>>,
+) -> Option<GrabLost> {
+    if keyboards.is_some_and(JoinHandle::is_finished) {
+        Some(GrabLost::KeyboardReader)
+    } else if mice.is_some_and(JoinHandle::is_finished) {
+        Some(GrabLost::MouseReader)
+    } else {
+        None
+    }
 }
 
 /// Locks state the reader shares. A panic elsewhere while holding the lock leaves plain data
@@ -1048,11 +1082,16 @@ impl DeviceGrab {
     ///
     /// # Errors
     ///
-    /// The supervisor is gone — it gave the keyboards back — and the manager must stop.
-    pub fn beat(&self) -> io::Result<()> {
+    /// Why the grab can't go on, and the manager must stop: the supervisor is gone — it gave
+    /// the keyboards back — or a reader stopped on its own and gave back what it held.
+    pub fn beat(&self) -> Result<(), GrabLost> {
+        if let Some(lost) = reader_lost(self.reader.as_ref(), self.pointers.as_ref()) {
+            return Err(lost);
+        }
         lock(&self.supervisor)
             .as_ref()
             .map_or(Ok(()), Supervisor::beat)
+            .map_err(GrabLost::Supervisor)
     }
 
     /// Ends the grab: nothing more is passed on, the supervisor lets every device go back to
@@ -1500,6 +1539,33 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert_eq!(given_back.into_inner(), ["keyboard", "macro pad"]);
+    }
+
+    /// A reader that has ended is what the next beat finds — the keyboards' first — and a
+    /// reader still running is not.
+    #[test]
+    fn a_beat_finds_a_reader_that_ended() {
+        let ended = std::thread::spawn(|| {});
+        while !ended.is_finished() {
+            std::thread::yield_now();
+        }
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let running = std::thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        assert!(matches!(
+            reader_lost(Some(&ended), Some(&running)),
+            Some(GrabLost::KeyboardReader)
+        ));
+        assert!(matches!(
+            reader_lost(Some(&running), Some(&ended)),
+            Some(GrabLost::MouseReader)
+        ));
+        assert!(reader_lost(Some(&running), None).is_none());
+        assert!(reader_lost(None, None).is_none());
+        drop(stop);
+        running.join().unwrap();
+        ended.join().unwrap();
     }
 
     /// Unlimited, the grab may take any device; limited by the live tests, only those whose

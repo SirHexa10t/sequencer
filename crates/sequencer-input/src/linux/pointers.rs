@@ -28,8 +28,11 @@
 //!
 //! Mice are found as keyboards plugged in later are: through sysfs, about once a second
 //! ([`SCAN_EVERY`]), and at once when the wanted buttons change. They are opened as the user
-//! — a manager started through sudo has shed root by then, keeping the `input` group — so
-//! where the nodes are root's alone, mice can't be held, and the log says so once.
+//! — a manager started through sudo has shed root by then, keeping the `input` group — and
+//! their stand-ins are made through `/dev/uinput` the same way. Where either is root's
+//! alone, mice can't be held, and the log says so once — for `/dev/uinput`, naming the
+//! uinput rule that fixes it. Each is taken in the order that loses nothing it sends
+//! (`take_in_order`).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -38,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use evdev::uinput::VirtualDevice;
+use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{AbsInfo, Device, InputEvent as DeviceEvent, KeyCode, UinputAbsSetup};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
@@ -198,35 +201,25 @@ impl Mice<'_> {
             ));
             return None;
         }
-        // `None` once the grab is ending: nothing more is taken then.
-        let grabbed = lock(&ends.supervisor).as_ref()?.grab(opened.as_fd());
-        match grabbed {
-            Ok(()) => {}
-            Err(GrabRefused::Busy) => {
-                warn_once(format!(
-                    "{} is held by another program, so its buttons can't be triggers",
-                    device.name
-                ));
-                return None;
-            }
-            Err(err) => {
-                warn_once(format!("{} could not be grabbed: {err}", device.name));
-                return None;
-            }
-        }
-        // The stand-in only once the grab is taken, so that a mouse another program holds
-        // never has one made and unmade at every look. What the mouse sends meanwhile waits
-        // in its own buffer, read once the stand-in is there.
-        let stand_in = match stand_in_for(&opened) {
-            Ok(stand_in) => stand_in,
-            Err(err) => {
+        let taken = take_in_order(
+            || prepare_stand_in(&opened),
+            || match lock(&ends.supervisor).as_ref() {
+                Some(supervisor) => supervisor.grab(opened.as_fd()),
+                None => Err(GrabRefused::Gone(io::Error::other("the grab is ending"))),
+            },
+            VirtualDeviceBuilder::build,
+            || {
                 if let Some(supervisor) = lock(&ends.supervisor).as_ref() {
                     let _ = supervisor.release(opened.as_fd());
                 }
-                warn_once(format!(
-                    "{} could not be given a stand-in, so it was left alone: {err}",
-                    device.name
-                ));
+            },
+        );
+        let stand_in = match taken {
+            Ok(stand_in) => stand_in,
+            Err(not_taken) => {
+                if let Some(said) = not_taken.said_of(&device.name) {
+                    warn_once(said);
+                }
                 return None;
             }
         };
@@ -315,9 +308,68 @@ fn stand_in_name(name: Option<&str>) -> &str {
     name.filter(|name| !name.is_empty()).unwrap_or("mouse")
 }
 
-/// A virtual device the session takes for `mouse` itself — its name, its IDs, everything it
-/// declares, absolute axes with their ranges — marked by [`STAND_IN_PHYS`] alone.
-fn stand_in_for(mouse: &Device) -> io::Result<VirtualDevice> {
+/// Why a mouse wasn't taken.
+#[derive(Debug)]
+enum NotTaken {
+    /// Its stand-in can't be had — refused before the mouse was ever grabbed.
+    NoStandIn(io::Error),
+    /// The grab was refused.
+    Refused(GrabRefused),
+    /// The stand-in failed as it was made, after the grab, which was let go again.
+    Unmade(io::Error),
+}
+
+impl NotTaken {
+    /// What the log says of `name`, not taken — nothing while the grab is ending.
+    fn said_of(&self, name: &str) -> Option<String> {
+        Some(match self {
+            Self::NoStandIn(err) if err.kind() == io::ErrorKind::PermissionDenied => format!(
+                "{name}'s buttons can't be triggers: its stand-in is made through /dev/uinput, \
+                 which this manager can't open — it let root go once the devices were open, \
+                 keeping your user and the `input` group alone — and the uinput rule in the \
+                 README's setup (step 3) is what gives that group the node"
+            ),
+            Self::NoStandIn(err) => {
+                format!("{name} could not be given a stand-in, so it was left alone: {err}")
+            }
+            Self::Refused(GrabRefused::Busy) => {
+                format!("{name} is held by another program, so its buttons can't be triggers")
+            }
+            Self::Refused(GrabRefused::Gone(_)) => return None,
+            Self::Refused(err) => format!("{name} could not be grabbed: {err}"),
+            Self::Unmade(err) => {
+                format!("{name} could not be given a stand-in, so it was let go again: {err}")
+            }
+        })
+    }
+}
+
+/// Takes a mouse in the one order that loses nothing it sends: its stand-in `prepare`d
+/// first — opened through `/dev/uinput` and given all it will be, none of which the system
+/// sees yet — so that a stand-in that can't be had is refused before the mouse is grabbed;
+/// then the `grab`; then the stand-in `make`, which the system sees only now, the grab let
+/// go again (`release`) should that fail. Grabbing first and letting go a moment later, as
+/// every look once did where no stand-in could be made, lost what the mouse sent meanwhile
+/// — a button's release among it, which left the session holding the button (found
+/// 2026-11-05). And a mouse another program holds never has a stand-in made and unmade.
+fn take_in_order<Prepared, StandIn>(
+    prepare: impl FnOnce() -> io::Result<Prepared>,
+    grab: impl FnOnce() -> Result<(), GrabRefused>,
+    make: impl FnOnce(Prepared) -> io::Result<StandIn>,
+    release: impl FnOnce(),
+) -> Result<StandIn, NotTaken> {
+    let prepared = prepare().map_err(NotTaken::NoStandIn)?;
+    grab().map_err(NotTaken::Refused)?;
+    make(prepared).map_err(|err| {
+        release();
+        NotTaken::Unmade(err)
+    })
+}
+
+/// Everything the stand-in for `mouse` will be — its name, its IDs, everything it declares,
+/// absolute axes with their ranges — marked by [`STAND_IN_PHYS`] alone, and not yet made:
+/// the system sees nothing of it until `build`.
+fn prepare_stand_in(mouse: &Device) -> io::Result<VirtualDeviceBuilder<'_>> {
     let mut builder = VirtualDevice::builder()?
         .name(stand_in_name(mouse.name()))
         .input_id(mouse.input_id())
@@ -347,7 +399,7 @@ fn stand_in_for(mouse: &Device) -> io::Result<VirtualDevice> {
             builder = builder.with_absolute_axis(&UinputAbsSetup::new(axis, range))?;
         }
     }
-    builder.build()
+    Ok(builder)
 }
 
 /// One batch from `mouse` on to its stand-in, frame by frame: motion and the wheel as they
@@ -433,6 +485,91 @@ mod tests {
         let syspath = device.get_syspath().expect("its sysfs entry");
         let phys = std::fs::read_to_string(syspath.join("phys")).expect("its phys");
         assert_eq!(phys.trim_end(), STAND_IN_PHYS.to_str().unwrap());
+    }
+
+    /// The steps `take_in_order` ran, in order, and whether the mouse was taken.
+    fn steps(
+        prepare: io::Result<()>,
+        grab: Result<(), GrabRefused>,
+        make: io::Result<()>,
+    ) -> (Vec<&'static str>, bool) {
+        let ran = std::cell::RefCell::new(Vec::new());
+        let taken = take_in_order(
+            || {
+                ran.borrow_mut().push("prepare");
+                prepare
+            },
+            || {
+                ran.borrow_mut().push("grab");
+                grab
+            },
+            |()| {
+                ran.borrow_mut().push("make");
+                make
+            },
+            || ran.borrow_mut().push("release"),
+        );
+        (ran.into_inner(), taken.is_ok())
+    }
+
+    /// A mouse is taken in order: its stand-in prepared, the mouse grabbed, the stand-in
+    /// made — and nothing let go.
+    #[test]
+    fn a_mouse_is_taken_stand_in_first_grab_second() {
+        assert_eq!(
+            steps(Ok(()), Ok(()), Ok(())),
+            (vec!["prepare", "grab", "make"], true)
+        );
+    }
+
+    /// A stand-in that can't be had is refused before the mouse is grabbed at all: nothing
+    /// the mouse sends is ever caught and lost.
+    #[test]
+    fn a_stand_in_that_cant_be_had_is_refused_before_any_grab() {
+        let refused = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            steps(Err(refused), Ok(()), Ok(())),
+            (vec!["prepare"], false)
+        );
+    }
+
+    /// A grab refused — the mouse another program's — makes no stand-in: the prepared one
+    /// was never shown to the system.
+    #[test]
+    fn a_refused_grab_makes_no_stand_in() {
+        assert_eq!(
+            steps(Ok(()), Err(GrabRefused::Busy), Ok(())),
+            (vec!["prepare", "grab"], false)
+        );
+    }
+
+    /// A stand-in failing as it is made lets the grab go again at once.
+    #[test]
+    fn a_stand_in_failing_as_it_is_made_lets_the_grab_go() {
+        let failed = io::Error::from(io::ErrorKind::InvalidInput);
+        assert_eq!(
+            steps(Ok(()), Ok(()), Err(failed)),
+            (vec!["prepare", "grab", "make", "release"], false)
+        );
+    }
+
+    /// A stand-in refused for want of `/dev/uinput` names the fix; a mouse another program
+    /// holds says so; and nothing is said while the grab is ending.
+    #[test]
+    fn a_mouse_not_taken_says_why() {
+        let denied = NotTaken::NoStandIn(io::Error::from(io::ErrorKind::PermissionDenied));
+        let said = denied.said_of("Wireless Mouse").unwrap();
+        assert!(
+            said.starts_with("Wireless Mouse's buttons can't be triggers")
+                && said.contains("/dev/uinput")
+                && said.contains("uinput rule")
+                && said.contains("step 3"),
+            "{said}"
+        );
+        let busy = NotTaken::Refused(GrabRefused::Busy).said_of("Wireless Mouse");
+        assert!(busy.is_some_and(|said| said.contains("another program")));
+        let ending = NotTaken::Refused(GrabRefused::Gone(io::Error::other("the grab is ending")));
+        assert_eq!(ending.said_of("Wireless Mouse"), None);
     }
 
     /// A stand-in takes its mouse's own name, however plain — and one that reports none still

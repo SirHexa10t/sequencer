@@ -104,7 +104,7 @@ seconds, and at once if it dies. A device is taken only once no key is held on i
 key held across the grab would stay down in the session for good. sequencer's own virtual
 devices are never taken, so nothing it types comes back as your input. And should the
 thread reading the devices end while the manager runs on — a failed read, a bug — it gives
-them back first. While the
+them back first, and the manager stops, saying why. While the
 screen is locked — logind's `LockedHint`, which KDE's and GNOME's lockers set — profiles
 pause and every key goes through as typed.
 
@@ -577,7 +577,7 @@ classification, which the grab, `detect-key` and `doctor` share.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 379 tests, all headless
+cargo test --workspace --all-features    # 385 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
@@ -661,6 +661,11 @@ the console it is built and tested headless, not yet tried live.
 - **Where device nodes are root's alone, a keyboard plugged in after a sudo start types
   without profiles** until the manager runs again, and no mouse button can be a trigger;
   elsewhere both are held within a second.
+- **Where `/dev/uinput` is root's alone, a mouse button can't be a trigger after a sudo
+  start**: the manager gives up root once the devices are open, and a held mouse's
+  stand-in is made later, through `/dev/uinput`. The uinput rule in
+  [Setup step 3](#3-input-device-access) fixes it on its own, since the manager keeps the
+  `input` group; the manager's log names the rule when it happens.
 - **Linux only.**
 
 ## Troubleshoot

@@ -319,8 +319,9 @@ pub(super) fn manage(
     let mut enforcement = Enforcement::new(&clock, sink, super::state::config_dir()?, lock);
     let mut rng = Rng::new(wall_seed());
     // A grab's supervisor gives the keyboards back when the beats stop; a beat it no
-    // longer hears ends the run, and says why.
-    let given_back = std::cell::Cell::new(false);
+    // longer hears ends the run, and says why. So does a beat that finds a reader stopped,
+    // its devices given back.
+    let lost = std::cell::Cell::new(None::<&'static str>);
     #[cfg_attr(
         not(feature = "evdev"),
         allow(unused_mut, reason = "only a device grab beats")
@@ -328,11 +329,16 @@ pub(super) fn manage(
     let mut pump = CapturePump::new(stream, &clock);
     #[cfg(feature = "evdev")]
     if backend.is_devices() {
-        pump = pump.beating(sequencer_input::linux::supervise::BEAT_EVERY, || {
-            let heard = backend.beat();
-            given_back.set(!heard);
-            heard
-        });
+        pump = pump.beating(
+            sequencer_input::linux::supervise::BEAT_EVERY,
+            || match backend.beat() {
+                Ok(()) => true,
+                Err(why) => {
+                    lost.set(Some(why));
+                    false
+                }
+            },
+        );
     }
     let mut focus: Option<Focus> = None;
     let mut layout: Option<Layout> = None;
@@ -403,12 +409,7 @@ pub(super) fn manage(
                 }
             }
             Wake::Deadline => {}
-            Wake::Interrupted if given_back.get() => {
-                break Ok(
-                    "the supervisor gave the keyboards back while this manager was not answering",
-                );
-            }
-            Wake::Interrupted => break Ok("event sources closed"),
+            Wake::Interrupted => break Ok(lost.get().unwrap_or("event sources closed")),
         }
     };
 
