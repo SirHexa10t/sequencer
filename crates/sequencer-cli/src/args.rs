@@ -231,6 +231,15 @@ pub struct ProfileApplyArgs {
     #[arg(value_name = "FILE", num_args = 1.., required = true)]
     pub files: Vec<PathBuf>,
 
+    /// Don't ask for sudo: where the input devices need it, run on X11's grabs instead.
+    ///
+    /// In a Wayland session those run through Xwayland, where native Wayland apps see only
+    /// part of a profile: while one has focus, a trigger fires only on the keys the
+    /// compositor passes to X11 apps, and a bound key still reaches the app. The default
+    /// asks sudo to open the devices, for this run only.
+    #[arg(short = 'n', long)]
+    pub no_sudo: bool,
+
     /// Shared options.
     #[command(flatten)]
     pub global: GlobalArgs,
@@ -242,6 +251,7 @@ impl ProfileApplyArgs {
     pub const fn new() -> Self {
         Self {
             files: Vec::new(),
+            no_sudo: false,
             global: GlobalArgs::new(),
         }
     }
@@ -408,6 +418,23 @@ mod tests {
             };
             assert!(args.no_sudo, "{flag} should set no_sudo");
         }
+    }
+
+    #[test]
+    fn profile_apply_takes_no_sudo_long_and_short() {
+        for flag in ["-n", "--no-sudo"] {
+            let Command::ProfileApply(args) =
+                parse(&["sequencer", "profile-apply", flag, "binds.toml"])
+            else {
+                panic!("should be profile-apply");
+            };
+            assert!(args.no_sudo, "{flag} should set no_sudo");
+        }
+        let Command::ProfileApply(args) = parse(&["sequencer", "profile-apply", "binds.toml"])
+        else {
+            panic!("should be profile-apply");
+        };
+        assert!(!args.no_sudo, "asking is the default");
     }
 
     #[test]

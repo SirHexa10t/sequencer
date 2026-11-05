@@ -11,7 +11,7 @@
 //!
 //! 1. **No elevation needed** — the command doesn't need the devices (`doctor`,
 //!    `write-script`, `detect-key --no-sudo`, and `profile-apply` unless it is to become a
-//!    Wayland session's manager — see [`wants_devices_in`]), or access is already there
+//!    Wayland session's manager without `--no-sudo` — see [`wants_devices_in`]), or access is already there
 //!    (group membership, running as root), or root couldn't give it either — a missing
 //!    `/dev/uinput` (see [`sudo_would_help`]). Runs directly; sudo is never mentioned, and
 //!    what fails, fails with the usual error naming the fix — or, for `profile-apply`, falls
@@ -65,7 +65,7 @@ pub fn run_with_sudo_prompt(cli: &Cli, doctor_hint: &str) -> u8 {
             "Using your cached sudo to open the input devices; root is dropped straight after."
         );
     } else {
-        eprint!("{}", session_prompt(doctor_hint));
+        eprint!("{}", session_prompt(doctor_hint, &cli.command));
     }
     let code = reexec_under_sudo();
     if !had_ticket {
@@ -110,8 +110,9 @@ fn wants_devices_in(command: &Command, wayland: bool, managed: bool) -> bool {
         // The devices are what make a profile whole in a Wayland session, where X11 grabs
         // reach Xwayland only; in an X11 session the X server's grabs are whole already,
         // so a password would buy nothing. Nor when a manager runs: this run only hands
-        // its profile over.
-        Command::ProfileApply(_) => wayland && !managed,
+        // its profile over. `--no-sudo` takes the grabs through Xwayland rather than the
+        // question (developer's call, 2026-11-05).
+        Command::ProfileApply(args) => wayland && !managed && !args.no_sudo,
         // `doctor` must see the machine as it really is: elevating it would blind it.
         _ => false,
     }
@@ -153,15 +154,34 @@ fn interactive() -> bool {
 }
 
 /// What the user reads before sudo asks for their password. Everything they are agreeing
-/// to, in order: what the elevation is for, exactly how long it lasts, and the standing
-/// alternative with its own trade named.
-fn session_prompt(doctor_hint: &str) -> String {
+/// to, in order: what the elevation is for, exactly how long it lasts, the standing
+/// alternative with its own trade named — and, for a command with one, the way around the
+/// password with its own.
+fn session_prompt(doctor_hint: &str, command: &Command) -> String {
+    let without = without_sudo(command)
+        .map(|instead| format!("Or pass --no-sudo: {instead}.\n"))
+        .unwrap_or_default();
     format!(
         "No access to the input devices, so sudo opens them for THIS RUN only — root is\n\
          dropped as soon as they are open, and nothing persists after exit.\n\
          To stop being asked, `{doctor_hint}` prints a one-time setup (more convenient, less\n\
-         secure: every program you run could then read every input device).\n"
+         secure: every program you run could then read every input device).\n{without}"
     )
+}
+
+/// What `--no-sudo` does instead of asking, for a command that takes it.
+fn without_sudo(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::DetectKey(_) => Some(
+            "the terminal is read instead, which knows only\n\
+             the keys that type something",
+        ),
+        Command::ProfileApply(_) => Some(
+            "X11's grabs run the profile instead, through Xwayland — where native\n\
+             Wayland apps see only part of it",
+        ),
+        _ => None,
+    }
 }
 
 /// What the run needs of the user's environment once it is the user again: where their
@@ -426,6 +446,14 @@ mod tests {
             !wants_devices_in(&apply, true, true),
             "with a manager running, this run only hands its profile over"
         );
+        let unasked = Command::ProfileApply(crate::args::ProfileApplyArgs {
+            no_sudo: true,
+            ..crate::args::ProfileApplyArgs::new()
+        });
+        assert!(
+            !wants_devices_in(&unasked, true, false),
+            "--no-sudo takes the grabs through Xwayland rather than the question"
+        );
 
         let doctor = Command::Doctor(crate::args::DoctorArgs::new());
         assert!(
@@ -465,7 +493,10 @@ mod tests {
     fn the_password_prompt_keeps_its_promises() {
         // Matched against whitespace-collapsed text: the promises are about what the prompt
         // SAYS, and a phrase that happens to straddle a line break is still said.
-        let text = session_prompt("mytool_doctor");
+        let text = session_prompt(
+            "mytool_doctor",
+            &Command::Bench(crate::args::BenchArgs::new()),
+        );
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
         for expected in [
             "THIS RUN only",
@@ -479,5 +510,32 @@ mod tests {
                 "prompt lost its promise {expected:?}:\n{text}"
             );
         }
+    }
+
+    /// The way around the password is named for each command that takes `--no-sudo`, with its
+    /// trade — and for no other.
+    #[test]
+    fn the_password_prompt_names_the_way_around_it_where_there_is_one() {
+        let flat = |command: &Command| {
+            session_prompt("doctor", command)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let apply = flat(&Command::ProfileApply(crate::args::ProfileApplyArgs::new()));
+        assert!(
+            apply.contains("--no-sudo: X11's grabs run the profile instead, through Xwayland"),
+            "{apply}"
+        );
+        let detect = flat(&Command::DetectKey(crate::args::DetectKeyArgs::new()));
+        assert!(
+            detect.contains("--no-sudo: the terminal is read instead"),
+            "{detect}"
+        );
+        let bench = flat(&Command::Bench(crate::args::BenchArgs::new()));
+        assert!(
+            !bench.contains("--no-sudo"),
+            "bench takes no --no-sudo: {bench}"
+        );
     }
 }

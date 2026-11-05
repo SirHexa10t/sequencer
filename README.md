@@ -183,7 +183,9 @@ help: where `/dev/uinput` doesn't exist, root can't make a virtual device either
 
 `profile-apply` asks only in a Wayland session, and only the run that becomes the
 manager: on X11 the X server's own grabs make a profile whole without the devices, and a
-later `profile-apply` just hands its file to the manager already running.
+later `profile-apply` just hands its file to the manager already running. Pass it
+`-n`/`--no-sudo` and it never asks: without the standing setup, the manager then runs on
+X11's grabs, through Xwayland.
 
 **Standing (no password, ever).** `sequencer doctor` prints the exact commands for whatever
 your machine is missing. In full:
@@ -367,8 +369,9 @@ one. Ctrl+C is caught rather than fatal, precisely so that release happens.
 What a profile runs on is settled as the manager starts ([How it reaches the
 screen](#how-it-reaches-the-screen)), and the manager says which. In a Wayland session the
 first `profile-apply` asks sudo to open the devices — saying first what for, unless you
-already hold a ticket — and sheds root before it writes anything; turn sudo down and the
-run ends there. A real start, with a ticket cached (device names and paths made generic):
+already hold a ticket — and sheds root before it writes anything (`--no-sudo` skips the
+question and runs on X11's grabs instead); turn sudo down and the run ends there. A real
+start, with a ticket cached (device names and paths made generic):
 
 ```
 Using your cached sudo to open the input devices; root is dropped straight after.
@@ -577,7 +580,7 @@ classification, which the grab, `detect-key` and `doctor` share.
 ## Development
 
 ```sh
-cargo test --workspace --all-features    # 385 tests, all headless
+cargo test --workspace --all-features    # 387 tests, all headless
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
